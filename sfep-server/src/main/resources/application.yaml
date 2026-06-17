@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: sfep-server
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://127.0.0.1:55432/sfep}
+    username: ${SPRING_DATASOURCE_USERNAME:sfep}
+    password: ${SPRING_DATASOURCE_PASSWORD:sfep}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        format_sql: false
+    show-sql: false
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:127.0.0.1}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+sfep:
+  desktop:
+    enabled: ${SFEP_DESKTOP_ENABLED:true}
+    dashboard-refresh-ms: ${SFEP_DESKTOP_DASHBOARD_REFRESH_MS:1000}
+  direct-write:
+    default-equipment-count: 100
+    default-events-per-equipment: 10
+    max-events-per-request: 50000

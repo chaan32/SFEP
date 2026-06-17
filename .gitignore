@@ -1,0 +1,34 @@
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Gradle / Java
+.gradle/
+build/
+out/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Docker volumes / local data
+data/
+postgres-data/
+redis-data/
+kafka-data/
+
+# Nested clone accidentally created during setup.
+/SFEP/
