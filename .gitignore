@@ -35,3 +35,6 @@ kafka-data/
 
 # Local learning notes for step-by-step portfolio writing.
 /docs/SFEP_STEP*.md
+
+# Keep Markdown notes and portfolio drafts local.
+*.md

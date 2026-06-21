@@ -69,10 +69,12 @@ public class SfepAlertFrame extends JFrame {
         setLocationByPlatform(true);
 
         add(buildRootPanel(), BorderLayout.CENTER);
+        // subscribe when this frame is started
         unsubscribe = alertEventBus.subscribe(this::onAlert);
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosed(WindowEvent event) {
+                // unsubscribe when this frame is closed
                 unsubscribe.run();
             }
         });

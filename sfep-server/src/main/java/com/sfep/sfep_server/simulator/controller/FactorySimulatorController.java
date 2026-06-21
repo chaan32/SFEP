@@ -6,6 +6,7 @@ import com.sfep.sfep_server.simulator.service.FactorySimulatorService;
 import jakarta.validation.Valid;
 import com.sfep.sfep_server.kafka.dto.KafkaPublishResponse;
 import com.sfep.sfep_server.kafka.dto.KafkaRunStatusResponse;
+import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -13,15 +14,13 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+// 시뮬레이션 실행
 @RestController
 @RequestMapping("/api/v1/simulator")
+@RequiredArgsConstructor
 public class FactorySimulatorController {
 
     private final FactorySimulatorService factorySimulatorService;
-
-    public FactorySimulatorController(FactorySimulatorService factorySimulatorService) {
-        this.factorySimulatorService = factorySimulatorService;
-    }
 
     @PostMapping("/direct/run")
     public SimulatorRunResponse runDirectWrite(@Valid @RequestBody SimulatorRunRequest request) {

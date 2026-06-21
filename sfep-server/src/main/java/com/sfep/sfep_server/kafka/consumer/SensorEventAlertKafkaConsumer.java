@@ -17,8 +17,13 @@ public class SensorEventAlertKafkaConsumer {
         this.alertEventPublisher = alertEventPublisher;
     }
 
+    /**
+     * Consume the messages By Another GroupId to alert
+     * @param messages Msgs in Kafka
+     */
     @KafkaListener(
             topics = "${sfep.kafka.sensor-events-topic:sfep.sensor-events}",
+            // alert-Consumer
             groupId = "${sfep.kafka.alert-consumer-group:sfep-alert-processor}",
             autoStartup = "${sfep.kafka.alert-consumer-enabled:true}"
     )

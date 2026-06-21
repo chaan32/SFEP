@@ -20,6 +20,11 @@ public class AlertEventPublisher {
         this.alertEventBus = alertEventBus;
     }
 
+    /**
+     * publish Alerts
+     * @param requests
+     * @return
+     */
     public int publishAlerts(List<SensorEventRequest> requests) {
         int published = 0;
         for (SensorEventRequest request : requests) {
@@ -31,10 +36,13 @@ public class AlertEventPublisher {
     }
 
     public boolean publishIfNeeded(SensorEventRequest request) {
+        // 1) Analyze the status equipment by Messages that contains information like power, rpm ..
         EventSeverity severity = riskAnalyzer.analyze(request);
+        // 2) Pass if Status is Normal
         if (severity == EventSeverity.NORMAL) {
             return false;
         }
+        // 3) Alert Message will be published with necessary information, If Status is Warning or Critical
         alertEventBus.publish(AlertEventResponse.from(request, severity));
         return true;
     }

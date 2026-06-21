@@ -24,3 +24,19 @@ public class EventRiskAnalyzer {
         return EventSeverity.NORMAL;
     }
 }
+/**
+ * CRITICAL:
+ * - 상태가 FAILURE
+ * - 온도 >= 90
+ * - 진동 >= 8
+ * - 전류 >= 80
+ *
+ * WARNING:
+ * - 상태가 WARNING
+ * - 온도 >= 75
+ * - 진동 >= 5
+ * - 전류 >= 60
+ *
+ * 그 외:
+ * - NORMAL
+ */

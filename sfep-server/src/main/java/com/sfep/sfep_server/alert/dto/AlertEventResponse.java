@@ -18,12 +18,15 @@ public record AlertEventResponse(
         double currentValue,
         Instant occurredAt,
         Instant receivedAt,
+        // 서버에서 위험하다고 판단한 시간!
         Instant alertPublishedAt,
+        // alertPublishedAt - occurredAt
         long alertLatencyMs,
         String message
 ) {
 
     public static AlertEventResponse from(SensorEvent event) {
+
         Instant alertPublishedAt = Instant.now();
         return new AlertEventResponse(
                 event.getEventId(),

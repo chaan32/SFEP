@@ -51,6 +51,11 @@ public class SensorEventService {
         this.jdbcBatchSize = jdbcBatchSize;
     }
 
+    /**
+     * Saving Single Event
+     * @param request Event Object that contains specific information (ex : value, power, rpm etc. )
+     * @return
+     */
     @Transactional
     public SensorEventResponse saveDirect(SensorEventRequest request) {
         SensorEvent saved = sensorEventRepository.save(toEvent(request));
@@ -59,6 +64,11 @@ public class SensorEventService {
         return SensorEventResponse.from(saved);
     }
 
+    /**
+     * Saving Many Events
+     * @param requests
+     * @return
+     */
     @Transactional
     public DirectWriteResult saveDirectBatch(List<SensorEventRequest> requests) {
         return saveDirectBatch(requests, true);
@@ -71,6 +81,8 @@ public class SensorEventService {
         }
 
         long start = System.nanoTime();
+
+        // Convert SensorEventRequest Object to SensorEvent Objet by using stream
         List<SensorEvent> events = requests.stream()
                 .map(this::toEvent)
                 .toList();
@@ -85,6 +97,11 @@ public class SensorEventService {
         return DirectWriteResult.of(requests.size(), savedEvents, elapsedMs);
     }
 
+    /**
+     * Saving Lots of Event to Repository by Using JDBC. Because of Size of Batch. When Using JPA, it will be slow. So Using JDBC and 'on conflict'.
+     * @param events
+     * @return
+     */
     private int batchInsertEvents(List<SensorEvent> events) {
         String sql = """
                 insert into sensor_event (
@@ -182,6 +199,11 @@ public class SensorEventService {
         return count;
     }
 
+    /**
+     * Convert to SensorEvent Object that is the way to save Repository
+     * @param request
+     * @return
+     */
     private SensorEvent toEvent(SensorEventRequest request) {
         Instant now = Instant.now();
         Instant occurredAt = request.occurredAt() == null ? now : request.occurredAt();
@@ -203,6 +225,12 @@ public class SensorEventService {
         );
     }
 
+    /**
+     * Update the Equipment status. Because if calculated Evnet status was WARNING or FAIL, It is important to know which equipment is Fail or Warning.
+     * The equipment is influenced from Event
+     * And The reason why save status of the equipment is the way that makes easy to find equipment status without events.
+     * @param event Event Object. It will be using at finding Equipment from Repository
+     */
     private void upsertEquipment(SensorEvent event) {
         Instant now = Instant.now();
         Equipment equipment = equipmentRepository.findById(event.getEquipmentId())

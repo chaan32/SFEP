@@ -7,11 +7,17 @@ import java.util.NoSuchElementException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
+// Tracker of Kafka Messages
 @Component
 public class KafkaRunTracker {
 
     private final ConcurrentMap<String, KafkaRunState> states = new ConcurrentHashMap<>();
 
+    /**
+     * Note the Running
+     * @param runId Id of Kafka Executing
+     * @param expectedEvents size of Events
+     */
     public void start(String runId, int expectedEvents) {
         states.put(runId, new KafkaRunState(runId, expectedEvents));
     }
