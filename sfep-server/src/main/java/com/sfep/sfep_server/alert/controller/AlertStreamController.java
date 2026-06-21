@@ -1,9 +1,12 @@
 package com.sfep.sfep_server.alert.controller;
 
 import com.sfep.sfep_server.alert.dto.AlertEventResponse;
+import com.sfep.sfep_server.alert.dto.AlertMetricsResponse;
 import com.sfep.sfep_server.alert.service.AlertEventBus;
+import com.sfep.sfep_server.alert.service.AlertMetricsService;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -17,9 +20,21 @@ import java.util.function.Consumer;
 public class AlertStreamController {
 
     private final AlertEventBus alertEventBus;
+    private final AlertMetricsService alertMetricsService;
 
-    public AlertStreamController(AlertEventBus alertEventBus) {
+    public AlertStreamController(AlertEventBus alertEventBus, AlertMetricsService alertMetricsService) {
         this.alertEventBus = alertEventBus;
+        this.alertMetricsService = alertMetricsService;
+    }
+
+    @GetMapping("/metrics")
+    public AlertMetricsResponse metrics() {
+        return alertMetricsService.snapshot();
+    }
+
+    @PostMapping("/metrics/reset")
+    public AlertMetricsResponse resetMetrics() {
+        return alertMetricsService.reset();
     }
 
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)

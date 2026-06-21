@@ -1,20 +1,29 @@
-# Smart Factory Event Monitoring Platform
+# SFEP - Large-scale Event Processing System
 
-SFEP는 제조 설비에서 발생하는 센서 이벤트를 수집, 저장, 조회하고 단계별 성능 개선 실험을 하기 위한 포트폴리오용 백엔드 프로젝트입니다.
+SFEP는 제조 설비에서 발생하는 대규모 이벤트를 수집, 저장, 알림 처리하고 단계별 성능 개선 실험을 하기 위한 포트폴리오용 백엔드 프로젝트입니다.
 
-초기 버전은 일부러 가장 단순한 구조인 `Spring -> PostgreSQL 직접 저장`으로 구현합니다. 이후 Kafka, Consumer 병렬화, Batch Insert, Redis 최신 상태 캐시, DB Index/Partitioning, Retry/DLQ를 순서대로 추가하면서 병목 지점과 개선 수치를 비교합니다.
+처음부터 완성형 구조를 만드는 것이 아니라, `Direct DB Write -> Kafka -> Consumer 병렬화 -> Batch Insert -> 알림 분리 -> partition/concurrency 비교` 순서로 병목을 확인하고 개선 수치를 남기는 방식으로 진행합니다.
 
 ## Current Stage
 
-`Stage 0 - Direct DB Write`
+`Stage 6 - Kafka Partition / Consumer Concurrency 비교 완료`
 
-- 설비 센서 이벤트를 HTTP API로 수집
-- 이벤트를 PostgreSQL에 직접 저장
-- 설비별 최신 상태를 `equipment` 테이블에 갱신
-- 로컬 실행 시 Swing 기반 데스크톱 모니터 실행
-- 시뮬레이터 API로 테스트 이벤트 생성
-- 대시보드 요약 API로 현재 상태 조회
-- Actuator/Prometheus 기반 메트릭 노출
+- Direct DB Write 기준선 측정
+- JDBC Batch Insert와 최신 설비 상태 upsert 적용
+- Kafka 기반 수집/저장 분리
+- Storage Consumer와 Alert Consumer 분리
+- SSE 기반 실시간 알림 endpoint 제공
+- Swing 기반 이벤트 처리/알림 모니터 제공
+- 100,000건 기준 Kafka partition/concurrency 조합 비교
+
+현재까지의 핵심 결론:
+
+- 50,000건 기준 Direct DB Write 처리 시간이 `53,611ms -> 1,849ms`로 단축됨
+- 저장 처리율이 `933 events/sec -> 27,056 events/sec`로 향상됨
+- Kafka Consumer 병렬화 후 약 `50,000 events/sec` 수준의 처리량을 검증함
+- 100,000건 기준 Alert Consumer 분리 후 p95 알림 지연이 `6,959ms -> 1,926ms`로 감소함
+- `12 partitions / 12 concurrency`는 오히려 저장 처리량이 감소하여 PostgreSQL write 경합 가능성을 확인함
+- 다음 단계는 PostgreSQL index/partitioning과 조회 성능 최적화
 
 ## Tech Stack
 
@@ -27,6 +36,19 @@ SFEP는 제조 설비에서 발생하는 센서 이벤트를 수집, 저장, 조
 - Docker Compose
 - Prometheus
 - Grafana
+
+## Architecture
+
+```text
+Factory Simulator
+-> Spring API
+-> Kafka
+-> Storage Consumer -> PostgreSQL
+-> Alert Consumer   -> SSE / Swing Alert Monitor
+
+PostgreSQL -> Dashboard Summary API
+Actuator   -> Prometheus -> Grafana
+```
 
 ## Run
 
@@ -60,6 +82,26 @@ GUI 없는 서버나 Docker 환경에서 실행할 때는 다음 옵션으로 �
 
 ```bash
 SFEP_DESKTOP_ENABLED=false ./gradlew bootRun
+```
+
+## Benchmark
+
+기본 성능 측정:
+
+```bash
+node scripts/benchmark-sfep.mjs
+```
+
+DB batch, Kafka poll, Hikari pool 조합 측정:
+
+```bash
+scripts/run-performance-matrix.sh
+```
+
+Kafka partition/concurrency 조합 측정:
+
+```bash
+scripts/run-partition-concurrency-matrix.sh
 ```
 
 ## API
@@ -106,3 +148,13 @@ curl -X POST http://localhost:8080/api/v1/events/direct \
 - Grafana: http://localhost:3001
 - Spring Actuator: http://localhost:8080/actuator
 - Prometheus Metrics: http://localhost:8080/actuator/prometheus
+
+## Docs
+
+- [Final Project Summary](docs/SFEP_FINAL_SUMMARY.md)
+- [Portfolio Notion Template](docs/SFEP_PORTFOLIO_NOTION.md)
+- [Performance Experiment Plan](docs/performance-experiment.md)
+- [Performance Check Template](docs/performance-check-template.md)
+- [Docs Index](docs/README.md)
+
+`docs/SFEP_STEP*.md` 파일은 단계별 학습 노트이며 `.gitignore`에 포함되어 있습니다. 포트폴리오 작성용으로 로컬에만 유지합니다.

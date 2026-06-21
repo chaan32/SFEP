@@ -24,6 +24,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
 public class SfepAlertFrame extends JFrame {
 
@@ -47,6 +50,8 @@ public class SfepAlertFrame extends JFrame {
     private final JLabel averageServerLatencyLabel = new JLabel("0 ms");
     private final JLabel averageUiLatencyLabel = new JLabel("0 ms");
     private final JLabel averageTotalLatencyLabel = new JLabel("0 ms");
+    private final JLabel p95TotalLatencyLabel = new JLabel("0 ms");
+    private final JLabel p99TotalLatencyLabel = new JLabel("0 ms");
     private final Runnable unsubscribe;
 
     private long totalAlerts;
@@ -55,11 +60,12 @@ public class SfepAlertFrame extends JFrame {
     private long serverLatencyTotalMs;
     private long uiLatencyTotalMs;
     private long displayLatencyTotalMs;
+    private final List<Long> displayLatencySamples = new ArrayList<>();
 
     public SfepAlertFrame(AlertEventBus alertEventBus) {
         super("SFEP Real-time Alert Monitor");
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        setMinimumSize(new Dimension(980, 520));
+        setMinimumSize(new Dimension(1120, 560));
         setLocationByPlatform(true);
 
         add(buildRootPanel(), BorderLayout.CENTER);
@@ -96,13 +102,15 @@ public class SfepAlertFrame extends JFrame {
     }
 
     private JPanel buildCounterPanel() {
-        JPanel panel = new JPanel(new GridLayout(2, 3, 10, 10));
+        JPanel panel = new JPanel(new GridLayout(2, 4, 10, 10));
         panel.add(counter("전체", totalAlertLabel));
         panel.add(counter("WARNING", warningAlertLabel));
         panel.add(counter("CRITICAL", criticalAlertLabel));
         panel.add(counter("평균 서버", averageServerLatencyLabel));
         panel.add(counter("평균 UI", averageUiLatencyLabel));
         panel.add(counter("평균 총 표시", averageTotalLatencyLabel));
+        panel.add(counter("p95 총 표시", p95TotalLatencyLabel));
+        panel.add(counter("p99 총 표시", p99TotalLatencyLabel));
         return panel;
     }
 
@@ -150,6 +158,10 @@ public class SfepAlertFrame extends JFrame {
         serverLatencyTotalMs += alert.alertLatencyMs();
         uiLatencyTotalMs += uiQueueLatencyMs;
         displayLatencyTotalMs += totalDisplayLatencyMs;
+        displayLatencySamples.add(totalDisplayLatencyMs);
+        if (displayLatencySamples.size() > MAX_ROWS) {
+            displayLatencySamples.remove(0);
+        }
         if (alert.severity() == EventSeverity.CRITICAL) {
             criticalAlerts++;
             Toolkit.getDefaultToolkit().beep();
@@ -171,6 +183,8 @@ public class SfepAlertFrame extends JFrame {
         averageServerLatencyLabel.setText(formatAverage(serverLatencyTotalMs));
         averageUiLatencyLabel.setText(formatAverage(uiLatencyTotalMs));
         averageTotalLatencyLabel.setText(formatAverage(displayLatencyTotalMs));
+        p95TotalLatencyLabel.setText(formatPercentile(95));
+        p99TotalLatencyLabel.setText(formatPercentile(99));
 
         tableModel.insertRow(0, new Object[]{
                 TIME_FORMATTER.format(alert.occurredAt()),
@@ -198,5 +212,17 @@ public class SfepAlertFrame extends JFrame {
             return "0 ms";
         }
         return "%.2f ms".formatted((double) totalLatencyMs / totalAlerts);
+    }
+
+    private String formatPercentile(int percentile) {
+        if (displayLatencySamples.isEmpty()) {
+            return "0 ms";
+        }
+        List<Long> sorted = displayLatencySamples.stream()
+                .sorted(Comparator.naturalOrder())
+                .toList();
+        int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
+        int boundedIndex = Math.max(0, Math.min(index, sorted.size() - 1));
+        return "%d ms".formatted(sorted.get(boundedIndex));
     }
 }

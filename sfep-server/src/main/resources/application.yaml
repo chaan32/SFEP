@@ -2,10 +2,13 @@ spring:
   application:
     name: sfep-server
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://127.0.0.1:55432/sfep}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://127.0.0.1:55432/sfep?reWriteBatchedInserts=true}
     username: ${SPRING_DATASOURCE_USERNAME:sfep}
     password: ${SPRING_DATASOURCE_PASSWORD:sfep}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${SFEP_HIKARI_MAX_POOL_SIZE:10}
+      minimum-idle: ${SFEP_HIKARI_MIN_IDLE:2}
   jpa:
     open-in-view: false
     hibernate:
@@ -13,6 +16,10 @@ spring:
     properties:
       hibernate:
         format_sql: false
+        jdbc:
+          batch_size: ${SFEP_HIBERNATE_JDBC_BATCH_SIZE:1000}
+        order_inserts: true
+        order_updates: true
     show-sql: false
   data:
     redis:
@@ -20,6 +27,29 @@ spring:
       port: ${SPRING_DATA_REDIS_PORT:6379}
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: ${SFEP_KAFKA_PRODUCER_ACKS:all}
+      properties:
+        linger.ms: ${SFEP_KAFKA_PRODUCER_LINGER_MS:10}
+        batch.size: ${SFEP_KAFKA_PRODUCER_BATCH_SIZE:65536}
+        compression.type: ${SFEP_KAFKA_PRODUCER_COMPRESSION_TYPE:lz4}
+        buffer.memory: ${SFEP_KAFKA_PRODUCER_BUFFER_MEMORY:67108864}
+    consumer:
+      group-id: ${SFEP_KAFKA_CONSUMER_GROUP:sfep-event-processor}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      max-poll-records: ${SFEP_KAFKA_MAX_POLL_RECORDS:1000}
+      properties:
+        spring.json.trusted.packages: com.sfep.sfep_server.*
+        spring.json.value.default.type: com.sfep.sfep_server.kafka.dto.KafkaSensorEventMessage
+    listener:
+      type: batch
+      ack-mode: batch
+      concurrency: ${SFEP_KAFKA_CONCURRENCY:3}
 
 server:
   port: ${SERVER_PORT:8080}
@@ -40,4 +70,20 @@ sfep:
   direct-write:
     default-equipment-count: 100
     default-events-per-equipment: 10
-    max-events-per-request: 50000
+    max-events-per-request: ${SFEP_MAX_EVENTS_PER_REQUEST:100000}
+    jdbc-batch-size: ${SFEP_JDBC_BATCH_SIZE:1000}
+  kafka:
+    sensor-events-topic: ${SFEP_KAFKA_SENSOR_EVENTS_TOPIC:sfep.sensor-events}
+    consumer-group: ${SFEP_KAFKA_CONSUMER_GROUP:sfep-event-processor}
+    alert-consumer-group: ${SFEP_KAFKA_ALERT_CONSUMER_GROUP:sfep-alert-processor}
+    alert-consumer-enabled: ${SFEP_KAFKA_ALERT_CONSUMER_ENABLED:true}
+    max-events-per-request: ${SFEP_MAX_EVENTS_PER_REQUEST:100000}
+    partitions: ${SFEP_KAFKA_PARTITIONS:6}
+    replication-factor: ${SFEP_KAFKA_REPLICATION_FACTOR:1}
+    retry-interval-ms: ${SFEP_KAFKA_RETRY_INTERVAL_MS:1000}
+    retry-max-attempts: ${SFEP_KAFKA_RETRY_MAX_ATTEMPTS:3}
+  alert:
+    executor:
+      core-pool-size: ${SFEP_ALERT_CORE_POOL_SIZE:2}
+      max-pool-size: ${SFEP_ALERT_MAX_POOL_SIZE:4}
+      queue-capacity: ${SFEP_ALERT_QUEUE_CAPACITY:10000}

@@ -19,6 +19,7 @@ import java.time.Instant;
 @Table(
         name = "sensor_event",
         indexes = {
+                @Index(name = "idx_sensor_event_occurred_at", columnList = "occurred_at"),
                 @Index(name = "idx_sensor_event_equipment_time", columnList = "equipment_id, occurred_at"),
                 @Index(name = "idx_sensor_event_severity_time", columnList = "severity, occurred_at"),
                 @Index(name = "idx_sensor_event_status_time", columnList = "status, occurred_at")

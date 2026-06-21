@@ -32,3 +32,6 @@ kafka-data/
 
 # Nested clone accidentally created during setup.
 /SFEP/
+
+# Local learning notes for step-by-step portfolio writing.
+/docs/SFEP_STEP*.md

@@ -5,6 +5,10 @@ import com.sfep.sfep_server.equipment.domain.EquipmentType;
 import com.sfep.sfep_server.event.dto.DirectWriteResult;
 import com.sfep.sfep_server.event.dto.SensorEventRequest;
 import com.sfep.sfep_server.event.service.SensorEventService;
+import com.sfep.sfep_server.kafka.dto.KafkaPublishResponse;
+import com.sfep.sfep_server.kafka.dto.KafkaRunStatusResponse;
+import com.sfep.sfep_server.kafka.service.KafkaRunTracker;
+import com.sfep.sfep_server.kafka.service.SensorEventKafkaProducer;
 import com.sfep.sfep_server.simulator.dto.SimulatorRunRequest;
 import com.sfep.sfep_server.simulator.dto.SimulatorRunResponse;
 import org.springframework.beans.factory.annotation.Value;
@@ -20,15 +24,21 @@ import java.util.concurrent.ThreadLocalRandom;
 public class FactorySimulatorService {
 
     private final SensorEventService sensorEventService;
+    private final SensorEventKafkaProducer sensorEventKafkaProducer;
+    private final KafkaRunTracker kafkaRunTracker;
     private final int defaultEquipmentCount;
     private final int defaultEventsPerEquipment;
 
     public FactorySimulatorService(
             SensorEventService sensorEventService,
+            SensorEventKafkaProducer sensorEventKafkaProducer,
+            KafkaRunTracker kafkaRunTracker,
             @Value("${sfep.direct-write.default-equipment-count:100}") int defaultEquipmentCount,
             @Value("${sfep.direct-write.default-events-per-equipment:10}") int defaultEventsPerEquipment
     ) {
         this.sensorEventService = sensorEventService;
+        this.sensorEventKafkaProducer = sensorEventKafkaProducer;
+        this.kafkaRunTracker = kafkaRunTracker;
         this.defaultEquipmentCount = defaultEquipmentCount;
         this.defaultEventsPerEquipment = defaultEventsPerEquipment;
     }
@@ -43,6 +53,21 @@ public class FactorySimulatorService {
         List<SensorEventRequest> events = generateEvents(equipmentCount, eventsPerEquipment, failureRatePercent);
         DirectWriteResult result = sensorEventService.saveDirectBatch(events);
         return SimulatorRunResponse.of(equipmentCount, eventsPerEquipment, result, "DIRECT_DB_WRITE");
+    }
+
+    public KafkaPublishResponse runKafkaWrite(SimulatorRunRequest request) {
+        int equipmentCount = request.equipmentCount() == null ? defaultEquipmentCount : request.equipmentCount();
+        int eventsPerEquipment = request.eventsPerEquipment() == null
+                ? defaultEventsPerEquipment
+                : request.eventsPerEquipment();
+        int failureRatePercent = request.failureRatePercent() == null ? 2 : request.failureRatePercent();
+
+        List<SensorEventRequest> events = generateEvents(equipmentCount, eventsPerEquipment, failureRatePercent);
+        return sensorEventKafkaProducer.publish(equipmentCount, eventsPerEquipment, events);
+    }
+
+    public KafkaRunStatusResponse getKafkaRunStatus(String runId) {
+        return kafkaRunTracker.get(runId);
     }
 
     private List<SensorEventRequest> generateEvents(
