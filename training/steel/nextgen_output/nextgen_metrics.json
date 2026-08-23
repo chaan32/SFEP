@@ -1,0 +1,211 @@
+{
+  "calibrator_sha256": "7700915460b56e784fef57f6016134879901503b3124b6876114ec47bdfbc6f1",
+  "candidate_models": [
+    "logistic_l2_c0_1_base",
+    "logistic_l2_c0_03_engineered",
+    "logistic_l2_c0_3_engineered",
+    "logistic_l2_c1_engineered",
+    "elastic_net_c0_03_l1r0_25",
+    "elastic_net_c0_1_l1r0_25",
+    "elastic_net_c0_1_l1r0_5",
+    "elastic_net_c0_3_l1r0_5",
+    "extra_trees_depth6_leaf10",
+    "extra_trees_depth10_leaf20",
+    "extra_trees_unbounded_leaf30",
+    "random_forest_depth6_leaf10",
+    "random_forest_depth10_leaf20",
+    "hist_gb_leaves7_leaf20",
+    "hist_gb_leaves15_leaf20",
+    "hist_gb_leaves15_leaf40",
+    "rank_average_top2"
+  ],
+  "deployment_eligible": false,
+  "development_positive_labels": 299,
+  "development_rows": 14963,
+  "group_oof_folds": 5,
+  "holdout_used_for_selection": false,
+  "leaderboard": [
+    {
+      "feature_variant": "engineered_union",
+      "model": "rank_average_top2",
+      "oof_brier_score": 0.3152042708012818,
+      "oof_pr_auc": 0.12241328793508756,
+      "oof_roc_auc": 0.7966433620342039,
+      "recommended": true,
+      "worst_time_pr_auc": 0.021815978829823196
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "random_forest_depth10_leaf20",
+      "oof_brier_score": 0.05321479698544764,
+      "oof_pr_auc": 0.12034657316653548,
+      "oof_roc_auc": 0.7950836759009391,
+      "recommended": false,
+      "worst_time_pr_auc": 0.026235962112206242
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "hist_gb_leaves15_leaf20",
+      "oof_brier_score": 0.1069946865732895,
+      "oof_pr_auc": 0.11608187945490046,
+      "oof_roc_auc": 0.7818663137901024,
+      "recommended": false,
+      "worst_time_pr_auc": 0.016951269166470953
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "extra_trees_depth10_leaf20",
+      "oof_brier_score": 0.11239743297047561,
+      "oof_pr_auc": 0.10927051443479185,
+      "oof_roc_auc": 0.7736930430038663,
+      "recommended": false,
+      "worst_time_pr_auc": 0.02225198452917139
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "hist_gb_leaves7_leaf20",
+      "oof_brier_score": 0.13140033239728344,
+      "oof_pr_auc": 0.1090535389220455,
+      "oof_roc_auc": 0.7769583828254576,
+      "recommended": false,
+      "worst_time_pr_auc": 0.018245891233175177
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "extra_trees_unbounded_leaf30",
+      "oof_brier_score": 0.10409228869191599,
+      "oof_pr_auc": 0.10552309939603233,
+      "oof_roc_auc": 0.7761348065108828,
+      "recommended": false,
+      "worst_time_pr_auc": 0.021065501300500063
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "hist_gb_leaves15_leaf40",
+      "oof_brier_score": 0.09647967500214501,
+      "oof_pr_auc": 0.0985503784468324,
+      "oof_roc_auc": 0.7825923883393818,
+      "recommended": false,
+      "worst_time_pr_auc": 0.015118143395188393
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "random_forest_depth6_leaf10",
+      "oof_brier_score": 0.11034584824935245,
+      "oof_pr_auc": 0.0913292136589079,
+      "oof_roc_auc": 0.7614534354376381,
+      "recommended": false,
+      "worst_time_pr_auc": 0.027462564167856363
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "extra_trees_depth6_leaf10",
+      "oof_brier_score": 0.17017631843134495,
+      "oof_pr_auc": 0.07135288326845582,
+      "oof_roc_auc": 0.7446582717076562,
+      "recommended": false,
+      "worst_time_pr_auc": 0.02466324902818464
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "logistic_l2_c0_03_engineered",
+      "oof_brier_score": 0.1875739891664075,
+      "oof_pr_auc": 0.06289009002322718,
+      "oof_roc_auc": 0.7463298282874175,
+      "recommended": false,
+      "worst_time_pr_auc": 0.016077930369139015
+    },
+    {
+      "feature_variant": "base",
+      "model": "logistic_l2_c0_1_base",
+      "oof_brier_score": 0.18746340752472404,
+      "oof_pr_auc": 0.0626387096195517,
+      "oof_roc_auc": 0.7466765012306888,
+      "recommended": false,
+      "worst_time_pr_auc": 0.01605914723256051
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "logistic_l2_c0_3_engineered",
+      "oof_brier_score": 0.18652316282578696,
+      "oof_pr_auc": 0.06224041040516989,
+      "oof_roc_auc": 0.7402646483002989,
+      "recommended": false,
+      "worst_time_pr_auc": 0.016306231811066788
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "elastic_net_c0_1_l1r0_25",
+      "oof_brier_score": 0.18538471104664422,
+      "oof_pr_auc": 0.062010841878778145,
+      "oof_roc_auc": 0.7363958238682498,
+      "recommended": false,
+      "worst_time_pr_auc": 0.009499134307828335
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "logistic_l2_c1_engineered",
+      "oof_brier_score": 0.18639891517306367,
+      "oof_pr_auc": 0.06187042879008732,
+      "oof_roc_auc": 0.7380981704791566,
+      "recommended": false,
+      "worst_time_pr_auc": 0.016997794869162
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "elastic_net_c0_3_l1r0_5",
+      "oof_brier_score": 0.20523947025256234,
+      "oof_pr_auc": 0.05936965284868189,
+      "oof_roc_auc": 0.7345069124760294,
+      "recommended": false,
+      "worst_time_pr_auc": 0.0187636797948654
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "elastic_net_c0_1_l1r0_5",
+      "oof_brier_score": 0.20439819626149971,
+      "oof_pr_auc": 0.05753052554537784,
+      "oof_roc_auc": 0.7384024216017384,
+      "recommended": false,
+      "worst_time_pr_auc": 0.016062727215611666
+    },
+    {
+      "feature_variant": "engineered",
+      "model": "elastic_net_c0_03_l1r0_25",
+      "oof_brier_score": 0.1872493680116637,
+      "oof_pr_auc": 0.05027452578929346,
+      "oof_roc_auc": 0.7213426916782073,
+      "recommended": false,
+      "worst_time_pr_auc": 0.021420015821729296
+    }
+  ],
+  "model_sha256": "b6e6aeb381994eb6282e359e5cf6e8df90fd3e25d6a3c2660e872d41a7f8247b",
+  "nextgen_version": "steel-quality-nextgen-v0.1",
+  "policy_threshold": 0.8275078527033348,
+  "recommendation": {
+    "best_candidate_model": "rank_average_top2",
+    "best_candidate_oof_pr_auc": 0.12241328793508756,
+    "incumbent_model": "logistic_l2_c0_1_base",
+    "incumbent_oof_pr_auc": 0.0626387096195517,
+    "min_pr_auc_improvement": 0.005,
+    "oof_pr_auc_improvement": 0.059774578315535856,
+    "recommended_model": "rank_average_top2",
+    "status": "ADOPT_NEXT_CHALLENGER"
+  },
+  "required_next_step": "FUTURE_SHADOW_VALIDATION",
+  "selected_thresholds_by_fpr_cap": {
+    "0.1": 0.8825436075653279,
+    "0.15": 0.8275078527033348,
+    "0.2": 0.7882777517877431
+  },
+  "software": {
+    "numpy": "2.4.2",
+    "pandas": "3.0.1",
+    "scikit_learn": "1.9.0"
+  },
+  "source": {
+    "modeling_cohort": "training/steel/output/modeling_cohort.csv",
+    "modeling_cohort_sha256": "6fd8584302ec48e092a297063c6036a7c0f40221927428500128c508b9411eb7"
+  },
+  "time_folds": 2
+}

@@ -1,0 +1,31 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:sfep;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: create-drop
+  data:
+    redis:
+      repositories:
+        enabled: false
+  kafka:
+    listener:
+      auto-startup: false
+    admin:
+      enabled: false
+      fail-fast: false
+
+sfep:
+  desktop:
+    enabled: false
+  kafka:
+    alert-consumer-enabled: false
+  steel-shadow:
+    enabled: false
+    base-url: http://127.0.0.1:18081
+    connect-timeout: 2s
+    read-timeout: 120s

@@ -38,3 +38,15 @@ kafka-data/
 
 # Keep Markdown notes and portfolio drafts local.
 *.md
+
+# Version the Steel Shadow integration documentation and model cards.
+!docs/
+!docs/**/*.md
+!training/steel/README.md
+!training/steel/**/*_report.md
+!training/steel/**/*_model_card.md
+
+# Python cache and runtime lock files remain local.
+**/__pycache__/
+*.py[cod]
+training/**/.shadow.lock

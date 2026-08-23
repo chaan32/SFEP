@@ -64,6 +64,11 @@ management:
       show-details: always
 
 sfep:
+  steel-shadow:
+    enabled: ${SFEP_STEEL_SHADOW_ENABLED:false}
+    base-url: ${SFEP_STEEL_SHADOW_BASE_URL:http://127.0.0.1:18081}
+    connect-timeout: ${SFEP_STEEL_SHADOW_CONNECT_TIMEOUT:2s}
+    read-timeout: ${SFEP_STEEL_SHADOW_READ_TIMEOUT:120s}
   desktop:
     enabled: ${SFEP_DESKTOP_ENABLED:true}
     dashboard-refresh-ms: ${SFEP_DESKTOP_DASHBOARD_REFRESH_MS:1000}
