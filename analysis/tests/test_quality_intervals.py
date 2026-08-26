@@ -1060,156 +1060,254 @@ def test_direct_posix_spawn_maps_worker_standard_streams_with_file_actions(
     ]
 
 
-def _run_descriptor_fallback_subprocess(tmp_path, soft_limit: int):
-    marker_path = tmp_path / f"fallback-{soft_limit}.json"
-    read_fd, write_fd = os.pipe()
-    os.set_inheritable(write_fd, True)
-    program = """
+def _child_pythonpath(injection_directory: Path) -> str:
+    existing = os.environ.get("PYTHONPATH")
+    return str(injection_directory) + (
+        "" if not existing else os.pathsep + existing
+    )
+
+
+def _wait_for_spawned_process(pid: int, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.005)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    raise AssertionError("bootstrap worker entry did not exit promptly")
+
+
+def test_real_worker_entry_fails_before_heavy_import_when_fd_directories_unavailable(
+    tmp_path,
+):
+    marker_path = tmp_path / "entry-marker.json"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        """
+import atexit
 import json
+import os
+from pathlib import Path
+import resource
+import sys
+
+marker_path = Path(os.environ['SFEP_FD_MARKER'])
+attempted = []
+high_fd_open_on_attempt = []
+listdir_calls = []
+real_listdir = os.listdir
+
+class ImportMarker:
+    def find_spec(self, fullname, _path=None, _target=None):
+        if fullname in {'equipment_quality.quality_intervals', 'pandas'}:
+            attempted.append(fullname)
+            try:
+                os.fstat(100)
+                high_fd_open_on_attempt.append(True)
+            except OSError:
+                high_fd_open_on_attempt.append(False)
+        return None
+
+def unavailable(path):
+    if path in {'/dev/fd', '/proc/self/fd'}:
+        listdir_calls.append(path)
+        raise OSError('injected descriptor-directory failure')
+    return real_listdir(path)
+
+def write_marker():
+    marker_path.write_text(
+        json.dumps(
+            {
+                'attempted': attempted,
+                'highFdOpenOnAttempt': high_fd_open_on_attempt,
+                'listdirCalls': listdir_calls,
+                'loaded': [
+                    name for name in ('equipment_quality.quality_intervals', 'pandas')
+                    if name in sys.modules
+                ],
+                'softLimit': resource.getrlimit(resource.RLIMIT_NOFILE)[0],
+                'stdio': [fd for fd in (0, 1, 2) if _fd_open(fd)],
+            },
+            sort_keys=True,
+        ),
+        encoding='utf-8',
+    )
+
+def _fd_open(fd):
+    try:
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+os.listdir = unavailable
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (10, hard))
+sys.meta_path.insert(0, ImportMarker())
+atexit.register(write_marker)
+""",
+        encoding="utf-8",
+    )
+    read_fd, write_fd = os.pipe()
+    saved_fd_100 = None
+    saved_fd_100_inheritable = None
+    try:
+        try:
+            saved_fd_100_inheritable = os.get_inheritable(100)
+            saved_fd_100 = os.dup(100)
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                raise
+        os.dup2(write_fd, 100, inheritable=True)
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = _child_pythonpath(tmp_path)
+        environment["SFEP_FD_MARKER"] = str(marker_path)
+        output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        started = time.monotonic()
+        pid = os.posix_spawn(
+            sys.executable,
+            (
+                sys.executable,
+                "-m",
+                "equipment_quality._bootstrap_worker",
+                "--bootstrap-worker",
+                str(tmp_path / "missing-input.pickle"),
+            ),
+            environment,
+            file_actions=(
+                (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+                (
+                    os.POSIX_SPAWN_OPEN,
+                    1,
+                    str(tmp_path / "stdout"),
+                    output_flags,
+                    0o600,
+                ),
+                (
+                    os.POSIX_SPAWN_OPEN,
+                    2,
+                    str(tmp_path / "stderr"),
+                    output_flags,
+                    0o600,
+                ),
+            ),
+            setsigmask=(),
+        )
+    finally:
+        if saved_fd_100 is None:
+            try:
+                os.close(100)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+        else:
+            os.dup2(
+                saved_fd_100,
+                100,
+                inheritable=saved_fd_100_inheritable,
+            )
+            os.close(saved_fd_100)
+        os.close(write_fd)
+
+    try:
+        returncode = _wait_for_spawned_process(pid, 2.0)
+        readable, _, _ = select.select((read_fd,), (), (), 0.1)
+        assert readable and os.read(read_fd, 1) == b""
+    finally:
+        os.close(read_fd)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+    assert returncode != 0
+    assert time.monotonic() - started < 2.0
+    assert marker == {
+        "attempted": [],
+        "highFdOpenOnAttempt": [],
+        "listdirCalls": ["/dev/fd", "/proc/self/fd"],
+        "loaded": [],
+        "softLimit": 10,
+        "stdio": [0, 1, 2],
+    }
+
+
+def test_dev_fd_failure_uses_proc_snapshot_and_runs_real_worker_entry(
+    monkeypatch,
+    tmp_path,
+):
+    marker_path = tmp_path / "proc-marker.json"
+    (tmp_path / "sitecustomize.py").write_text(
+        """
+import atexit
+import json
+import os
 from pathlib import Path
 import sys
-from equipment_quality import _bootstrap_worker as worker
 
-soft_limit = int(sys.argv[1])
-marker_path = Path(sys.argv[2])
+marker_path = Path(os.environ['SFEP_FD_MARKER'])
 calls = []
-real_closerange = worker.os.closerange
+real_listdir = os.listdir
+snapshot = real_listdir('/dev/fd')
 
-def unavailable(_path):
-    raise OSError('descriptor directory unavailable')
+def injected_listdir(path):
+    if path == '/dev/fd':
+        calls.append(path)
+        raise OSError('injected /dev/fd failure')
+    if path == '/proc/self/fd':
+        calls.append(path)
+        return snapshot
+    return real_listdir(path)
 
-def observed_closerange(low, high):
-    calls.append([low, high])
-    if soft_limit <= 1_048_576:
-        real_closerange(low, high)
-
-worker.os.listdir = unavailable
-worker.os.closerange = observed_closerange
-worker.resource.getrlimit = lambda _resource: (soft_limit, soft_limit)
-status = 0
-error = None
-try:
-    worker._close_inherited_file_descriptors()
-except BaseException as caught:
-    status = 78
-    error = f'{type(caught).__name__}: {caught}'
-marker_path.write_text(
-    json.dumps(
-        {
-            'calls': calls,
-            'error': error,
-            'heavy': [
-                name for name in ('equipment_quality.quality_intervals', 'pandas')
-                if name in sys.modules
-            ],
-        },
-        sort_keys=True,
-    ),
-    encoding='utf-8',
-)
-raise SystemExit(status)
-"""
-    started = time.monotonic()
-    pid = os.posix_spawn(
-        sys.executable,
-        (
-            sys.executable,
-            "-c",
-            program,
-            str(soft_limit),
-            str(marker_path),
+def write_marker():
+    marker_path.write_text(
+        json.dumps(
+            {
+                'calls': calls,
+                'heavyLoaded': all(
+                    name in sys.modules
+                    for name in ('equipment_quality.quality_intervals', 'pandas')
+                ),
+                'stdio': [fd for fd in (0, 1, 2) if _fd_open(fd)],
+            },
+            sort_keys=True,
         ),
-        dict(os.environ),
+        encoding='utf-8',
     )
-    os.close(write_fd)
-    write_fd = -1
-    waited = False
+
+def _fd_open(fd):
     try:
-        readable, _, _ = select.select((read_fd,), (), (), 2.0)
-        assert readable, "descriptor fallback retained the inherited pipe"
-        assert os.read(read_fd, 1) == b""
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            waited_pid, status = os.waitpid(pid, os.WNOHANG)
-            if waited_pid == pid:
-                waited = True
-                break
-            time.sleep(0.005)
-        assert waited, "descriptor fallback subprocess did not exit promptly"
-    finally:
-        if not waited:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-        if write_fd >= 0:
-            os.close(write_fd)
-        os.close(read_fd)
-    return (
-        os.waitstatus_to_exitcode(status),
-        json.loads(marker_path.read_text(encoding="utf-8")),
-        time.monotonic() - started,
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+os.listdir = injected_listdir
+atexit.register(write_marker)
+""",
+        encoding="utf-8",
     )
+    monkeypatch.setenv("PYTHONPATH", _child_pythonpath(tmp_path))
+    monkeypatch.setenv("SFEP_FD_MARKER", str(marker_path))
 
-
-@pytest.mark.parametrize(
-    ("soft_limit", "expected_exit", "expected_calls"),
-    [
-        (1_048_575, 0, [[3, 1_048_575]]),
-        (9223372036854775807, 78, []),
-        (2**31 - 1, 78, []),
-    ],
-)
-def test_descriptor_directory_fallback_is_complete_or_fails_before_heavy_import(
-    tmp_path,
-    soft_limit,
-    expected_exit,
-    expected_calls,
-):
-    exit_code, marker, elapsed = _run_descriptor_fallback_subprocess(
-        tmp_path,
-        soft_limit,
+    responses = quality_intervals._parallel_bootstrap_tasks(
+        [_tiny_bootstrap_task()],
+        1,
     )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
 
-    assert exit_code == expected_exit
-    assert marker["calls"] == expected_calls
-    assert marker["heavy"] == []
-    assert (marker["error"] is None) == (expected_exit == 0)
-    assert elapsed < 2.0
-
-
-@pytest.mark.parametrize("soft_limit", [True, "1048575", None, -1, 0, 2])
-def test_descriptor_fallback_rejects_invalid_rlimit_without_closerange(
-    monkeypatch,
-    soft_limit,
-):
-    from equipment_quality import _bootstrap_worker
-
-    calls = []
-    monkeypatch.setattr(
-        _bootstrap_worker.os,
-        "listdir",
-        lambda _path: (_ for _ in ()).throw(OSError("unavailable")),
-    )
-    monkeypatch.setattr(
-        _bootstrap_worker.resource,
-        "getrlimit",
-        lambda _resource: (soft_limit, soft_limit),
-    )
-    monkeypatch.setattr(
-        _bootstrap_worker.os,
-        "closerange",
-        lambda low, high: calls.append((low, high)),
-    )
-
-    with pytest.raises(RuntimeError, match="RLIMIT_NOFILE"):
-        _bootstrap_worker._close_inherited_file_descriptors()
-
-    assert calls == []
+    assert len(responses) == 1
+    assert responses[0].interval.valid_replicates == 2000
+    assert marker == {
+        "calls": ["/dev/fd", "/proc/self/fd"],
+        "heavyLoaded": True,
+        "stdio": [0, 1, 2],
+    }
 
 
 def test_real_worker_does_not_retain_unrelated_inheritable_fd(
