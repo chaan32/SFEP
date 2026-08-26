@@ -1060,6 +1060,158 @@ def test_direct_posix_spawn_maps_worker_standard_streams_with_file_actions(
     ]
 
 
+def _run_descriptor_fallback_subprocess(tmp_path, soft_limit: int):
+    marker_path = tmp_path / f"fallback-{soft_limit}.json"
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(write_fd, True)
+    program = """
+import json
+from pathlib import Path
+import sys
+from equipment_quality import _bootstrap_worker as worker
+
+soft_limit = int(sys.argv[1])
+marker_path = Path(sys.argv[2])
+calls = []
+real_closerange = worker.os.closerange
+
+def unavailable(_path):
+    raise OSError('descriptor directory unavailable')
+
+def observed_closerange(low, high):
+    calls.append([low, high])
+    if soft_limit <= 1_048_576:
+        real_closerange(low, high)
+
+worker.os.listdir = unavailable
+worker.os.closerange = observed_closerange
+worker.resource.getrlimit = lambda _resource: (soft_limit, soft_limit)
+status = 0
+error = None
+try:
+    worker._close_inherited_file_descriptors()
+except BaseException as caught:
+    status = 78
+    error = f'{type(caught).__name__}: {caught}'
+marker_path.write_text(
+    json.dumps(
+        {
+            'calls': calls,
+            'error': error,
+            'heavy': [
+                name for name in ('equipment_quality.quality_intervals', 'pandas')
+                if name in sys.modules
+            ],
+        },
+        sort_keys=True,
+    ),
+    encoding='utf-8',
+)
+raise SystemExit(status)
+"""
+    started = time.monotonic()
+    pid = os.posix_spawn(
+        sys.executable,
+        (
+            sys.executable,
+            "-c",
+            program,
+            str(soft_limit),
+            str(marker_path),
+        ),
+        dict(os.environ),
+    )
+    os.close(write_fd)
+    write_fd = -1
+    waited = False
+    try:
+        readable, _, _ = select.select((read_fd,), (), (), 2.0)
+        assert readable, "descriptor fallback retained the inherited pipe"
+        assert os.read(read_fd, 1) == b""
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            waited_pid, status = os.waitpid(pid, os.WNOHANG)
+            if waited_pid == pid:
+                waited = True
+                break
+            time.sleep(0.005)
+        assert waited, "descriptor fallback subprocess did not exit promptly"
+    finally:
+        if not waited:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+    return (
+        os.waitstatus_to_exitcode(status),
+        json.loads(marker_path.read_text(encoding="utf-8")),
+        time.monotonic() - started,
+    )
+
+
+@pytest.mark.parametrize(
+    ("soft_limit", "expected_exit", "expected_calls"),
+    [
+        (1_048_575, 0, [[3, 1_048_575]]),
+        (9223372036854775807, 78, []),
+        (2**31 - 1, 78, []),
+    ],
+)
+def test_descriptor_directory_fallback_is_complete_or_fails_before_heavy_import(
+    tmp_path,
+    soft_limit,
+    expected_exit,
+    expected_calls,
+):
+    exit_code, marker, elapsed = _run_descriptor_fallback_subprocess(
+        tmp_path,
+        soft_limit,
+    )
+
+    assert exit_code == expected_exit
+    assert marker["calls"] == expected_calls
+    assert marker["heavy"] == []
+    assert (marker["error"] is None) == (expected_exit == 0)
+    assert elapsed < 2.0
+
+
+@pytest.mark.parametrize("soft_limit", [True, "1048575", None, -1, 0, 2])
+def test_descriptor_fallback_rejects_invalid_rlimit_without_closerange(
+    monkeypatch,
+    soft_limit,
+):
+    from equipment_quality import _bootstrap_worker
+
+    calls = []
+    monkeypatch.setattr(
+        _bootstrap_worker.os,
+        "listdir",
+        lambda _path: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+    monkeypatch.setattr(
+        _bootstrap_worker.resource,
+        "getrlimit",
+        lambda _resource: (soft_limit, soft_limit),
+    )
+    monkeypatch.setattr(
+        _bootstrap_worker.os,
+        "closerange",
+        lambda low, high: calls.append((low, high)),
+    )
+
+    with pytest.raises(RuntimeError, match="RLIMIT_NOFILE"):
+        _bootstrap_worker._close_inherited_file_descriptors()
+
+    assert calls == []
+
+
 def test_real_worker_does_not_retain_unrelated_inheritable_fd(
     tmp_path,
 ):

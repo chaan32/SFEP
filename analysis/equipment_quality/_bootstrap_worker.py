@@ -13,6 +13,9 @@ import resource
 import sys
 
 
+_MAX_COMPLETE_CLOSERANGE = 1_048_576
+
+
 def _close_inherited_file_descriptors() -> None:
     """Close the post-exec descriptor snapshot without changing parent flags."""
 
@@ -31,9 +34,20 @@ def _close_inherited_file_descriptors() -> None:
             continue
     if descriptors is None:
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft_limit == resource.RLIM_INFINITY:
-            soft_limit = 1_048_576
-        os.closerange(3, max(3, int(soft_limit)))
+        # Darwin's observed SC_OPEN_MAX is 1,048,575 and closing this complete
+        # finite range is bounded.  Truncating an infinite or larger range would
+        # silently retain descriptors; iterating a huge range can stall before
+        # package imports.  Both cases must fail the minimal worker immediately.
+        if (
+            type(soft_limit) is not int
+            or soft_limit == resource.RLIM_INFINITY
+            or not 3 <= soft_limit <= _MAX_COMPLETE_CLOSERANGE
+        ):
+            raise RuntimeError(
+                "descriptor directories unavailable and RLIMIT_NOFILE is not "
+                "a safe complete closerange bound"
+            )
+        os.closerange(3, soft_limit)
         return
 
     # PEP 446 makes newly-created Python descriptors non-inheritable by default,
