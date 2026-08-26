@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import random
+import struct
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -43,6 +46,12 @@ def test_canonical_json_uses_global_lexicographic_tie_break_for_smallest_normal(
     smallest_normal = float.fromhex("0x1.0000000000000p-1022")
 
     assert canonical_json_bytes(smallest_normal) == b"22250738585072012e-324\n"
+
+
+def test_canonical_json_uses_equal_length_18_digit_lexicographic_alternative():
+    value = float.fromhex("0x1.6345785d8a03fp+56")
+
+    assert canonical_json_bytes(value) == b"100000000000001008\n"
 
 
 def test_canonical_json_rejects_nested_non_finite_numbers():
@@ -87,6 +96,82 @@ def test_numpy_real_scalars_are_normalized_and_quantiles_return_builtin_float():
         type1_quantile([True], 0.5)
     with pytest.raises(TypeError):
         type1_quantile([1.0], True)
+    with pytest.raises(TypeError):
+        type1_quantile([np.bool_(True)], 0.5)
+    with pytest.raises(TypeError):
+        type1_quantile([1.0], np.bool_(True))
+
+
+def test_canonical_json_encodes_unique_finite_binary64_batch_within_ci_budget():
+    values = [
+        math.ldexp(1.0 + index / 997.0, -300 + ((index * 47) % 600))
+        for index in range(128)
+    ]
+
+    started = time.perf_counter()
+    encoded = [canonical_json_bytes(value) for value in values]
+    elapsed = time.perf_counter() - started
+
+    assert len(set(encoded)) == len(values)
+    assert elapsed < 1.0, f"encoded 128 unique binary64 values in {elapsed:.3f}s"
+
+
+def test_canonical_json_matches_independent_exhaustive_short_decimal_oracle():
+    oracle: dict[float, str] = {}
+    for coefficient in range(1, 1_000):
+        if coefficient % 10 == 0:
+            continue
+        digits = str(coefficient)
+        for exponent in range(-3, 10):
+            point = len(digits) + exponent
+            fixed = (
+                digits + ("0" * exponent)
+                if exponent >= 0
+                else (
+                    digits[:point] + "." + digits[point:]
+                    if point > 0
+                    else "0." + ("0" * (-point)) + digits
+                )
+            )
+            spellings = [fixed]
+            for decimal_point in range(1, len(digits) + 1):
+                mantissa = (
+                    digits
+                    if decimal_point == len(digits)
+                    else digits[:decimal_point] + "." + digits[decimal_point:]
+                )
+                spellings.append(f"{mantissa}e{exponent + len(digits) - decimal_point}")
+            for spelling in spellings:
+                for signed in (spelling, "-" + spelling):
+                    if len(signed) > 3:
+                        continue
+                    parsed = float(signed)
+                    incumbent = oracle.get(parsed)
+                    if incumbent is None or (len(signed), signed) < (len(incumbent), incumbent):
+                        oracle[parsed] = signed
+
+    for value, expected in oracle.items():
+        assert canonical_json_bytes(value) == (expected + "\n").encode("utf-8")
+
+
+def test_canonical_json_round_trips_random_and_extreme_finite_binary64_values():
+    extremes = [
+        float.fromhex("0x0.0000000000001p-1022"),
+        float.fromhex("0x1.0000000000000p-1022"),
+        float.fromhex("0x1.fffffffffffffp+1023"),
+    ]
+    generator = random.Random(20260826)
+    random_values = []
+    while len(random_values) < 256:
+        value = struct.unpack(">d", generator.getrandbits(64).to_bytes(8, "big"))[0]
+        if math.isfinite(value):
+            random_values.append(value)
+
+    for value in [*extremes, *[-item for item in extremes], *random_values]:
+        spelling = canonical_json_bytes(value).decode("utf-8").strip()
+        assert float(spelling) == value
+        assert "e+" not in spelling
+        assert not any(token in spelling for token in ("e-0", "e00", "e01"))
 
 
 def test_canonical_json_and_id_lines_serialize_stateful_mappings_from_one_snapshot():

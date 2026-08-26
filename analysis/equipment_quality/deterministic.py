@@ -11,16 +11,29 @@ from fractions import Fraction
 from numbers import Integral, Real
 
 
-_MIN_DECIMAL_EXPONENT = -324
-_MAX_DECIMAL_EXPONENT = 308
-_MAX_BINARY64_SIGNIFICAND_DIGITS = 17
+_POWER10 = tuple(10**exponent for exponent in range(400))
 
 
 def _scaled_floor(value: Fraction, exponent: int) -> int:
     """Return floor(value / 10**exponent) without a lossy decimal conversion."""
     if exponent >= 0:
-        return value.numerator // (value.denominator * (10**exponent))
-    return (value.numerator * (10 ** (-exponent))) // value.denominator
+        power = _POWER10[exponent] if exponent < len(_POWER10) else 10**exponent
+        return value.numerator // (value.denominator * power)
+    power = _POWER10[-exponent] if -exponent < len(_POWER10) else 10 ** (-exponent)
+    return (value.numerator * power) // value.denominator
+
+
+def _decimal_order(value: Fraction) -> int:
+    """Return floor(log10(value)) exactly for a positive rational value."""
+    numerator_digits = len(str(value.numerator))
+    denominator_digits = len(str(value.denominator))
+    order = numerator_digits - denominator_digits
+    if order >= 0:
+        if value.numerator < value.denominator * _POWER10[order]:
+            return order - 1
+    elif value.numerator * _POWER10[-order] < value.denominator:
+        return order - 1
+    return order
 
 
 def _rounding_interval(number: float) -> tuple[Fraction, Fraction]:
@@ -38,9 +51,10 @@ def _rounding_interval(number: float) -> tuple[Fraction, Fraction]:
     return lower, upper
 
 
-def _decimal_spellings(coefficient: int, exponent: int) -> set[str]:
-    """Return the non-redundant fixed/scientific spellings of coefficient*10**exponent."""
+def _decimal_spellings(coefficient: int, exponent: int, limit: int) -> tuple[str, ...]:
+    """Return only non-redundant decimal spellings no longer than ``limit``."""
     digits = str(coefficient)
+    spellings: list[str] = []
     if exponent >= 0:
         fixed = digits + ("0" * exponent)
     else:
@@ -50,12 +64,73 @@ def _decimal_spellings(coefficient: int, exponent: int) -> set[str]:
             if point > 0
             else "0." + ("0" * (-point)) + digits
         )
-
-    spellings = {fixed}
+    if len(fixed) <= limit:
+        spellings.append(fixed)
     for point in range(1, len(digits) + 1):
         mantissa = digits if point == len(digits) else digits[:point] + "." + digits[point:]
-        spellings.add(f"{mantissa}e{exponent + len(digits) - point}")
-    return spellings
+        scientific = f"{mantissa}e{exponent + len(digits) - point}"
+        if len(scientific) <= limit:
+            spellings.append(scientific)
+    return tuple(spellings)
+
+
+def _initial_float_spelling(number: float) -> str:
+    """Use Python's shortest round-trip spelling only as an exhaustive-search bound."""
+    negative = number < 0.0
+    magnitude = -number if negative else number
+    coefficient, marker, exponent_text = repr(magnitude).lower().partition("e")
+    exponent = int(exponent_text) if marker else 0
+    integer, dot, fraction = coefficient.partition(".")
+    digits = (integer + fraction).lstrip("0")
+    decimal_exponent = exponent - (len(fraction) if dot else 0)
+    while digits.endswith("0"):
+        digits = digits[:-1]
+        decimal_exponent += 1
+    prefix = "-" if negative else ""
+    spellings = _decimal_spellings(int(digits), decimal_exponent, 1000)
+    candidates = [prefix + spelling for spelling in spellings if float(prefix + spelling) == number]
+    return min(candidates, key=lambda candidate: (len(candidate), candidate))
+
+
+def _minimum_spelling_length(digits_count: int, exponent: int, sign_length: int) -> int:
+    """Return the shortest layout length for any coefficient with this shape."""
+    if exponent >= 0:
+        fixed_length = digits_count + exponent
+    else:
+        point = digits_count + exponent
+        fixed_length = digits_count + 1 if point > 0 else 2 + (-point) + digits_count
+    scientific_length = min(
+        digits_count
+        + (1 if point < digits_count else 0)
+        + 1
+        + len(str(exponent + digits_count - point))
+        for point in range(1, digits_count + 1)
+    )
+    return sign_length + min(fixed_length, scientific_length)
+
+
+def _feasible_exponents(lower: Fraction, upper: Fraction, digits_count: int) -> range:
+    """Return the small exact exponent window whose d-digit coefficients can intersect it."""
+    lower_order = _decimal_order(lower)
+    upper_order = _decimal_order(upper)
+    return range(lower_order - digits_count - 1, upper_order - digits_count + 2)
+
+
+def _first_feasible_coefficients(
+    lower: Fraction,
+    upper: Fraction,
+    exponent: int,
+    digits_count: int,
+) -> range:
+    """Return the only leading coefficient positions that can win a layout tie."""
+    least = 1 if digits_count == 1 else _POWER10[digits_count - 1]
+    greatest = _POWER10[digits_count] - 1
+    first = max(least, _scaled_floor(lower, exponent) - 1)
+    last = min(greatest, _scaled_floor(upper, exponent) + 1)
+    # All valid coefficients form one interval. For a fixed layout, lexical
+    # order follows coefficient order, so only its first four positions can
+    # beat another layout; four covers both midpoint endpoints and a trailing 0.
+    return range(first, min(last, first + 3) + 1)
 
 
 def _canonical_float(number: float) -> str:
@@ -65,44 +140,65 @@ def _canonical_float(number: float) -> str:
     if number == 0.0:
         return "0"
 
+    best = _initial_float_spelling(number)
+    best_key = (len(best.encode("utf-8")), best.encode("utf-8"))
     negative = number < 0.0
     magnitude = -number if negative else number
     lower, upper = _rounding_interval(magnitude)
     prefix = "-" if negative else ""
-    candidates: set[str] = set()
+    max_digits = best_key[0] - len(prefix)
+    exact_integer = int(magnitude) if magnitude.is_integer() else None
 
-    for digits_count in range(1, _MAX_BINARY64_SIGNIFICAND_DIGITS + 1):
-        least = 1 if digits_count == 1 else 10 ** (digits_count - 1)
-        greatest = (10**digits_count) - 1
-        for exponent in range(_MIN_DECIMAL_EXPONENT, _MAX_DECIMAL_EXPONENT + 1):
-            # The extra integer at each edge accounts for an exact midpoint;
-            # float() below applies the platform's binary64 tie rule exactly.
-            first = max(least, _scaled_floor(lower, exponent) - 1)
-            last = min(greatest, _scaled_floor(upper, exponent) + 1)
-            for coefficient in range(first, last + 1):
+    for digits_count in range(1, max_digits + 1):
+        for exponent in _feasible_exponents(lower, upper, digits_count):
+            if _minimum_spelling_length(digits_count, exponent, len(prefix)) > best_key[0]:
+                continue
+            coefficients = list(_first_feasible_coefficients(
+                lower, upper, exponent, digits_count
+            ))
+            if exact_integer is not None and exponent >= 0:
+                power = _POWER10[exponent] if exponent < len(_POWER10) else 10**exponent
+                if exact_integer % power == 0:
+                    exact_coefficient = exact_integer // power
+                    if len(str(exact_coefficient)) == digits_count:
+                        coefficients.append(exact_coefficient)
+            for coefficient in sorted(set(coefficients)):
                 if coefficient % 10 == 0:
                     continue
-                for spelling in _decimal_spellings(coefficient, exponent):
+                for spelling in _decimal_spellings(
+                    coefficient, exponent, best_key[0] - len(prefix)
+                ):
+                    if (
+                        exact_integer is not None
+                        and "." not in spelling
+                        and "e" not in spelling
+                        and int(spelling) != exact_integer
+                    ):
+                        continue
                     candidate = prefix + spelling
-                    if float(candidate) == number:
-                        candidates.add(candidate)
-
-    if not candidates:  # Every finite binary64 has a <=17-digit spelling.
-        raise AssertionError("no canonical decimal spelling found for finite binary64")
-    return min(
-        candidates,
-        key=lambda candidate: (len(candidate.encode("utf-8")), candidate.encode("utf-8")),
-    )
+                    candidate_key = (len(candidate.encode("utf-8")), candidate.encode("utf-8"))
+                    if candidate_key <= best_key and float(candidate) == number:
+                        best = candidate
+                        best_key = candidate_key
+    return best
 
 
 def _normalise_real(value: Real, label: str) -> float:
     """Convert an accepted real scalar exactly once into a built-in binary64."""
-    if isinstance(value, bool):
+    if _is_boolean_scalar(value):
         raise TypeError(f"{label} must not be boolean")
     number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{label} must be finite")
     return number
+
+
+def _is_boolean_scalar(value: object) -> bool:
+    """Recognize built-in and NumPy-style boolean scalars before float conversion."""
+    if isinstance(value, bool):
+        return True
+    dtype = getattr(value, "dtype", None)
+    return getattr(dtype, "kind", None) == "b"
 
 
 def _normalise_integer(value: Integral) -> int:
