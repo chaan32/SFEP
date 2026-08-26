@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import ast
 import copy
 import csv
 import hashlib
 import io
+import inspect
 import json
 import math
 import re
+import struct
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -42,6 +46,41 @@ SHA_B = "sha256:" + "b" * 64
 MATERIAL_CH1_1 = "sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a"
 TOKEN_RE = re.compile(rb"(?:" + rb"|".join(re.escape(token) for token in sorted(EXACT_ALLOWED_TOKENS)) + rb")")
 LINEAGE_OUTPUT_PATTERNS = {
+    "bundle_manifest": re.compile(
+        r"^(?:schemaVersion|bundleId|criteriaId|asOf|timezone|labelMaturityDays|"
+        r"identity\.(?:analysis_config_sha256|criteria_id|producer_runtime_sha256|"
+        r"schema\.(?:analysis_config|analysis_summary|bundle_manifest|equipment_operating_ranges|"
+        r"producer_runtime|quality_risk_intervals|replay_events)\.sha256|"
+        r"source\.(?:ap|fur_hr|sm_cc)\.(?:name|sha256|size_bytes))|"
+        r"criteriaIdentity\.(?:analysis_config_sha256|as_of|criteria_projection_sha256|"
+        r"producer_runtime_sha256|schema\.(?:analysis_config|equipment_operating_ranges|"
+        r"producer_runtime|quality_risk_intervals)\.sha256)|"
+        r"artifacts\[\]\.(?:role|sizeBytes|sha256|schemaVersion))$"
+    ),
+    "analysis_config": re.compile(
+        r"^(?:schemaVersion|analysisConfigVersion|timezone|labelMaturityDays|wilsonZ|"
+        r"splits\.(?:referenceFraction|discoveryFraction)|"
+        r"operatingRanges\.(?:minimumSupport|extremeTailMinimumSupport|quantileMethod|"
+        r"typicalLowerQuantile|typicalUpperQuantile|extremeLowerQuantile|extremeUpperQuantile)|"
+        r"qualityRisk\.(?:minimumDiscoverySupport|minimumCautionDefects|minimumDangerDefects|"
+        r"minimumConfirmationSupport|minimumConfirmationDefects|minimumInformativeStrata|"
+        r"numericBins|interactionBins|zeroCellCorrection|bhQ\.(?:caution|danger)|"
+        r"relativeRisk\.(?:caution|danger)|riskDifference\.(?:caution|danger)|"
+        r"confirmationRelativeRisk\.(?:cautionExclusive|danger))|"
+        r"bootstrap\.(?:replicates|minimumValidReplicates)|"
+        r"fields\[\]\.(?:field|sourceRole|sourceColumn|dataType|featureRole|equipmentType|"
+        r"firstAvailableStage|evidenceFamily|dependencies\[\])|"
+        r"(?:rangeContextHierarchies|riskAdjustmentHierarchies)\[\]\.(?:equipmentType|levels\[\]\[\])|"
+        r"fixedInteractions\[\]\[\]|fdrFamilies\[\]|evidenceFamilies\[\])$"
+    ),
+    "producer_runtime": re.compile(
+        r"^(?:schemaVersion|pipVersion|platform\.(?:system|machine|macosProductVersion|sysconfigPlatform)|"
+        r"python\.(?:implementation|version|build|cacheTag|soabi|executableSha256)|"
+        r"locks\.(?:pyproject|bootstrap|buildRequirements|requirements|wheelhouse|producer)|"
+        r"packages\[\]\.(?:name|version|direct|wheelFilename|wheelTag|wheelSha256|installedCodeTreeSha256)|"
+        r"producer\.(?:name|version|wheelFilename|wheelSha256|installedCodeTreeSha256|sourceSha256)|"
+        r"environmentPolicy\.(?:pythonHashSeed|timezone|localeIndependentParsing|floatPolicy))$"
+    ),
     "equipment_operating_ranges": re.compile(
         r"^(?:schemaVersion|criteriaId|asOf|ranges\[\]\.(?:ruleId|field|fieldRole|"
         r"firstAvailableStage|equipmentType|equipmentId|contextLevel|context(?:\.[a-z][a-z0-9_]*)?|"
@@ -50,7 +89,7 @@ LINEAGE_OUTPUT_PATTERNS = {
     "quality_risk_intervals": re.compile(
         r"^(?:schemaVersion|criteriaId|asOf|rules\[\]\.(?:ruleId|analysisFamily|evidenceFamily|"
         r"firstAvailableStage|equipmentType|applicationScope|equipmentId|fieldNames\[\]|"
-        r"predicate\.allOf\[\]\.(?:field|type|lower|lowerInclusive|upper|upperInclusive|values\[\])|"
+        r"predicate\.allOf\[\]\.(?:field|type|lower|lowerInclusive|upper|upperInclusive|values(?:\[\])?)|"
         r"applicationContext(?:\.[a-z][a-z0-9_]*)?|adjustmentLevel|adjustmentFieldsDropped\[\]|"
         r"adjustmentKind|grade|earlyWarningEligible|(?:discovery|confirmation)\.(?:support|defects|"
         r"crudeRate|crudeRateCiLower|crudeRateCiUpper|adjustedRate|comparatorAdjustedRate|"
@@ -60,21 +99,62 @@ LINEAGE_OUTPUT_PATTERNS = {
     "replay_events": re.compile(
         r"^(?:schema_version|bundle_id|criteria_id|event_id|replay_date|replay_hour|batch_kind|batch_id|"
         r"equipment_batch_id|batch_step|time_precision|material_key|equipment_type|equipment_id|"
-        r"charge_id|slab_no|hr_coil_id|ap_prod_id|values_json\.[a-z][a-z0-9_]*)$"
+        r"charge_id|slab_no|hr_coil_id|ap_prod_id|values_json\.(?:sm_plant|steel_grade|steel_usage|"
+        r"cc_gubun|slab_gubun|tundish_temp|mlac_ratio|delta_ferrite|ingre_cr|ingre_ni|ingre_s|"
+        r"slab_grind|cast_date|furnace_no|f_jangip_gubun|f_jangip_temp|slab_width|f_pre_temp|"
+        r"f_pre_interval|f_heat_temp|f_heat_interval|f_sock_temp|f_sock_interval|f_bfg|f_cog|"
+        r"f_ldg|f_bfg_ratio|f_cog_ratio|f_ldg_ratio|f_ext_date|f_ext_time|hr_date|hr_thick|"
+        r"hr_width|rm4_temp|rm_pitch|ap_plant|ap_date|ap_shift|ap_thick|ap_width|ap_line_speed|judge))$"
     ),
     "analysis_summary": re.compile(
         r"^(?:schemaVersion|bundleId|criteriaId|asOf|innerSplitDate|evaluationMode|"
         r"dateRange\.(?:from|to)|splitCounts\.(?:reference|discovery|confirmation|holdout)\."
         r"(?:total|defects|nonDefects|unknownOrCensored|dateFrom|dateTo)|"
-        r"quarantineCounts\.[A-Z][A-Z0-9_]*|labelCensoringCounts\.[A-Z][A-Z0-9_]*|"
+        r"quarantineCounts\.(?:MISSING_SM_CC_KEY|MISSING_FUR_HR_KEY|MISSING_AP_HR_COIL_ID|"
+        r"MISSING_FUR_HR_COIL_ID|MISSING_AP_PROD_ID|DUPLICATE_SM_CC_KEY|DUPLICATE_FUR_HR_KEY|"
+        r"DUPLICATE_AP_KEY|DUPLICATE_FUR_HR_COIL_KEY|DUPLICATE_AP_PROD_ID|INVALID_FUR_HR_DATE|"
+        r"IMPOSSIBLE_STAGE_DATE_ORDER|UNLINKED_SM_CC|UNLINKED_FUR_HR|UNLINKED_AP)|"
+        r"labelCensoringCounts\.(?:AP_UNLINKED|LABEL_MISSING|LABEL_NOT_YET_AVAILABLE)|"
+        r"chargePurgeCounts\.(?:outer|inner)\.(?:chargeCount|rowCount)|"
         r"sourceColumnProfiles\[\]\.(?:sourceRole|column|dataType|total|missing|unique|"
-        r"numeric\.(?:p05|median|p95)|levels\[\]\.(?:value|count))|"
+        r"numeric(?:\.(?:p05|median|p95))?|levels(?:\[\]\.(?:value|count))?)|"
         r"driftMetrics\[\]\.(?:field|dataType|(?:reference|holdout)\."
-        r"(?:support|missingRate|p05|median|p95|levels\[\]\.(?:value|count)))|"
+        r"(?:support|missingRate|p05|median|p95|levels(?:\[\]\.(?:value|count))?))|"
         r"holdoutMetrics\[\]\.(?:alertGrade|total|truePositive|falsePositive|trueNegative|falseNegative|"
-        r"alertRate|precision|recall|baseDefectRate|lift|falseAlertsPer100|validBootstrapReplicates|"
-        r"ci\.(?:alertRate|precision|recall|baseDefectRate|lift|falseAlertsPer100)|reasonCode))$"
+        r"(?:alertRate|precision|recall|baseDefectRate|lift|falseAlertsPer100)\."
+        r"(?:pointEstimate|lower|upper|validReplicates|reasonCode)))$"
     ),
+}
+
+QUARANTINE_REASONS = (
+    "MISSING_SM_CC_KEY", "MISSING_FUR_HR_KEY", "MISSING_AP_HR_COIL_ID",
+    "MISSING_FUR_HR_COIL_ID", "MISSING_AP_PROD_ID", "DUPLICATE_SM_CC_KEY",
+    "DUPLICATE_FUR_HR_KEY", "DUPLICATE_AP_KEY", "DUPLICATE_FUR_HR_COIL_KEY",
+    "DUPLICATE_AP_PROD_ID", "INVALID_FUR_HR_DATE", "IMPOSSIBLE_STAGE_DATE_ORDER",
+    "UNLINKED_SM_CC", "UNLINKED_FUR_HR", "UNLINKED_AP",
+)
+CENSOR_REASONS = ("AP_UNLINKED", "LABEL_MISSING", "LABEL_NOT_YET_AVAILABLE")
+POPULATION_ORDER = ("REFERENCE", "DISCOVERY", "CONFIRMATION", "HOLDOUT")
+HOLDOUT_PROFILE_ORDER = ("DANGER", "CAUTION_OR_DANGER")
+HOLDOUT_METRIC_NAMES = (
+    "alertRate", "precision", "recall", "baseDefectRate", "lift", "falseAlertsPer100",
+)
+CONVERSIONS = {
+    "COPY_SOURCE_SCALAR", "PARSE_FINITE_BINARY64", "PARSE_DATE", "PARSE_HOUR_BUCKET",
+    "DERIVE_FUEL_RATIO", "COPY_CANONICAL_CONFIG", "COPY_VERIFIED_RUNTIME",
+    "COMPUTE_IDENTITY", "COMPUTE_SHA256", "TYPE1_QUANTILE", "COUNT_PARTITION",
+    "PROFILE_SOURCE_COLUMN", "COMPARE_DISTRIBUTIONS", "COMPUTE_HOLDOUT_METRIC",
+    "LINEAGE_INDEX_V1",
+}
+AGGREGATE_FILTERS = {
+    "STAGE_AVAILABLE_AT_AS_OF", "FINITE_VALUE", "LABEL_AVAILABLE_AND_MATURE",
+    "PREDICATE_MATCH", "INFORMATIVE_STRATA_ONLY", "FIXED_DISCOVERY_STRATA",
+}
+AGGREGATE_TRANSFORMATIONS = {
+    "TYPE1_QUANTILE", "WILSON_SCORE_INTERVAL", "DIRECT_STANDARDIZATION",
+    "MANTEL_HAENSZEL_RR", "CMH_NORMAL_APPROXIMATION", "BENJAMINI_HOCHBERG_FDR",
+    "CHARGE_BLOCK_BOOTSTRAP_PERCENTILE_CI", "CONFIRMATION_WEIGHT_RENORMALIZATION",
+    "GRADE_POLICY_V1", "DISPLAY_MERGE_V1",
 }
 
 
@@ -110,51 +190,232 @@ def _replace_tokens(data: bytes) -> bytes:
     return TOKEN_RE.sub(SHA_A.encode("ascii"), data)
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    def encode_finite_binary64(number: float) -> str:
-        if not math.isfinite(number):
-            raise ValueError("JSON numbers must be finite binary64 values")
-        if number == 0.0:
-            return "0"
+def _positive_binary64_fraction(bits: int) -> tuple[Fraction, int]:
+    exponent = (bits >> 52) & 0x7FF
+    fraction_bits = bits & ((1 << 52) - 1)
+    if exponent == 0:
+        significand = fraction_bits
+        power = -1074
+    else:
+        significand = (1 << 52) | fraction_bits
+        power = exponent - 1023 - 52
+    value = Fraction(significand)
+    if power >= 0:
+        value *= 1 << power
+    else:
+        value /= 1 << -power
+    return value, significand
 
-        negative = number < 0.0
-        shortest = repr(abs(number)).lower()
-        coefficient, separator, exponent_text = shortest.partition("e")
-        exponent = int(exponent_text) if separator else 0
-        integer, dot, fraction = coefficient.partition(".")
-        digits = (integer + fraction).lstrip("0")
-        decimal_exponent = exponent - (len(fraction) if dot else 0)
-        while digits.endswith("0"):
-            digits = digits[:-1]
-            decimal_exponent += 1
 
-        if decimal_exponent >= 0:
-            fixed = digits + ("0" * decimal_exponent)
-        else:
-            point = len(digits) + decimal_exponent
-            fixed = (
-                digits[:point] + "." + digits[point:]
-                if point > 0
-                else "0." + ("0" * -point) + digits
-            )
+def _floor_log10_fraction(value: Fraction) -> int:
+    assert value > 0
+    candidate = len(str(value.numerator)) - len(str(value.denominator))
 
-        unsigned_candidates = {fixed}
-        for point in range(1, len(digits) + 1):
-            mantissa = digits if point == len(digits) else digits[:point] + "." + digits[point:]
-            scientific_exponent = decimal_exponent + len(digits) - point
-            unsigned_candidates.add(f"{mantissa}e{scientific_exponent}")
-
-        prefix = "-" if negative else ""
-        candidates = {
-            prefix + candidate
-            for candidate in unsigned_candidates
-            if math.isfinite(float(prefix + candidate)) and float(prefix + candidate) == number
-        }
-        return min(
-            candidates,
-            key=lambda candidate: (len(candidate.encode("utf-8")), candidate.encode("utf-8")),
+    def power10(exponent: int) -> Fraction:
+        return (
+            Fraction(10**exponent)
+            if exponent >= 0
+            else Fraction(1, 10 ** -exponent)
         )
 
+    while value < power10(candidate):
+        candidate -= 1
+    while value >= power10(candidate + 1):
+        candidate += 1
+    return candidate
+
+
+def _ceil_fraction(value: Fraction) -> int:
+    return -(-value.numerator // value.denominator)
+
+
+def _render_decimal_layouts(coefficient: int, exponent: int) -> set[str]:
+    assert coefficient > 0 and coefficient % 10 != 0
+    digits = str(coefficient)
+    count = len(digits)
+    if exponent >= 0:
+        fixed = digits + ("0" * exponent)
+    else:
+        point = count + exponent
+        fixed = (
+            digits[:point] + "." + digits[point:]
+            if point > 0
+            else "0." + ("0" * -point) + digits
+        )
+    layouts = {fixed}
+    for point in range(1, count + 1):
+        mantissa = (
+            digits
+            if point == count
+            else digits[:point] + "." + digits[point:]
+        )
+        scientific_exponent = exponent + count - point
+        layouts.add(mantissa + "e" + str(scientific_exponent))
+    return layouts
+
+
+def _independent_binary64_json_number(number: float) -> str:
+    bits = int.from_bytes(struct.pack(">d", number), "big")
+    sign = "-" if bits >> 63 else ""
+    magnitude_bits = bits & ((1 << 63) - 1)
+    exponent = (magnitude_bits >> 52) & 0x7FF
+    if exponent == 0x7FF:
+        raise ValueError("JSON numbers must be finite binary64 values")
+    if magnitude_bits == 0:
+        return "0"
+
+    target, significand = _positive_binary64_fraction(magnitude_bits)
+    previous = (
+        Fraction(0)
+        if magnitude_bits == 1
+        else _positive_binary64_fraction(magnitude_bits - 1)[0]
+    )
+    if magnitude_bits == 0x7FEFFFFFFFFFFFFF:
+        following = Fraction(1 << 1024)
+    else:
+        following = _positive_binary64_fraction(magnitude_bits + 1)[0]
+    lower = (previous + target) / 2
+    upper = (target + following) / 2
+    midpoint_closed = significand % 2 == 0
+
+    sign_length = len(sign.encode("utf-8"))
+    candidates: set[str] = set()
+    for digit_count in range(1, 24 - sign_length + 1):
+        q_min = _floor_log10_fraction(lower) - digit_count + 1
+        q_max = _floor_log10_fraction(upper) - digit_count + 1
+        for decimal_exponent in range(q_min, q_max + 1):
+            scale = (
+                Fraction(10**decimal_exponent)
+                if decimal_exponent >= 0
+                else Fraction(1, 10 ** -decimal_exponent)
+            )
+            scaled_lower = lower / scale
+            scaled_upper = upper / scale
+            coefficient_low = (
+                _ceil_fraction(scaled_lower)
+                if midpoint_closed
+                else scaled_lower.numerator // scaled_lower.denominator + 1
+            )
+            coefficient_high = (
+                scaled_upper.numerator // scaled_upper.denominator
+                if midpoint_closed
+                else _ceil_fraction(scaled_upper) - 1
+            )
+            digit_low = 1 if digit_count == 1 else 10 ** (digit_count - 1)
+            digit_high = 10**digit_count - 1
+            coefficient_low = max(coefficient_low, digit_low)
+            coefficient_high = min(coefficient_high, digit_high)
+            if coefficient_low > coefficient_high:
+                continue
+            coefficient = coefficient_low
+            while coefficient <= coefficient_high and coefficient % 10 == 0:
+                coefficient += 1
+            if coefficient > coefficient_high:
+                continue
+            candidates.update(
+                sign + layout
+                for layout in _render_decimal_layouts(
+                    coefficient, decimal_exponent
+                )
+            )
+    if not candidates:
+        raise AssertionError("exact binary64 interval produced no decimal candidate")
+    return min(
+        candidates,
+        key=lambda candidate: (
+            len(candidate.encode("utf-8")),
+            candidate.encode("utf-8"),
+        ),
+    )
+
+
+_DECIMAL_NUMBER = re.compile(
+    r"^(?P<sign>-?)(?P<integer>0|[1-9][0-9]*)(?:\.(?P<fraction>[0-9]+))?"
+    r"(?:[eE](?P<exponent>[+-]?[0-9]+))?$"
+)
+
+
+def _exact_decimal_fraction(token: str) -> Fraction:
+    match = _DECIMAL_NUMBER.fullmatch(token)
+    if match is None:
+        raise AssertionError(f"invalid JSON numeric token: {token}")
+    fraction_digits = match.group("fraction") or ""
+    coefficient = int(match.group("integer") + fraction_digits)
+    if match.group("sign") == "-":
+        coefficient = -coefficient
+    exponent = int(match.group("exponent") or "0") - len(fraction_digits)
+    return (
+        Fraction(coefficient * (10**exponent))
+        if exponent >= 0
+        else Fraction(coefficient, 10 ** -exponent)
+    )
+
+
+def _exact_decimal_to_binary64_bits(token: str) -> int:
+    exact = _exact_decimal_fraction(token)
+    sign_bit = 1 << 63 if exact < 0 else 0
+    magnitude = abs(exact)
+    if magnitude == 0:
+        return sign_bit
+
+    maximum_bits = 0x7FEFFFFFFFFFFFFF
+    low = 0
+    high = maximum_bits
+    while low <= high:
+        middle = (low + high) // 2
+        middle_value = (
+            Fraction(0)
+            if middle == 0
+            else _positive_binary64_fraction(middle)[0]
+        )
+        if middle_value <= magnitude:
+            low = middle + 1
+        else:
+            high = middle - 1
+    lower_bits = high
+    lower_value = (
+        Fraction(0)
+        if lower_bits == 0
+        else _positive_binary64_fraction(lower_bits)[0]
+    )
+    if lower_value == magnitude:
+        chosen = lower_bits
+    else:
+        upper_bits = lower_bits + 1
+        upper_value = (
+            Fraction(1 << 1024)
+            if upper_bits > maximum_bits
+            else _positive_binary64_fraction(upper_bits)[0]
+        )
+        lower_distance = magnitude - lower_value
+        upper_distance = upper_value - magnitude
+        if lower_distance < upper_distance:
+            chosen = lower_bits
+        elif upper_distance < lower_distance:
+            chosen = upper_bits
+        else:
+            chosen = lower_bits if lower_bits % 2 == 0 else upper_bits
+    if chosen > maximum_bits:
+        raise ValueError("JSON numeric token rounds to non-finite binary64")
+    return sign_bit | chosen
+
+
+def _assert_json_numeric_tokens_are_canonical(text: str) -> None:
+    def parse_integer(token: str) -> int:
+        assert token == str(int(token)), f"non-canonical exact integer: {token}"
+        return int(token)
+
+    def parse_binary64(token: str) -> float:
+        bits = _exact_decimal_to_binary64_bits(token)
+        number = struct.unpack(">d", bits.to_bytes(8, "big"))[0]
+        expected = _independent_binary64_json_number(number)
+        assert token == expected, f"non-canonical binary64: {token} != {expected}"
+        return number
+
+    json.loads(text, parse_int=parse_integer, parse_float=parse_binary64)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
     def encode(node: object) -> str:
         if node is None:
             return "null"
@@ -165,7 +426,7 @@ def _canonical_json_bytes(value: object) -> bytes:
         if isinstance(node, int):
             return str(node)
         if isinstance(node, float):
-            return encode_finite_binary64(node)
+            return _independent_binary64_json_number(node)
         if isinstance(node, str):
             return json.dumps(node, ensure_ascii=False, separators=(",", ":"))
         if isinstance(node, list):
@@ -174,7 +435,8 @@ def _canonical_json_bytes(value: object) -> bytes:
             if not all(isinstance(key, str) for key in node):
                 raise TypeError("canonical JSON object keys must be strings")
             return "{" + ",".join(
-                encode(key) + ":" + encode(node[key]) for key in sorted(node)
+                encode(key) + ":" + encode(node[key])
+                for key in sorted(node, key=lambda item: item.encode("utf-8"))
             ) + "}"
         raise TypeError(f"unsupported canonical JSON value: {type(node).__name__}")
 
@@ -203,6 +465,38 @@ def _validate_summary_application_contract(summary: dict) -> None:
 
     for count in summary["splitCounts"].values():
         assert count["total"] == count["defects"] + count["nonDefects"] + count["unknownOrCensored"]
+    assert tuple(summary["quarantineCounts"]) == tuple(
+        reason for reason in QUARANTINE_REASONS if reason in summary["quarantineCounts"]
+    )
+    assert set(summary["labelCensoringCounts"]) <= set(CENSOR_REASONS)
+    assert set(summary["chargePurgeCounts"]) == {"outer", "inner"}
+    for purge in summary["chargePurgeCounts"].values():
+        assert purge["rowCount"] >= purge["chargeCount"]
+    assert tuple(profile["alertGrade"] for profile in summary["holdoutMetrics"]) == (
+        HOLDOUT_PROFILE_ORDER
+    )
+    for profile in summary["holdoutMetrics"]:
+        assert profile["total"] == (
+            profile["truePositive"] + profile["falsePositive"]
+            + profile["trueNegative"] + profile["falseNegative"]
+        )
+        for metric_name in HOLDOUT_METRIC_NAMES:
+            metric = profile[metric_name]
+            if metric["reasonCode"] == "NONE":
+                assert metric["pointEstimate"] is not None
+                assert metric["lower"] is not None and metric["upper"] is not None
+                assert metric["validReplicates"] >= 1900
+                assert metric["lower"] <= metric["upper"]
+            elif metric["reasonCode"] == "ZERO_DENOMINATOR":
+                assert metric == {
+                    "pointEstimate": None, "lower": None, "upper": None,
+                    "validReplicates": 0, "reasonCode": "ZERO_DENOMINATOR",
+                }
+            else:
+                assert metric["reasonCode"] == "TOO_FEW_VALID_BOOTSTRAPS"
+                assert metric["pointEstimate"] is not None
+                assert metric["lower"] is None and metric["upper"] is None
+                assert metric["validReplicates"] < 1900
 
     lineage = summary["lineage"]
     material_keys = [item["materialKey"] for item in lineage["materials"]]
@@ -229,6 +523,8 @@ def _validate_summary_application_contract(summary: dict) -> None:
                 assert row["hr_coil_id"].strip() == material["hrCoilId"]
             else:
                 assert row["hr_coil_id"].strip() == material["hrCoilId"]
+    assert tuple(item["populationRef"] for item in lineage["populations"]) == POPULATION_ORDER
+    assert tuple(item["split"] for item in lineage["populations"]) == POPULATION_ORDER
     populations = {item["populationRef"]: item for item in lineage["populations"]}
     assert len(populations) == len(lineage["populations"])
     for population in populations.values():
@@ -241,9 +537,15 @@ def _validate_summary_application_contract(summary: dict) -> None:
         assert set(keys) <= set(populations[aggregate["populationRef"]]["materialKeys"])
         assert aggregate["split"] == populations[aggregate["populationRef"]]["split"]
         if aggregate["artifactRole"] == "equipment_operating_ranges":
+            assert aggregate["split"] == "REFERENCE"
+            assert aggregate["populationRef"] == "REFERENCE"
             assert aggregate["comparatorDefinition"] == "NOT_APPLICABLE"
         else:
+            assert aggregate["split"] in {"DISCOVERY", "CONFIRMATION"}
+            assert aggregate["populationRef"] == aggregate["split"]
             assert aggregate["comparatorDefinition"] == "FIXED_POPULATION_STRATA_MINUS_CANDIDATE"
+        assert set(aggregate["filters"]) <= AGGREGATE_FILTERS
+        assert set(aggregate["transformations"]) <= AGGREGATE_TRANSFORMATIONS
     lineage_node_ids = {
         f'{field["artifactRole"]}.{field["outputField"]}' for field in lineage["fields"]
     }
@@ -253,6 +555,7 @@ def _validate_summary_application_contract(summary: dict) -> None:
         output_pattern = LINEAGE_OUTPUT_PATTERNS.get(field["artifactRole"])
         if output_pattern is not None:
             assert output_pattern.fullmatch(field["outputField"]), "invalid lineage output field"
+        assert field["conversion"] in CONVERSIONS
         raw = field["sourceRole"] is not None
         if raw:
             assert field["sourceColumn"] is not None
@@ -260,11 +563,20 @@ def _validate_summary_application_contract(summary: dict) -> None:
             assert field["sourceColumn"] in source_headers[field["sourceRole"]]
             definition = config_fields[(field["sourceRole"], field["sourceColumn"])]
             assert field["artifactRole"] == "replay_events"
-            assert field["outputField"] == f'values_json.{definition["field"]}'
+            identifier_outputs = {
+                "charge_id": "charge_id", "slab_no": "slab_no",
+                "hr_coil_id": "hr_coil_id", "ap_prod_id": "ap_prod_id",
+            }
+            assert field["outputField"] == identifier_outputs.get(
+                definition["field"], f'values_json.{definition["field"]}'
+            )
             assert field["firstAvailableStage"] == definition["firstAvailableStage"]
+            assert field["dependencies"] == []
         else:
             assert field["sourceColumn"] is None
             assert field["dependencies"]
+            if field["artifactRole"] != "replay_events":
+                assert field["firstAvailableStage"] is None
         for dependency in field["dependencies"]:
             assert dependency in source_dependencies or dependency in lineage_node_ids
         dependency_graph[node_id] = [
@@ -489,6 +801,39 @@ def _count(total: int, defects: int, non_defects: int, unknown: int) -> dict:
     }
 
 
+def _holdout_metric(
+    point: float | None,
+    lower: float | None,
+    upper: float | None,
+    valid_replicates: int,
+    reason_code: str,
+) -> dict:
+    return {
+        "pointEstimate": point,
+        "lower": lower,
+        "upper": upper,
+        "validReplicates": valid_replicates,
+        "reasonCode": reason_code,
+    }
+
+
+def _holdout_profile(alert_grade: str) -> dict:
+    return {
+        "alertGrade": alert_grade,
+        "total": 3,
+        "truePositive": 1,
+        "falsePositive": 0,
+        "trueNegative": 2,
+        "falseNegative": 0,
+        "alertRate": _holdout_metric(1 / 3, 0.0, 1.0, 2000, "NONE"),
+        "precision": _holdout_metric(1.0, 1.0, 1.0, 2000, "NONE"),
+        "recall": _holdout_metric(1.0, 1.0, 1.0, 2000, "NONE"),
+        "baseDefectRate": _holdout_metric(1 / 3, 0.0, 1.0, 2000, "NONE"),
+        "lift": _holdout_metric(3.0, 1.0, 3.0, 2000, "NONE"),
+        "falseAlertsPer100": _holdout_metric(0.0, 0.0, 0.0, 2000, "NONE"),
+    }
+
+
 def _summary() -> dict:
     return {
         "schemaVersion": "sfep-analysis-summary/v1",
@@ -504,8 +849,12 @@ def _summary() -> dict:
             "confirmation": _count(2, 0, 2, 0),
             "holdout": _count(4, 1, 2, 1),
         },
-        "quarantineCounts": {"DUPLICATE_KEY": 1, "UNLINKED_AP": 1},
+        "quarantineCounts": {"DUPLICATE_AP_KEY": 1, "UNLINKED_AP": 1},
         "labelCensoringCounts": {"LABEL_NOT_YET_AVAILABLE": 2},
+        "chargePurgeCounts": {
+            "outer": {"chargeCount": 0, "rowCount": 0},
+            "inner": {"chargeCount": 0, "rowCount": 0},
+        },
         "sourceColumnProfiles": [{
             "sourceRole": "fur_hr", "column": "f_pre_temp", "dataType": "NUMBER",
             "total": 12, "missing": 0, "unique": 12,
@@ -517,14 +866,10 @@ def _summary() -> dict:
             "reference": {"support": 8, "missingRate": 0.0, "p05": 1080.0, "median": 1120.0, "p95": 1160.0, "levels": None},
             "holdout": {"support": 4, "missingRate": 0.0, "p05": 1090.0, "median": 1130.0, "p95": 1170.0, "levels": None},
         }],
-        "holdoutMetrics": [{
-            "alertGrade": "DANGER", "total": 3, "truePositive": 1, "falsePositive": 0,
-            "trueNegative": 2, "falseNegative": 0, "alertRate": 0.3333333333333333,
-            "precision": 1.0, "recall": 1.0, "baseDefectRate": 0.3333333333333333,
-            "lift": 3.0, "falseAlertsPer100": 0.0, "validBootstrapReplicates": 2000,
-            "ci": {"alertRate": [0.0, 1.0], "precision": [1.0, 1.0], "recall": [1.0, 1.0], "baseDefectRate": [0.0, 1.0], "lift": [1.0, 3.0], "falseAlertsPer100": [0.0, 0.0]},
-            "reasonCode": "NONE",
-        }],
+        "holdoutMetrics": [
+            _holdout_profile("DANGER"),
+            _holdout_profile("CAUTION_OR_DANGER"),
+        ],
         "lineage": {
             "fields": [{
                 "artifactRole": "replay_events", "outputField": "values_json.f_pre_temp",
@@ -539,12 +884,15 @@ def _summary() -> dict:
                 "materialKey": MATERIAL_CH1_1, "chargeId": "CH1", "slabNo": "1", "hrCoilId": "H001",
                 "sourceRecords": [{"role": "sm_cc", "name": "sts_1sm_cc_1.csv", "recordNumber": 2}, {"role": "fur_hr", "name": "sts_2fur_hr_2.csv", "recordNumber": 2}, {"role": "ap", "name": "sts_3ap_3.csv", "recordNumber": 2}],
             }],
-            "populations": [{"populationRef": "DISCOVERY", "split": "DISCOVERY", "materialKeys": [MATERIAL_CH1_1]}],
+            "populations": [
+                {"populationRef": split, "split": split, "materialKeys": [MATERIAL_CH1_1]}
+                for split in POPULATION_ORDER
+            ],
             "aggregates": [{
                 "artifactRole": "equipment_operating_ranges", "ruleId": SHA_B,
-                "split": "DISCOVERY", "populationRef": "DISCOVERY", "inputMaterialKeys": [MATERIAL_CH1_1],
+                "split": "REFERENCE", "populationRef": "REFERENCE", "inputMaterialKeys": [MATERIAL_CH1_1],
                 "comparatorDefinition": "NOT_APPLICABLE",
-                "filters": ["isfinite(f_pre_temp)"], "transformations": ["TYPE1_QUANTILE"],
+                "filters": ["FINITE_VALUE"], "transformations": ["TYPE1_QUANTILE"],
             }],
         },
     }
@@ -674,6 +1022,169 @@ def test_nested_objects_reject_unknown_fields_and_invalid_enum_or_range():
             _validator(schema_name).validate(bad)
 
 
+def test_summary_closes_task3_counts_and_requires_separate_charge_purges():
+    validator = _validator("analysis_summary.schema.json")
+    validator.validate(_summary())
+
+    for invalid_reason in ("DUPLICATE_KEY", "CROSS_BOUNDARY_CHARGE", "NEW_REASON"):
+        invalid = _summary()
+        invalid["quarantineCounts"] = {invalid_reason: 1}
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+    invalid_censor = _summary()
+    invalid_censor["labelCensoringCounts"] = {"UNKNOWN_CENSOR": 1}
+    with pytest.raises(ValidationError):
+        validator.validate(invalid_censor)
+    missing_purge = _summary()
+    missing_purge.pop("chargePurgeCounts")
+    with pytest.raises(ValidationError):
+        validator.validate(missing_purge)
+    merged_purge = _summary()
+    merged_purge["quarantineCounts"]["CROSS_BOUNDARY_CHARGE"] = 1
+    with pytest.raises(ValidationError):
+        validator.validate(merged_purge)
+
+
+def test_summary_holdout_profiles_are_ordered_and_each_metric_owns_status():
+    validator = _validator("analysis_summary.schema.json")
+    valid = _summary()
+    validator.validate(valid)
+    _validate_summary_application_contract(valid)
+
+    reversed_profiles = _summary()
+    reversed_profiles["holdoutMetrics"].reverse()
+    missing_profile = _summary()
+    missing_profile["holdoutMetrics"].pop()
+    shared_status = _summary()
+    shared_status["holdoutMetrics"][0]["reasonCode"] = "NONE"
+    for invalid in (reversed_profiles, missing_profile, shared_status):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+    zero_denominator = _summary()
+    zero_denominator["holdoutMetrics"][0]["precision"] = _holdout_metric(
+        None, None, None, 0, "ZERO_DENOMINATOR"
+    )
+    validator.validate(zero_denominator)
+    _validate_summary_application_contract(zero_denominator)
+
+    confused_zero = copy.deepcopy(zero_denominator)
+    confused_zero["holdoutMetrics"][0]["precision"]["lower"] = 0.0
+    with pytest.raises(ValidationError):
+        validator.validate(confused_zero)
+    too_few = _summary()
+    too_few["holdoutMetrics"][0]["lift"] = _holdout_metric(
+        3.0, None, None, 1899, "TOO_FEW_VALID_BOOTSTRAPS"
+    )
+    validator.validate(too_few)
+    _validate_summary_application_contract(too_few)
+
+
+def test_summary_populations_and_aggregate_population_contract_are_exact():
+    validator = _validator("analysis_summary.schema.json")
+    valid = _summary()
+    validator.validate(valid)
+    _validate_summary_application_contract(valid)
+
+    for mutation in (
+        lambda value: value["lineage"]["populations"].reverse(),
+        lambda value: value["lineage"]["populations"].pop(),
+        lambda value: value["lineage"]["aggregates"][0].update(split="DISCOVERY"),
+        lambda value: value["lineage"]["aggregates"][0].update(populationRef="DISCOVERY"),
+    ):
+        invalid = _summary()
+        mutation(invalid)
+        with pytest.raises((ValidationError, AssertionError)):
+            validator.validate(invalid)
+            _validate_summary_application_contract(invalid)
+
+
+def test_lineage_vocabularies_and_all_seven_output_grammars_are_closed():
+    validator = _validator("analysis_summary.schema.json")
+    valid_shapes = (
+        ("bundle_manifest", "artifacts[].sha256", "COMPUTE_SHA256", "schema.analysis_summary"),
+        ("analysis_config", "qualityRisk.bhQ.danger", "COPY_CANONICAL_CONFIG", "config.qualityRisk.bhQ.danger"),
+        ("producer_runtime", "producer.sourceSha256", "COPY_VERIFIED_RUNTIME", "runtime.producer.sourceSha256"),
+        ("equipment_operating_ranges", "ranges[].median", "TYPE1_QUANTILE", "population.REFERENCE"),
+        ("quality_risk_intervals", "rules[].grade", "COMPUTE_HOLDOUT_METRIC", "population.DISCOVERY"),
+        ("quality_risk_intervals", "rules[].predicate.allOf[].values", "COMPUTE_HOLDOUT_METRIC", "population.DISCOVERY"),
+        ("replay_events", "values_json.f_bfg_ratio", "DERIVE_FUEL_RATIO", "fur_hr.f_bfg_per"),
+        ("analysis_summary", "driftMetrics[].reference.median", "COMPARE_DISTRIBUTIONS", "policy.LOCKED_RETROSPECTIVE_HOLDOUT"),
+        ("analysis_summary", "sourceColumnProfiles[].numeric", "PROFILE_SOURCE_COLUMN", "fur_hr.f_pre_temp"),
+        ("analysis_summary", "sourceColumnProfiles[].levels", "PROFILE_SOURCE_COLUMN", "fur_hr.f_pre_temp"),
+        ("analysis_summary", "driftMetrics[].reference.levels", "COMPARE_DISTRIBUTIONS", "policy.LOCKED_RETROSPECTIVE_HOLDOUT"),
+        ("analysis_summary", "driftMetrics[].holdout.levels", "COMPARE_DISTRIBUTIONS", "policy.LOCKED_RETROSPECTIVE_HOLDOUT"),
+    )
+    for artifact_role, output_field, conversion, dependency in valid_shapes:
+        valid = _summary()
+        valid["lineage"]["fields"][1].update(
+            artifactRole=artifact_role,
+            outputField=output_field,
+            conversion=conversion,
+            dependencies=[dependency],
+            firstAvailableStage=(
+                "FURNACE_EXTRACTED" if artifact_role == "replay_events" else None
+            ),
+        )
+        validator.validate(valid)
+
+    for mutation in (
+        lambda field: field.update(outputField="unknown.path"),
+        lambda field: field.update(conversion="FREE_TEXT_CONVERSION"),
+        lambda field: field.update(dependencies=["config.unknown"]),
+        lambda field: field.update(dependencies=["runtime.unknown"]),
+        lambda field: field.update(dependencies=["fur_hr.not_a_source_column"]),
+    ):
+        invalid = _summary()
+        mutation(invalid["lineage"]["fields"][1])
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+    invalid_filter = _summary()
+    invalid_filter["lineage"]["aggregates"][0]["filters"] = ["field > 0"]
+    invalid_transformation = _summary()
+    invalid_transformation["lineage"]["aggregates"][0]["transformations"] = ["CUSTOM"]
+    for invalid in (invalid_filter, invalid_transformation):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+
+def test_replay_identifier_raw_lineage_uses_top_level_paths_and_gas_ratio_sources_exist():
+    validator = _validator("analysis_summary.schema.json")
+    identifier_cases = (
+        ("sm_cc", "charge_id", "CAST_RECORDED", "charge_id", "COPY_SOURCE_SCALAR"),
+        ("fur_hr", "slab_no", "FURNACE_CHARGED", "slab_no", "COPY_SOURCE_SCALAR"),
+        ("fur_hr", "hr_coil_id", "RM4_RECORDED", "hr_coil_id", "COPY_SOURCE_SCALAR"),
+        ("ap", "ap_prod_id", "AP_RECORDED_WITH_RESULT", "ap_prod_id", "COPY_SOURCE_SCALAR"),
+    )
+    for source_role, source_column, stage, output_field, conversion in identifier_cases:
+        valid = _summary()
+        valid["lineage"]["fields"][0].update(
+            sourceRole=source_role,
+            sourceColumn=source_column,
+            firstAvailableStage=stage,
+            outputField=output_field,
+            conversion=conversion,
+        )
+        validator.validate(valid)
+        _validate_summary_application_contract(valid)
+
+        nested = copy.deepcopy(valid)
+        nested["lineage"]["fields"][0]["outputField"] = f"values_json.{source_column}"
+        with pytest.raises((ValidationError, AssertionError)):
+            validator.validate(nested)
+            _validate_summary_application_contract(nested)
+
+    field_schema = _load_schema("analysis_summary.schema.json")["$defs"]["fieldLineage"]
+    source_columns = set(field_schema["properties"]["sourceColumn"]["enum"])
+    dependency_source_terminals = set(
+        field_schema["properties"]["dependencies"]["items"]["oneOf"][0]["enum"]
+    )
+    for column in ("f_bfg_per", "f_cog_per", "f_ldg_per"):
+        assert column in source_columns
+        assert f"fur_hr.{column}" in dependency_source_terminals
+
+
 def test_lineage_application_validation_rejects_broken_counts_refs_and_sorting():
     bad_count = _summary()
     bad_count["splitCounts"]["reference"]["total"] += 1
@@ -766,10 +1277,41 @@ def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
         {"name": "decimal-placement-fixed-tie", "hex": "0x1.2c00000000000p+10", "expected": "1200"},
         {"name": "decimal-placement-scientific", "hex": "0x1.7700000000000p+13", "expected": "12e3"},
         {"name": "integral-float", "hex": "0x1.1800000000000p+10", "expected": "1120"},
+        {"name": "minimum-subnormal-open-midpoints", "hex": "0x0.0000000000001p-1022", "expected": "3e-324"},
+        {"name": "minimum-normal-even-midpoints", "hex": "0x1.0000000000000p-1022", "expected": "22250738585072012e-324"},
+        {"name": "eighteen-digit-fixed-tie", "hex": "0x1.6345785d8a03fp+56", "expected": "100000000000001001"},
+        {"name": "negative-eighteen-digit-fixed-tie", "hex": "-0x1.6345785d8a03fp+56", "expected": "-100000000000001001"},
+        {"name": "two-to-53-even-midpoint", "hex": "0x1.0000000000000p+53", "expected": "9007199254740992"},
+        {"name": "negative-two-to-53-even-midpoint", "hex": "-0x1.0000000000000p+53", "expected": "-9007199254740992"},
+        {"name": "two-to-54-even-midpoint", "hex": "0x1.0000000000000p+54", "expected": "18014398509481983"},
+        {"name": "negative-two-to-54-even-midpoint", "hex": "-0x1.0000000000000p+54", "expected": "-18014398509481983"},
+        {"name": "odd-successor-two-to-54", "hex": "0x1.0000000000001p+54", "expected": "18014398509481987"},
+        {"name": "negative-odd-successor-two-to-54", "hex": "-0x1.0000000000001p+54", "expected": "-18014398509481987"},
+        {"name": "positive-zero", "hex": "0x0.0p+0", "expected": "0"},
         {"name": "negative-zero", "hex": "-0x0.0p+0", "expected": "0"},
         {"name": "small-exponent", "hex": "0x1.ad7f29abcaf48p-24", "expected": "1e-7"},
         {"name": "positive-exponent", "hex": "0x1.5af1d78b58c40p+66", "expected": "1e20"},
         {"name": "maximum-finite", "hex": "0x1.fffffffffffffp+1023", "expected": "17976931348623157e292"},
+        {"name": "gas-ratio-h001-ldg", "hex": "0x1.1111111111111p-3", "expected": "0.13333333333333332"},
+        {"name": "gas-ratio-h002-h010-cog", "hex": "0x1.9ef4499ef449ap-3", "expected": "0.20261437908496731"},
+        {"name": "gas-ratio-h002-ldg", "hex": "0x1.0bb6610bb6611p-3", "expected": "0.13071895424836601"},
+        {"name": "gas-ratio-h003-cog", "hex": "0x1.af286bca1af28p-3", "expected": "0.21052631578947366"},
+        {"name": "gas-ratio-h003-ldg", "hex": "0x1.286bca1af286cp-3", "expected": "0.14473684210526315"},
+        {"name": "gas-ratio-h004-cog", "hex": "0x1.b9b9b9b9b9b9cp-3", "expected": "0.21568627450980392"},
+        {"name": "gas-ratio-h004-ldg", "hex": "0x1.1919191919192p-3", "expected": "0.13725490196078432"},
+        {"name": "gas-ratio-h005-cog", "hex": "0x1.7bc2f785ef0bep-3", "expected": "0.18543046357615893"},
+        {"name": "gas-ratio-h006-cog", "hex": "0x1.81a98ef606a64p-3", "expected": "0.18831168831168831"},
+        {"name": "gas-ratio-h006-ldg", "hex": "0x1.f959c427e5671p-4", "expected": "0.12337662337662337"},
+        {"name": "gas-ratio-h007-cog", "hex": "0x1.ce739ce739ce7p-3", "expected": "0.22580645161290321"},
+        {"name": "gas-ratio-h007-ldg", "hex": "0x1.4a5294a5294a5p-3", "expected": "0.16129032258064515"},
+        {"name": "gas-ratio-h008-cog", "hex": "0x1.d89d89d89d89ep-3", "expected": "0.23076923076923077"},
+        {"name": "gas-ratio-h008-ldg", "hex": "0x1.5555555555555p-3", "expected": "0.16666666666666665"},
+        {"name": "gas-ratio-h009-ldg", "hex": "0x1.0f421e843d088p-3", "expected": "0.13245033112582782"},
+        {"name": "gas-ratio-h010-ldg", "hex": "0x1.fca751fca7520p-4", "expected": "0.12418300653594771"},
+        {"name": "gas-ratio-h011-cog", "hex": "0x1.ec8e951033d92p-3", "expected": "0.24050632911392405"},
+        {"name": "gas-ratio-h011-ldg", "hex": "0x1.6aefcc26e2d5ep-3", "expected": "0.17721518987341771"},
+        {"name": "gas-ratio-h012-cog", "hex": "0x1.f656f1826a43ap-3", "expected": "0.24528301886792452"},
+        {"name": "gas-ratio-h012-ldg", "hex": "0x1.7588daf7f31e9p-3", "expected": "0.18238993710691822"},
     ]
     for vector in vectors:
         value = float.fromhex(vector["hex"])
@@ -778,6 +1320,157 @@ def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
     for value in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError, match="finite"):
             _canonical_json_bytes({"value": value})
+
+
+def test_exact_binary64_oracle_has_no_float_formatting_or_production_import():
+    oracle_source = "\n".join(
+        inspect.getsource(function)
+        for function in (
+            _positive_binary64_fraction,
+            _floor_log10_fraction,
+            _ceil_fraction,
+            _render_decimal_layouts,
+            _independent_binary64_json_number,
+        )
+    )
+    tree = ast.parse(oracle_source)
+    prohibited_calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"repr", "format", "float"}
+    }
+    assert prohibited_calls == set()
+    module_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    assert not any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").startswith("equipment_quality")
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(
+                alias.name.startswith("equipment_quality") for alias in node.names
+            )
+        )
+        for node in ast.walk(module_tree)
+    )
+
+
+def test_every_current_golden_json_numeric_token_uses_the_exact_global_winner():
+    root = CONTRACT / "golden-expectation"
+    for path in sorted(root.glob("*.json")):
+        _assert_json_numeric_tokens_are_canonical(path.read_text(encoding="utf-8"))
+    for line in (root / "criteria_projection.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines():
+        _assert_json_numeric_tokens_are_canonical(line)
+    replay_rows = csv.DictReader(io.StringIO(
+        (root / "replay_events.template.csv").read_text(encoding="utf-8")
+    ))
+    for row in replay_rows:
+        if row["replay_hour"]:
+            assert row["replay_hour"] == str(int(row["replay_hour"]))
+        _assert_json_numeric_tokens_are_canonical(row["values_json"])
+
+
+def test_spelling_only_repairs_preserve_expectation_rows_objects_counts_and_ids():
+    root = CONTRACT / "golden-expectation"
+    repairs = {
+        "quality_risk_intervals.template.json": (
+            "0.7934506856227626", "0.7934506856227625",
+        ),
+        "criteria_projection.jsonl": (
+            "0.13333333333333333", "0.13333333333333332",
+        ),
+        "replay_events.template.csv": (
+            "0.13333333333333333", "0.13333333333333332",
+        ),
+    }
+    assert set(path.name for path in root.iterdir()) == {
+        "analysis_summary.template.json",
+        "criteria_projection.jsonl",
+        "equipment_operating_ranges.template.json",
+        "expected_alerts.json",
+        "quality_risk_intervals.template.json",
+        "replay_events.template.csv",
+    }
+
+    def surface(value: object) -> tuple[int, tuple[tuple[str, object], ...]]:
+        objects = 0
+        identifiers_and_counts: list[tuple[str, object]] = []
+
+        def visit(node: object) -> None:
+            nonlocal objects
+            if isinstance(node, dict):
+                objects += 1
+                for key, child in node.items():
+                    lowered = key.lower()
+                    if (
+                        "id" in lowered
+                        or "count" in lowered
+                        or lowered in {
+                            "total", "support", "defects", "nondefects",
+                            "unknownorcensored", "truepositive", "falsepositive",
+                            "truenegative", "falsenegative",
+                        }
+                    ):
+                        identifiers_and_counts.append((key, child))
+                    visit(child)
+            elif isinstance(node, list):
+                for child in node:
+                    visit(child)
+
+        visit(value)
+        return objects, tuple(identifiers_and_counts)
+
+    for name, (legacy_token, canonical_token) in repairs.items():
+        current = (root / name).read_text(encoding="utf-8")
+        assert current.count(legacy_token) == 0
+        assert current.count(canonical_token) == 1
+        legacy = current.replace(canonical_token, legacy_token)
+        if name.endswith(".json"):
+            current_value = json.loads(current)
+            legacy_value = json.loads(legacy)
+            assert current_value == legacy_value
+            assert surface(current_value) == surface(legacy_value)
+        elif name.endswith(".jsonl"):
+            current_rows = [json.loads(line) for line in current.splitlines()]
+            legacy_rows = [json.loads(line) for line in legacy.splitlines()]
+            assert len(current_rows) == len(legacy_rows) == 2
+            assert current_rows == legacy_rows
+            assert surface(current_rows) == surface(legacy_rows)
+        else:
+            current_rows = list(csv.DictReader(io.StringIO(current), strict=True))
+            legacy_rows = list(csv.DictReader(io.StringIO(legacy), strict=True))
+            assert len(current_rows) == len(legacy_rows) == 8
+            for current_row, legacy_row in zip(
+                current_rows, legacy_rows, strict=True
+            ):
+                assert {
+                    key: value for key, value in current_row.items()
+                    if key != "values_json"
+                } == {
+                    key: value for key, value in legacy_row.items()
+                    if key != "values_json"
+                }
+                current_values = json.loads(current_row["values_json"])
+                legacy_values = json.loads(legacy_row["values_json"])
+                assert current_values == legacy_values
+                assert surface(current_values) == surface(legacy_values)
+
+    unchanged_names = {
+        "analysis_summary.template.json",
+        "equipment_operating_ranges.template.json",
+        "expected_alerts.json",
+    }
+    all_repair_tokens = {
+        token for pair in repairs.values() for token in pair
+    }
+    for name in unchanged_names:
+        text = (root / name).read_text(encoding="utf-8")
+        assert all(text.count(token) == 0 for token in all_repair_tokens)
 
 
 def test_raw_lineage_output_field_is_bound_to_artifact_source_and_config_mapping():
@@ -825,7 +1518,7 @@ def test_derived_lineage_node_dependencies_are_schema_valid_resolved_and_acyclic
         "outputField": "driftMetrics[].holdout.median",
         "sourceRole": None,
         "sourceColumn": None,
-        "conversion": "COPY_DERIVED_METRIC",
+        "conversion": "COMPARE_DISTRIBUTIONS",
         "dependencies": ["analysis_summary.driftMetrics[].reference.median"],
         "firstAvailableStage": None,
     })
@@ -1208,7 +1901,26 @@ def test_golden_summary_censoring_and_counts_match_literal_source_audit():
     assert summary["asOf"] == "2025-02-20"
     assert summary["innerSplitDate"] == "2025-01-03"
     assert summary["labelCensoringCounts"] == expected_censoring
-    assert summary["quarantineCounts"] == {"DUPLICATE_KEY": 1, "UNLINKED_AP": 1}
+    assert summary["quarantineCounts"] == {"DUPLICATE_AP_KEY": 2, "UNLINKED_AP": 1}
+    assert summary["chargePurgeCounts"] == {
+        "outer": {"chargeCount": 0, "rowCount": 0},
+        "inner": {"chargeCount": 0, "rowCount": 0},
+    }
+    assert [item["alertGrade"] for item in summary["holdoutMetrics"]] == [
+        "DANGER", "CAUTION_OR_DANGER",
+    ]
+    # Repair 2 replaces this intentionally partial, schema-valid transition fixture.
+    assert len(summary["lineage"]["materials"]) == 1
+    assert len(summary["lineage"]["aggregates"]) == 1
+    assert {
+        item["populationRef"]: item["materialKeys"]
+        for item in summary["lineage"]["populations"]
+    } == {
+        "REFERENCE": [MATERIAL_CH1_1],
+        "DISCOVERY": [MATERIAL_CH1_1],
+        "CONFIRMATION": [],
+        "HOLDOUT": [],
+    }
     assert summary["splitCounts"] == {
         "confirmation": {
             "dateFrom": "2025-01-04", "dateTo": "2025-01-04", "defects": 0,

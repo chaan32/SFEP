@@ -627,7 +627,7 @@ def test_pandas_nan_source_missingness_becomes_json_null():
     assert preheat.values_json["f_pre_temp"] is None
 
 
-def test_csv_matches_hand_authored_one_chain_golden_after_known_number_correction():
+def test_csv_matches_hand_authored_one_chain_golden():
     events = build_replay_events(
         one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
     )
@@ -637,11 +637,6 @@ def test_csv_matches_hand_authored_one_chain_golden_after_known_number_correctio
     ).read_bytes()
     expected = expected.replace(b"@BUNDLE_ID@", BUNDLE_ID.encode("ascii"))
     expected = expected.replace(b"@CRITERIA_ID@", CRITERIA_ID.encode("ascii"))
-    noncanonical = b'""f_ldg_ratio"":0.13333333333333333'
-    canonical = b'""f_ldg_ratio"":0.13333333333333332'
-    assert expected.count(noncanonical) == 1
-    expected = expected.replace(noncanonical, canonical)
-
     assert serialize_replay_events(events) == expected
 
 

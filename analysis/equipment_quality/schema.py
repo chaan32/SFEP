@@ -18,7 +18,7 @@ from urllib.parse import unquote_to_bytes
 
 import pandas as pd
 from jsonschema import Draft202012Validator, FormatChecker
-from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import SchemaError, ValidationError
 from referencing.exceptions import Unresolvable
 
 from equipment_quality.deterministic import sha256_uri
@@ -100,7 +100,7 @@ _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
     {
         "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-        "analysis_summary.schema.json": "22dd374f5cd5ac7e04624f7d4ce63b69895931239ac443ea36a44f7509af8efd",
+        "analysis_summary.schema.json": "38e61d5d81f15ffb30bd3164c6f34b469b20f06a90e9e393dee1f2a54818bf0f",
         "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
         "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
         "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -111,6 +111,128 @@ _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
 _NORMATIVE_SCHEMA_BYTES_CACHE: dict[str, bytes] = {}
 _NORMATIVE_VALIDATOR_CACHE: dict[str, Draft202012Validator] = {}
 _NORMATIVE_SCHEMA_CACHE_LOCK = RLock()
+
+_LINEAGE_ARTIFACT_ORDER = {
+    role: index
+    for index, role in enumerate(
+        (
+            "bundle_manifest",
+            "analysis_config",
+            "producer_runtime",
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+            "replay_events",
+            "analysis_summary",
+        )
+    )
+}
+_LINEAGE_SOURCE_TERMINALS = frozenset(
+    f"{role}.{column}"
+    for role, _name, columns in _SOURCE_SPECS
+    for column in columns
+)
+_LINEAGE_CONVERSIONS = frozenset(
+    {
+        "COPY_SOURCE_SCALAR",
+        "PARSE_FINITE_BINARY64",
+        "PARSE_DATE",
+        "PARSE_HOUR_BUCKET",
+        "DERIVE_FUEL_RATIO",
+        "COPY_CANONICAL_CONFIG",
+        "COPY_VERIFIED_RUNTIME",
+        "COMPUTE_IDENTITY",
+        "COMPUTE_SHA256",
+        "TYPE1_QUANTILE",
+        "COUNT_PARTITION",
+        "PROFILE_SOURCE_COLUMN",
+        "COMPARE_DISTRIBUTIONS",
+        "COMPUTE_HOLDOUT_METRIC",
+        "LINEAGE_INDEX_V1",
+    }
+)
+_LINEAGE_FILTERS = frozenset(
+    {
+        "STAGE_AVAILABLE_AT_AS_OF",
+        "FINITE_VALUE",
+        "LABEL_AVAILABLE_AND_MATURE",
+        "PREDICATE_MATCH",
+        "INFORMATIVE_STRATA_ONLY",
+        "FIXED_DISCOVERY_STRATA",
+    }
+)
+_LINEAGE_TRANSFORMATIONS = frozenset(
+    {
+        "TYPE1_QUANTILE",
+        "WILSON_SCORE_INTERVAL",
+        "DIRECT_STANDARDIZATION",
+        "MANTEL_HAENSZEL_RR",
+        "CMH_NORMAL_APPROXIMATION",
+        "BENJAMINI_HOCHBERG_FDR",
+        "CHARGE_BLOCK_BOOTSTRAP_PERCENTILE_CI",
+        "CONFIRMATION_WEIGHT_RENORMALIZATION",
+        "GRADE_POLICY_V1",
+        "DISPLAY_MERGE_V1",
+    }
+)
+_LINEAGE_ROOT_PREFIXES = {
+    "bundle_manifest": ("identity.", "schema.", "source."),
+    "analysis_config": ("config.",),
+    "producer_runtime": ("runtime.",),
+    "equipment_operating_ranges": ("config.", "population.REFERENCE"),
+    "quality_risk_intervals": (
+        "config.",
+        "population.DISCOVERY",
+        "population.CONFIRMATION",
+    ),
+    "replay_events": ("config.", "identity."),
+    "analysis_summary": (
+        "config.",
+        "identity.",
+        "policy.",
+        "population.",
+        "runtime.",
+        "schema.",
+        "source.",
+    ),
+}
+_LINEAGE_SOURCE_TERMINAL_ROLES = frozenset(
+    {
+        "equipment_operating_ranges",
+        "quality_risk_intervals",
+        "replay_events",
+        "analysis_summary",
+    }
+)
+_LINEAGE_NODE_DEPENDENCY_ROLES = {
+    "bundle_manifest": frozenset(
+        {
+            "analysis_config",
+            "producer_runtime",
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+            "replay_events",
+            "analysis_summary",
+        }
+    ),
+    "analysis_config": frozenset(),
+    "producer_runtime": frozenset(),
+    "equipment_operating_ranges": frozenset({"analysis_config"}),
+    "quality_risk_intervals": frozenset(
+        {"analysis_config", "equipment_operating_ranges"}
+    ),
+    "replay_events": frozenset(
+        {"equipment_operating_ranges", "quality_risk_intervals"}
+    ),
+    "analysis_summary": frozenset(_LINEAGE_ARTIFACT_ORDER),
+}
+_HOLDOUT_METRICS = (
+    "alertRate",
+    "precision",
+    "recall",
+    "baseDefectRate",
+    "lift",
+    "falseAlertsPer100",
+)
 
 
 class _MalformedSchemaResource(ValueError):
@@ -350,11 +472,312 @@ def normative_schema_bytes(name: str) -> bytes:
     return _normative_schema_bytes(name)
 
 
+def _summary_validation_error(message: str) -> None:
+    raise ValidationError(f"analysis summary application contract: {message}")
+
+
+def _utf8_sorted(values: list[str]) -> bool:
+    return values == sorted(values, key=lambda value: value.encode("utf-8"))
+
+
+def _validate_analysis_summary_application_contract(
+    summary: Mapping[str, object],
+) -> None:
+    split_counts = summary["splitCounts"]
+    assert isinstance(split_counts, Mapping)
+    for split, value in split_counts.items():
+        assert isinstance(value, Mapping)
+        if value["total"] != (
+            value["defects"]
+            + value["nonDefects"]
+            + value["unknownOrCensored"]
+        ):
+            _summary_validation_error(f"{split} count balance is invalid")
+
+    purge_counts = summary["chargePurgeCounts"]
+    assert isinstance(purge_counts, Mapping)
+    for boundary in ("outer", "inner"):
+        value = purge_counts[boundary]
+        assert isinstance(value, Mapping)
+        if value["rowCount"] < value["chargeCount"]:
+            _summary_validation_error(
+                f"{boundary} purge row count is smaller than charge count"
+            )
+
+    holdout_profiles = summary["holdoutMetrics"]
+    assert isinstance(holdout_profiles, list)
+    if [item["alertGrade"] for item in holdout_profiles] != [
+        "DANGER",
+        "CAUTION_OR_DANGER",
+    ]:
+        _summary_validation_error("holdout profile order is invalid")
+    for profile in holdout_profiles:
+        assert isinstance(profile, Mapping)
+        if profile["total"] != sum(
+            profile[name]
+            for name in (
+                "truePositive",
+                "falsePositive",
+                "trueNegative",
+                "falseNegative",
+            )
+        ):
+            _summary_validation_error("holdout confusion count balance is invalid")
+        total = profile["total"]
+        true_positive = profile["truePositive"]
+        false_positive = profile["falsePositive"]
+        false_negative = profile["falseNegative"]
+        alert_count = true_positive + false_positive
+        defect_count = true_positive + false_negative
+        precision = (
+            None if alert_count == 0 else true_positive / alert_count
+        )
+        base_defect_rate = None if total == 0 else defect_count / total
+        expected_points = {
+            "alertRate": None if total == 0 else alert_count / total,
+            "precision": precision,
+            "recall": (
+                None if defect_count == 0 else true_positive / defect_count
+            ),
+            "baseDefectRate": base_defect_rate,
+            "lift": (
+                None
+                if precision is None or base_defect_rate in {None, 0}
+                else precision / base_defect_rate
+            ),
+            "falseAlertsPer100": (
+                None if total == 0 else 100 * false_positive / total
+            ),
+        }
+        for name in _HOLDOUT_METRICS:
+            metric = profile[name]
+            assert isinstance(metric, Mapping)
+            reason = metric["reasonCode"]
+            point = metric["pointEstimate"]
+            lower = metric["lower"]
+            upper = metric["upper"]
+            valid = metric["validReplicates"]
+            expected_point = expected_points[name]
+            if expected_point is None:
+                if (
+                    reason != "ZERO_DENOMINATOR"
+                    or (point, lower, upper, valid) != (None, None, None, 0)
+                ):
+                    _summary_validation_error(
+                        f"holdout {name} zero-denominator state is inconsistent"
+                    )
+                continue
+            if point != expected_point or reason == "ZERO_DENOMINATOR":
+                _summary_validation_error(
+                    f"holdout {name} point estimate is inconsistent with counts"
+                )
+            if reason == "NONE":
+                if (
+                    lower is None
+                    or upper is None
+                    or valid < 1900
+                    or not lower <= point <= upper
+                ):
+                    _summary_validation_error(
+                        f"holdout {name} valid interval is inconsistent"
+                    )
+            elif (
+                lower is not None
+                or upper is not None
+                or valid >= 1900
+            ):
+                _summary_validation_error(
+                    f"holdout {name} bootstrap state is inconsistent"
+                )
+
+    lineage = summary["lineage"]
+    assert isinstance(lineage, Mapping)
+    materials = lineage["materials"]
+    assert isinstance(materials, list)
+    material_keys = [item["materialKey"] for item in materials]
+    if not _utf8_sorted(material_keys) or len(material_keys) != len(set(material_keys)):
+        _summary_validation_error("material keys must be unique and UTF-8 sorted")
+    known_materials = set(material_keys)
+    source_order = {role: index for index, (role, _name, _columns) in enumerate(_SOURCE_SPECS)}
+    for material in materials:
+        records = material["sourceRecords"]
+        record_keys = [
+            (source_order[record["role"]], record["recordNumber"])
+            for record in records
+        ]
+        if record_keys != sorted(record_keys) or len(record_keys) != len(set(record_keys)):
+            _summary_validation_error(
+                "material source records must be unique and role/record sorted"
+            )
+
+    populations = lineage["populations"]
+    assert isinstance(populations, list)
+    expected_populations = ["REFERENCE", "DISCOVERY", "CONFIRMATION", "HOLDOUT"]
+    if [item["populationRef"] for item in populations] != expected_populations or [
+        item["split"] for item in populations
+    ] != expected_populations:
+        _summary_validation_error("population order or split binding is invalid")
+    population_keys: dict[str, set[str]] = {}
+    for population in populations:
+        keys = population["materialKeys"]
+        if not _utf8_sorted(keys) or not set(keys) <= known_materials:
+            _summary_validation_error(
+                "population material keys must be sorted references"
+            )
+        population_keys[population["populationRef"]] = set(keys)
+
+    aggregates = lineage["aggregates"]
+    assert isinstance(aggregates, list)
+    aggregate_sort_keys = [
+        (
+            _LINEAGE_ARTIFACT_ORDER[item["artifactRole"]],
+            item["ruleId"].encode("utf-8"),
+            item["split"].encode("utf-8"),
+        )
+        for item in aggregates
+    ]
+    if aggregate_sort_keys != sorted(aggregate_sort_keys) or len(
+        aggregate_sort_keys
+    ) != len(set(aggregate_sort_keys)):
+        _summary_validation_error("aggregates must be unique and sorted")
+    for aggregate in aggregates:
+        keys = aggregate["inputMaterialKeys"]
+        if not _utf8_sorted(keys) or not set(keys) <= population_keys[
+            aggregate["populationRef"]
+        ]:
+            _summary_validation_error(
+                "aggregate material keys must be sorted population references"
+            )
+        if aggregate["artifactRole"] == "equipment_operating_ranges":
+            expected_binding = ("REFERENCE", "REFERENCE", "NOT_APPLICABLE")
+        else:
+            expected_binding = (
+                aggregate["split"],
+                aggregate["split"],
+                "FIXED_POPULATION_STRATA_MINUS_CANDIDATE",
+            )
+        actual_binding = (
+            aggregate["split"],
+            aggregate["populationRef"],
+            aggregate["comparatorDefinition"],
+        )
+        if actual_binding != expected_binding:
+            _summary_validation_error("aggregate population binding is invalid")
+        if not set(aggregate["filters"]) <= _LINEAGE_FILTERS:
+            _summary_validation_error("aggregate filter vocabulary is invalid")
+        if not set(aggregate["transformations"]) <= _LINEAGE_TRANSFORMATIONS:
+            _summary_validation_error("aggregate transformation vocabulary is invalid")
+
+    fields = lineage["fields"]
+    assert isinstance(fields, list)
+    node_ids = [f'{field["artifactRole"]}.{field["outputField"]}' for field in fields]
+    field_sort_keys = [
+        (
+            _LINEAGE_ARTIFACT_ORDER[field["artifactRole"]],
+            field["outputField"].encode("utf-8"),
+        )
+        for field in fields
+    ]
+    if field_sort_keys != sorted(field_sort_keys) or len(node_ids) != len(set(node_ids)):
+        _summary_validation_error("lineage fields must be unique and sorted")
+    known_nodes = set(node_ids)
+    dependency_graph: dict[str, list[str]] = {}
+    source_columns = {
+        role: set(columns) for role, _name, columns in _SOURCE_SPECS
+    }
+    for field, node_id in zip(fields, node_ids, strict=True):
+        if field["conversion"] not in _LINEAGE_CONVERSIONS:
+            _summary_validation_error("lineage conversion vocabulary is invalid")
+        dependencies = field["dependencies"]
+        if not _utf8_sorted(dependencies):
+            _summary_validation_error(
+                "lineage dependencies must be unique and UTF-8 sorted"
+            )
+        source_role = field["sourceRole"]
+        if source_role is not None:
+            source_column = field["sourceColumn"]
+            if (
+                field["artifactRole"] != "replay_events"
+                or source_column not in source_columns[source_role]
+                or field["firstAvailableStage"] is None
+                or dependencies
+            ):
+                _summary_validation_error("raw lineage mapping is invalid")
+            identifier_fields = {
+                "charge_id",
+                "slab_no",
+                "hr_coil_id",
+                "ap_prod_id",
+            }
+            expected_output = (
+                source_column
+                if source_column in identifier_fields
+                else f"values_json.{source_column}"
+            )
+            if field["outputField"] != expected_output:
+                _summary_validation_error("raw replay output path is invalid")
+        elif (
+            field["sourceColumn"] is not None
+            or not dependencies
+            or (
+                field["artifactRole"] != "replay_events"
+                and field["firstAvailableStage"] is not None
+            )
+        ):
+            _summary_validation_error("derived lineage mapping is invalid")
+
+        graph_dependencies: list[str] = []
+        for dependency in dependencies:
+            if dependency in known_nodes:
+                dependency_role = dependency.split(".", 1)[0]
+                if dependency_role not in _LINEAGE_NODE_DEPENDENCY_ROLES[
+                    field["artifactRole"]
+                ]:
+                    _summary_validation_error(
+                        "lineage output-node dependency is invalid for "
+                        f"{field['artifactRole']}"
+                    )
+                graph_dependencies.append(dependency)
+                continue
+            if (
+                dependency in _LINEAGE_SOURCE_TERMINALS
+                and field["artifactRole"] in _LINEAGE_SOURCE_TERMINAL_ROLES
+            ) or any(
+                dependency.startswith(prefix)
+                for prefix in _LINEAGE_ROOT_PREFIXES[field["artifactRole"]]
+            ):
+                continue
+            _summary_validation_error(
+                f"lineage dependency terminal is invalid for {field['artifactRole']}"
+            )
+        dependency_graph[node_id] = graph_dependencies
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visiting:
+            _summary_validation_error("lineage dependency cycle")
+        if node_id in visited:
+            return
+        visiting.add(node_id)
+        for dependency in dependency_graph[node_id]:
+            visit(dependency)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    for node_id in dependency_graph:
+        visit(node_id)
+
+
 def validate_normative_instance(name: str, instance: object) -> None:
     """Validate an instance with the cached checked Draft 2020-12 schema."""
     _require_normative_schema_name(name)
     try:
         _normative_validator(name).validate(instance)
+        if name == "analysis_summary.schema.json":
+            assert isinstance(instance, Mapping)
+            _validate_analysis_summary_application_contract(instance)
     except Unresolvable as error:
         raise RuntimeError(
             f"normative schema reference resolution failed: {name}"

@@ -155,7 +155,7 @@ artifact는 내부에 `bundleId`를 포함하므로 artifact digest를 `bundleId
 
 ### 6.1 Bundle wire contract v1
 
-모든 JSON은 UTF-8·BOM 없음, key Unicode code-point 오름차순, 공백 없는 `,`·`:` 구분자, 비ASCII 문자 비이스케이프, LF 한 개 종료로 기록한다. 숫자는 Python binary64의 shortest round-trip 표기인 유한 JSON number만 허용하고 NaN/Infinity는 금지한다. Java는 JSON을 다시 직렬화해 hash하지 않고 원본 바이트 digest를 검증한 뒤 파싱한다. 날짜는 `YYYY-MM-DD`, SHA-256은 `sha256:` 뒤 소문자 64자리 hex다. 모르는 필수 enum이나 schema major version은 Java가 거부한다.
+모든 JSON은 UTF-8·BOM 없음, key Unicode code-point 오름차순, 공백 없는 `,`·`:` 구분자, 비ASCII 문자 비이스케이프, LF 한 개 종료로 기록한다. Python `int`는 binary64로 바꾸지 않고 exact 정수를 부호와 10진 숫자로만 기록하며 선행 0과 `-0`을 금지한다. Python `float`는 같은 finite binary64로 round-to-nearest-ties-to-even 되는 모든 유효 JSON number 중 UTF-8 byte 길이가 가장 짧고, 동률이면 UTF-8 lexical order가 가장 앞선 spelling을 고른다. `e`는 소문자이고 exponent의 `+`와 선행 0, mantissa의 불필요한 끝 0과 소수점은 금지하며 `+0.0`과 `-0.0`은 모두 `0`이다. 후보 구간의 midpoint 소유권은 binary significand parity로 정하고 최대 finite 값의 개념적 다음 경계에는 `2^1024`를 사용한다. NaN/Infinity는 금지한다. Java는 JSON을 다시 직렬화해 hash하지 않고 원본 바이트 digest를 검증한 뒤 파싱한다. 날짜는 `YYYY-MM-DD`, SHA-256은 `sha256:` 뒤 소문자 64자리 hex다. 모르는 필수 enum이나 schema major version은 Java가 거부한다.
 
 normative contract는 `contracts/equipment-monitor/v1/` 아래 다음 JSON Schema 파일과 `golden-bundle/` fixture로 저장한다. 동일한 일곱 schema bytes를 Gradle `processResources`로 monitor bootJar의 고정 classpath에 포함하며, 빌드 중 원본과 복사본의 digest가 다르면 실패한다.
 
@@ -167,6 +167,7 @@ normative contract는 `contracts/equipment-monitor/v1/` 아래 다음 JSON Schem
 - `analysis_summary.schema.json`
 - `replay_event_row.schema.json`
 - `id-test-vectors.json` — hand-authored line preimage와 독립 SHA-256 기대값
+- `canonical-number-test-vectors.json` — exact binary64 interval oracle의 parity, subnormal/max-finite, 18-digit tie와 golden gas-ratio 기대 spelling
 - `golden-source/` — CP949 최소 원본 3개
 - `golden-expectation/` — hand-authored criteria projection, 통계·이벤트·경보의 의미상 기대값과 provenance token template
 - `golden-bundle/` — producer 구현 뒤 독립 봉인한 최소 완전 Bundle과 Java 예상 이벤트·경보
@@ -229,7 +230,11 @@ Java는 먼저 사용자가 준 절대 bundle root가 존재하는 non-symlink d
 
 `applicationContext` value는 null이 아닌 string·boolean·finite number 한 개이고 무제한 context는 빈 object다. 숫자·상호작용과 비설비 범주 규칙은 `PROCESS_GLOBAL`, `equipmentId=ALL`이고, 설비 ID 자체의 범주 predicate만 `EQUIPMENT_SPECIFIC`과 해당 ID를 쓴다. Java는 predicate와 `applicationContext`만 runtime 매칭에 쓰며 `adjustmentLevel`은 통계설명 전용이다. predicate `type`은 `NUMERIC_INTERVAL|CATEGORY_IN`, `values` 원소도 같은 scalar 타입이다. metric object는 `support`, `defects`, `crudeRate`, `crudeRateCiLower`, `crudeRateCiUpper`, `adjustedRate`, `comparatorAdjustedRate`, `riskDifference`, `relativeRisk`, `relativeRiskCiLower`, `relativeRiskCiUpper`, `pValue`, `qValue`, `reasonCode`를 가진다. 계산 불가능한 통계만 JSON null이며 `reasonCode`는 `NONE|LOW_SUPPORT|LOW_DEFECT_COUNT|ZERO_COMPARATOR_RISK|NON_FINITE_ESTIMATE|NO_INFORMATIVE_STRATA|NO_VARIATION|ZERO_VARIANCE|DIRECTION_NOT_REPEATED|TOO_FEW_VALID_BOOTSTRAPS|NOT_APPLICABLE` 중 하나다. 확인구간의 `relativeRiskCiLower`, `relativeRiskCiUpper`, `pValue`, `qValue`는 계약상 null이며 정상 계산이면 `reasonCode=NONE`이다.
 
-`analysis_summary.json`은 `schemaVersion=sfep-analysis-summary/v1`, 두 ID, 날짜범위, `splitCounts`, `quarantineCounts`, `labelCensoringCounts`, `sourceColumnProfiles`, `driftMetrics`, `holdoutMetrics`를 가진다. 모든 count object는 `total,defects,nonDefects,unknownOrCensored` 정수와 적용 가능한 날짜범위를 포함하며 `total = defects + nonDefects + unknownOrCensored`를 항상 만족한다. Label이 정의되지 않은 격리·미연결·미성숙 행은 `unknownOrCensored`에만 센다.
+`analysis_summary.json`은 `schemaVersion=sfep-analysis-summary/v1`, 두 ID, 날짜범위, `splitCounts`, Task 3의 exact 15-value `quarantineCounts`, exact `AP_UNLINKED|LABEL_MISSING|LABEL_NOT_YET_AVAILABLE` `labelCensoringCounts`, 별도의 필수 `chargePurgeCounts.outer|inner`, `sourceColumnProfiles`, `driftMetrics`, `holdoutMetrics`, `lineage`를 가진다. 각 purge object는 `chargeCount,rowCount`를 가지며 quarantine에 합치지 않는다. 모든 split count object는 `total,defects,nonDefects,unknownOrCensored` 정수와 적용 가능한 날짜범위를 포함하며 `total = defects + nonDefects + unknownOrCensored`를 항상 만족한다. Label이 정의되지 않은 격리·미연결·미성숙 행은 `unknownOrCensored`에만 센다.
+
+`holdoutMetrics`는 정확히 `DANGER`, `CAUTION_OR_DANGER` 순서의 두 profile이다. 각 profile의 `alertRate,precision,recall,baseDefectRate,lift,falseAlertsPer100`는 각각 독립된 `pointEstimate,lower,upper,validReplicates,reasonCode` object다. `NONE`은 non-null point/CI와 최소 1,900 valid replicate, `ZERO_DENOMINATOR`는 모두 null/0, `TOO_FEW_VALID_BOOTSTRAPS`는 non-null point·null CI·1,900 미만 valid replicate를 뜻하며 상태를 profile 공통 필드로 합치지 않는다.
+
+`lineage.populations`는 정확히 `REFERENCE,DISCOVERY,CONFIRMATION,HOLDOUT` 순서이고 ref와 split은 같은 이름에 고정한다. Range aggregate는 `REFERENCE/REFERENCE/NOT_APPLICABLE`, quality aggregate는 `DISCOVERY` 또는 `CONFIRMATION`과 같은 population ref 및 `FIXED_POPULATION_STRATA_MINUS_CANDIDATE`를 사용한다. 일곱 artifact role의 output grammar, 50개 source terminal과 config/runtime/schema/source/identity/population/policy root, conversion/filter/transformation vocabulary를 폐쇄한다. raw mapping은 exact source role/column, non-null stage, 빈 dependencies를 가지며 replay identifier는 top-level `charge_id,slab_no,hr_coil_id,ap_prod_id`에 기록한다. derived mapping은 null source role/column과 하나 이상의 폐쇄 dependency를 가지되 derived replay field만 non-null stage를 가질 수 있다. output-node 참조, uniqueness, UTF-8 정렬, role별 terminal, cycle과 point/CI consistency는 schema와 application validation을 함께 적용한다. `analysis_summary.lineage` subtree 자체는 다른 lineage entry를 재귀 요구하지 않는 유일한 metadata 예외다.
 
 `replay_events.csv`는 UTF-8, RFC 4180, LF, 점 소수점이며 첫 행의 열 순서를 다음으로 고정한다.
 

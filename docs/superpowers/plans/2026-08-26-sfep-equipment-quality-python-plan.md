@@ -17,7 +17,7 @@
 - 모든 production/test 작업은 먼저 실패하는 실제 동작 테스트를 확인한 뒤 최소 구현으로 통과시킨다.
 - Python producer 지원환경은 `Darwin/arm64`, CPython `3.12.10` 하나다.
 - 직접 의존성은 `numpy==2.2.6`, `pandas==2.3.0`, `jsonschema==4.24.0`, `pytest==8.4.1`, pip `25.1.1`이다. SciPy는 사용하지 않는다.
-- JSON은 UTF-8·BOM 없음, Unicode code-point key 정렬, 공백 없는 separators, 비ASCII 비이스케이프, finite binary64 shortest-roundtrip, 마지막 LF 한 개다.
+- JSON은 UTF-8·BOM 없음, Unicode code-point key 정렬, 공백 없는 separators, 비ASCII 비이스케이프, 마지막 LF 한 개다. Exact Python `int`는 binary64와 분리해 canonical 10진 정수로 쓰고, finite binary64는 round-to-nearest-ties-to-even interval의 모든 JSON spelling 중 UTF-8 길이·lexical 순으로 전역 winner를 택한다. `e`는 소문자, exponent는 `+`/선행 0 없이 정규화하고 양·음 zero는 `0`으로 합친다.
 - CSV는 UTF-8·BOM 없음, RFC 4180, LF, 고정 header와 고정 sort tuple을 사용한다.
 - `LABEL_MATURITY_DAYS=38`, `T=처음으로 count(hr_date<=d)>=ceil(0.70*N)인 날짜`, 내부 `D`도 같은 70% 공식이며 날짜를 쪼개거나 재계산하지 않는다.
 - 동일 Charge가 경계를 가르면 양쪽에서 전부 제거한다. `judge`가 없는/미성숙 소재는 양품이 아니라 `unknownOrCensored`다.
@@ -211,6 +211,7 @@ git commit -m "feat: add deterministic Python producer foundation"
 - Create: `contracts/equipment-monitor/v1/analysis_summary.schema.json`
 - Create: `contracts/equipment-monitor/v1/replay_event_row.schema.json`
 - Create: `contracts/equipment-monitor/v1/id-test-vectors.json`
+- Create: `contracts/equipment-monitor/v1/canonical-number-test-vectors.json`
 - Create: `contracts/equipment-monitor/v1/golden-source/sts_1sm_cc_1.csv`
 - Create: `contracts/equipment-monitor/v1/golden-source/sts_2fur_hr_2.csv`
 - Create: `contracts/equipment-monitor/v1/golden-source/sts_3ap_3.csv`
@@ -295,7 +296,9 @@ Expected: FAIL with missing `contracts/equipment-monitor/v1` files.
 
 `analysis_config.json`에 다음 exact policy를 넣는다: `schemaVersion=sfep-analysis-config/v1`, `analysisConfigVersion=quality-analysis-v1`, `timezone=Asia/Seoul`, `labelMaturityDays=38`, reference/discovery fraction `0.70`, range support `400/2000`, discovery support/defects `200/5/10`, confirmation support/defects `100/5`, bootstrap `2000/1900`, Wilson z `1.959963984540054`, BH q `0.10/0.05`, effect thresholds `1.5/2.0`과 `0.005/0.01`, spec 8.5 field stages, spec 12.3의 6개 fixed interactions, spec 13의 10개 evidence family.
 
-각 schema는 `$schema=https://json-schema.org/draft/2020-12/schema`, exact `required`, enum/nullability/numeric range와 모든 중첩 object의 `additionalProperties:false`를 둔다. 배열의 role/order/unique 조건은 Draft 2020-12 표현과 application-level validation 양쪽에 고정한다. Manifest artifact item에는 `role,sizeBytes,sha256,schemaVersion`만 허용하고 자유 `path`를 금지한다. `analysis_summary`에는 필수 `lineage.fields[]`, `lineage.materials[]`, `lineage.populations[]`, `lineage.aggregates[]`를 둔다. field entry는 `artifactRole,outputField,sourceRole,sourceColumn,conversion,dependencies,firstAvailableStage`, material entry는 `materialKey,chargeId,slabNo,hrCoilId,sourceRecords`를 가지며 source record는 `role,name,recordNumber`다. population entry는 `populationRef,split,materialKeys`, aggregate entry는 `artifactRole,ruleId,split,populationRef,inputMaterialKeys,comparatorDefinition,filters,transformations`를 가진다. Range input keys는 실제 finite value 기여 소재, quality input keys는 candidate 소재이고 comparator는 고정 population/strata에서 candidate를 뺀 집합이라는 exact expression으로 기록한다. derived field의 source role/column/stage는 null일 수 있지만 dependencies는 비어 있지 않고, raw copy/parse field는 정확한 source role/column과 stage를 필수로 갖는다. 모든 material key/ref는 존재하고 UTF-8 byte 순으로 정렬되어야 한다. `NESTED_SCHEMA_NEGATIVE_CASES`와 token renderer는 test 안의 hand-authored literal instance/변조 함수이며 producer helper를 import하지 않는다.
+각 schema는 `$schema=https://json-schema.org/draft/2020-12/schema`, exact `required`, enum/nullability/numeric range와 모든 중첩 object의 `additionalProperties:false`를 둔다. 배열의 role/order/unique 조건은 Draft 2020-12 표현과 application-level validation 양쪽에 고정한다. Manifest artifact item에는 `role,sizeBytes,sha256,schemaVersion`만 허용하고 자유 `path`를 금지한다. `analysis_summary`에는 Task 3 exact quarantine/censor vocabulary, 별도 필수 `chargePurgeCounts.outer|inner.{chargeCount,rowCount}`, 정확히 `DANGER,CAUTION_OR_DANGER` 순서인 두 holdout profile과 필수 `lineage.fields[]`, `lineage.materials[]`, `lineage.populations[]`, `lineage.aggregates[]`를 둔다. 여섯 holdout metric은 각각 `pointEstimate,lower,upper,validReplicates,reasonCode`를 소유해 정상 CI, zero denominator, too-few-bootstrap 상태를 혼합하지 않는다. population은 정확히 `REFERENCE,DISCOVERY,CONFIRMATION,HOLDOUT` 순서이고 ref/split을 같은 값에 묶는다. Range aggregate는 `REFERENCE/REFERENCE/NOT_APPLICABLE`, quality aggregate는 matching `DISCOVERY|CONFIRMATION` population과 `FIXED_POPULATION_STRATA_MINUS_CANDIDATE`를 쓴다.
+
+field entry는 `artifactRole,outputField,sourceRole,sourceColumn,conversion,dependencies,firstAvailableStage`, material entry는 `materialKey,chargeId,slabNo,hrCoilId,sourceRecords`를 가지며 source record는 `role,name,recordNumber`다. population entry는 `populationRef,split,materialKeys`, aggregate entry는 `artifactRole,ruleId,split,populationRef,inputMaterialKeys,comparatorDefinition,filters,transformations`를 가진다. 일곱 role의 output grammar, 50개 source column(`f_bfg_per,f_cog_per,f_ldg_per` 포함), config/runtime/schema/source/identity/population/policy root와 conversion/filter/transformation vocabulary를 폐쇄한다. Replay identifier raw mapping은 `values_json.*`가 아니라 top-level `charge_id,slab_no,hr_coil_id,ap_prod_id`를 사용한다. raw mapping은 exact source role/column, non-null stage와 빈 dependencies, derived mapping은 null source role/column과 non-empty dependency를 가지며 derived replay field만 stage를 가질 수 있다. `analysis_summary.lineage` 자체만 재귀 metadata tracking에서 제외한다. Range input keys는 실제 finite value 기여 소재, quality input keys는 candidate 소재이고 comparator는 고정 population/strata에서 candidate를 뺀 집합이라는 exact expression으로 기록한다. 모든 material/population/output-node ref의 존재, uniqueness, UTF-8 정렬, cycle, role별 terminal과 point/CI consistency를 application validator가 추가 확인한다. `NESTED_SCHEMA_NEGATIVE_CASES`와 token renderer는 test 안의 hand-authored literal instance/변조 함수이며 producer helper를 import하지 않는다.
 
 - [ ] **Step 4: golden source/expectation과 ID vector를 hand-author**
 
@@ -898,7 +901,7 @@ git commit -m "feat: build deterministic historical replay events"
 - Produces: `compute_bundle_identity(criteria_id: str, analysis_config: bytes, producer_runtime: bytes, sources: Sequence[SourceFile], schema_digests: Mapping[str, str]) -> Identity`
 - Produces: `build_criteria_projection(split: TimeSplitResult, definitions: Sequence[FeatureDefinition]) -> bytes`
 - Produces: `build_summary(request: SummaryBuildRequest) -> dict[str, object]`; the frozen request contains inputs, genealogy, split, ranges, rules, events, two IDs and config-derived definitions.
-- Produces: `holdout_metrics(split: TimeSplitResult, rules: Sequence[QualityRule], criteria_id: str) -> dict[str, object]`
+- Produces: `holdout_metrics(split: TimeSplitResult, rules: Sequence[QualityRule], criteria_id: str) -> list[dict[str, object]]`; 정확히 `DANGER`, `CAUTION_OR_DANGER` 순서다.
 - Produces: `write_bundle(request: BundleWriteRequest) -> Path`
 - Produces: `output_lock(output_root: Path) -> ContextManager[None]`
 - Produces: `run_analysis(config_path: Path, runtime_path: Path, data_dir: Path, output_dir: Path) -> Path`
@@ -1022,20 +1025,22 @@ def test_range_and_quality_aggregate_lineage_resolve_all_stat_inputs_to_source_r
 
 def test_holdout_alert_positive_requires_pre_ap_danger():
     split, rules = holdout_fixture(caution_then_ap_defect=True)
-    metrics = holdout_metrics(split, rules, CRITERIA_ID)
-    assert metrics["alertRate"] == 0.0
-    assert metrics["baseDefectRate"] == 1.0
+    danger = holdout_metrics(split, rules, CRITERIA_ID)[0]
+    assert danger["alertGrade"] == "DANGER"
+    assert danger["alertRate"]["pointEstimate"] == 0.0
+    assert danger["baseDefectRate"]["pointEstimate"] == 1.0
 
 
 def test_holdout_danger_before_ap_is_alert_positive_and_charge_bootstrapped():
     split, rules = holdout_fixture(pre_ap_danger_then_ap_defect=True)
-    metrics = holdout_metrics(split, rules, CRITERIA_ID)
-    assert metrics["truePositive"] == 1
-    assert metrics["precision"] == 1.0
-    assert metrics["confidenceIntervals"]["precision"]["validReplicates"] >= 1900
+    danger = holdout_metrics(split, rules, CRITERIA_ID)[0]
+    assert danger["alertGrade"] == "DANGER"
+    assert danger["truePositive"] == 1
+    assert danger["precision"]["pointEstimate"] == 1.0
+    assert danger["precision"]["validReplicates"] >= 1900
 ```
 
-Holdout point metrics는 spec 10의 TP/FP/TN/FN 식을 exact 사용한다. AP 결과 공개 전 도착했고 `earlyWarningEligible=true`인 DANGER rule 하나 이상과 매칭된 `hr_coil_id`만 alert-positive다; CAUTION 포함 값은 별도 보조지표이고 등급을 올리지 않는다. Holdout CI는 `criteriaId + NUL + "holdout-bootstrap-v1"`의 UTF-8 SHA-256 seed, Charge block 2,000회, Task 5와 같은 uint64be index sampler, type-1 2.5/97.5 percentile, 최소 유효 1,900회를 사용한다. 분모 0은 null/`ZERO_DENOMINATOR`, 유효회수 부족은 null/`TOO_FEW_VALID_BOOTSTRAPS`다.
+Holdout point metrics는 spec 10의 TP/FP/TN/FN 식을 exact 사용한다. AP 결과 공개 전 도착했고 `earlyWarningEligible=true`인 DANGER rule 하나 이상과 매칭된 `hr_coil_id`만 DANGER profile의 alert-positive다; CAUTION 포함 값은 별도 `CAUTION_OR_DANGER` profile이며 등급을 올리지 않는다. 각 profile의 여섯 metric은 독립 `pointEstimate,lower,upper,validReplicates,reasonCode` object다. Holdout CI는 `criteriaId + NUL + "holdout-bootstrap-v1"`의 UTF-8 SHA-256 seed, Charge block 2,000회, Task 5와 같은 uint64be index sampler, type-1 2.5/97.5 percentile, 최소 유효 1,900회를 사용한다. 분모 0은 null point/CI, 0 replicate, `ZERO_DENOMINATOR`; 유효회수 부족은 non-null point, null CI, 1,900 미만 replicate, `TOO_FEW_VALID_BOOTSTRAPS`다.
 
 - [ ] **Step 4: CLI absolute-path/fail-closed 실패 테스트 작성**
 
@@ -1049,7 +1054,7 @@ def test_cli_requires_four_absolute_paths(tmp_path, capsys):
 
 - [ ] **Step 5: summary와 orchestration 구현 후 tests 통과**
 
-`run_analysis`는 네 path의 absolute/non-symlink/expected kind를 확인하고 config/schema/runtime identity를 fail-closed 검증한 뒤 한 `AnalysisConfig` instance에서 definitions를 만든다. 순서는 `read/validate → genealogy → split → criteria projection/criteriaId → ranges/rules → bundleId → events/summary → atomic write`로 고정한다. `analysis_summary.json`에는 split/quarantine/censor counts, source column profile, reference-vs-holdout drift, holdout point estimate/CI, normalized lineage와 `LOCKED_RETROSPECTIVE_HOLDOUT` mode를 포함한다. `lineage.fields`는 여섯 artifact와 Manifest의 모든 leaf field path를 raw source column 또는 명명된 deterministic conversion/dependency에 연결하고, `lineage.materials`는 각 material의 source role/name/record ordinal을 연결한다. `lineage.populations`는 REFERENCE/DISCOVERY/CONFIRMATION/HOLDOUT 소재집합을 한 번씩 고정하고, `lineage.aggregates`는 각 range/rule ID의 실제 input material, split/filter/strata/comparator 구성과 변환을 연결한다. 따라서 range/rule의 support·불량수·분위수·표준화·RR/CI도 population과 material ref를 따라 원본 record까지 역추적되어야 한다. Replay는 `materialKey|batchStep|values_json key`를 field/material 표에 대입해 추적한다. `analysis_summary.lineage` subtree 자체는 다른 lineage entry를 재귀 요구하지 않는 유일한 metadata 예외이며, `LINEAGE_INDEX_V1` 변환으로 genealogy+definitions+split+ranges+rules/events에서 생성되고 모든 참조 무결성·정렬을 schema/application tests로 검증한다. Source profile은 각 원본 column의 role/dtype/total/missing/unique와 numeric type-1 p05/median/p95 또는 category/date frequency를 정렬해 기록한다. Drift는 각 monitored/context field의 reference/holdout support·missing rate와 numeric p05/median/p95 또는 categorical level frequency를 양쪽에 나란히 기록할 뿐 임의 score나 threshold를 만들지 않는다. Holdout을 기준 재학습에 전달하는 함수 경로는 만들지 않는다.
+`run_analysis`는 네 path의 absolute/non-symlink/expected kind를 확인하고 config/schema/runtime identity를 fail-closed 검증한 뒤 한 `AnalysisConfig` instance에서 definitions를 만든다. 순서는 `read/validate → genealogy → split → criteria projection/criteriaId → ranges/rules → bundleId → events/summary → atomic write`로 고정한다. `analysis_summary.json`에는 balanced split counts, exact quarantine/censor counts, 분리된 outer/inner Charge·row purge counts, source column profile, reference-vs-holdout drift, 두 ordered holdout profile, normalized lineage와 `LOCKED_RETROSPECTIVE_HOLDOUT` mode를 포함한다. `lineage.fields`는 여섯 artifact와 Manifest의 모든 leaf field path를 raw source column 또는 명명된 deterministic conversion/dependency에 연결하고, `lineage.materials`는 각 material의 source role/name/record ordinal을 연결한다. `lineage.populations`는 정확히 REFERENCE/DISCOVERY/CONFIRMATION/HOLDOUT 순서로 소재집합을 한 번씩 고정하고, `lineage.aggregates`는 range를 REFERENCE population, quality rule을 matching DISCOVERY/CONFIRMATION population에 묶어 실제 input material, closed filter/transformation/comparator 구성을 연결한다. 따라서 range/rule의 support·불량수·분위수·표준화·RR/CI도 population과 material ref를 따라 원본 record까지 역추적되어야 한다. Replay는 `materialKey|batchStep|values_json key`를 field/material 표에 대입해 추적하되 네 identifier는 top-level CSV path로 추적한다. `analysis_summary.lineage` subtree 자체는 다른 lineage entry를 재귀 요구하지 않는 유일한 metadata 예외이며, `LINEAGE_INDEX_V1` 변환으로 genealogy+definitions+split+ranges+rules/events에서 생성되고 모든 참조 무결성·정렬·cycle·role별 terminal·point/CI consistency를 schema/application tests로 검증한다. Source profile은 각 원본 column의 role/dtype/total/missing/unique와 numeric type-1 p05/median/p95 또는 category/date frequency를 정렬해 기록한다. Drift는 각 monitored/context field의 reference/holdout support·missing rate와 numeric p05/median/p95 또는 categorical level frequency를 양쪽에 나란히 기록할 뿐 임의 score나 threshold를 만들지 않는다. Holdout을 기준 재학습에 전달하는 함수 경로는 만들지 않는다.
 
 Run:
 

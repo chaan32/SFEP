@@ -17,8 +17,9 @@ import time
 import urllib.request
 import zipfile
 
+import jsonschema
 import pytest
-from jsonschema import ValidationError
+from jsonschema import Draft202012Validator, ValidationError
 from referencing.exceptions import Unresolvable
 
 import equipment_quality.schema as schema_module
@@ -39,7 +40,7 @@ SCHEMA_NAMES = (
 )
 LITERAL_ROOT_SHA256 = {
     "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-    "analysis_summary.schema.json": "22dd374f5cd5ac7e04624f7d4ce63b69895931239ac443ea36a44f7509af8efd",
+    "analysis_summary.schema.json": "38e61d5d81f15ffb30bd3164c6f34b469b20f06a90e9e393dee1f2a54818bf0f",
     "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
     "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
     "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -86,6 +87,15 @@ def _valid_replay_row() -> dict[str, object]:
             "cast_date": "2025-01-01",
         },
     }
+
+
+def _transitional_summary() -> dict[str, object]:
+    payload = (
+        CONTRACT_ROOT / "golden-expectation/analysis_summary.template.json"
+    ).read_bytes()
+    payload = payload.replace(b"@BUNDLE_ID@", SHA_A.encode("ascii"))
+    payload = payload.replace(b"@CRITERIA_ID@", SHA_B.encode("ascii"))
+    return json.loads(payload)
 
 
 def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schemas():
@@ -176,6 +186,116 @@ def test_validator_accepts_valid_instance_and_rejects_schema_and_date_violations
         schema_module.validate_normative_instance(
             "replay_event_row.schema.json", invalid_date
         )
+
+
+def test_summary_resource_runs_closed_application_validation_after_json_schema():
+    summary = _transitional_summary()
+    schema_module.validate_normative_instance("analysis_summary.schema.json", summary)
+
+    invalid = copy.deepcopy(summary)
+    invalid["splitCounts"]["reference"]["total"] += 1
+    with pytest.raises(ValidationError, match="count"):
+        schema_module.validate_normative_instance(
+            "analysis_summary.schema.json", invalid
+        )
+
+
+def test_summary_application_validation_closes_refs_order_cycles_roles_and_intervals():
+    summary = _transitional_summary()
+    root_validator = Draft202012Validator(
+        json.loads((CONTRACT_ROOT / "analysis_summary.schema.json").read_bytes())
+    )
+    invalid_instances = []
+
+    invalid_purge = copy.deepcopy(summary)
+    invalid_purge["chargePurgeCounts"]["outer"] = {
+        "chargeCount": 1,
+        "rowCount": 0,
+    }
+    invalid_instances.append(invalid_purge)
+
+    invalid_interval = copy.deepcopy(summary)
+    invalid_interval["holdoutMetrics"][0]["baseDefectRate"]["lower"] = 0.75
+    invalid_instances.append(invalid_interval)
+
+    invalid_formula = copy.deepcopy(summary)
+    invalid_formula["holdoutMetrics"][0]["alertRate"].update(
+        pointEstimate=0.25,
+        lower=0,
+        upper=0.5,
+    )
+    invalid_instances.append(invalid_formula)
+
+    invalid_zero_denominator = copy.deepcopy(summary)
+    invalid_zero_denominator["holdoutMetrics"][0]["alertRate"] = {
+        "pointEstimate": None,
+        "lower": None,
+        "upper": None,
+        "validReplicates": 0,
+        "reasonCode": "ZERO_DENOMINATOR",
+    }
+    invalid_instances.append(invalid_zero_denominator)
+
+    duplicate_material = copy.deepcopy(summary)
+    duplicate_material["lineage"]["materials"].append(
+        copy.deepcopy(duplicate_material["lineage"]["materials"][0])
+    )
+    invalid_instances.append(duplicate_material)
+
+    missing_aggregate_material = copy.deepcopy(summary)
+    missing_aggregate_material["lineage"]["aggregates"][0][
+        "inputMaterialKeys"
+    ] = ["sha256:" + "c" * 64]
+    invalid_instances.append(missing_aggregate_material)
+
+    unsorted_fields = copy.deepcopy(summary)
+    unsorted_fields["lineage"]["fields"].reverse()
+    invalid_instances.append(unsorted_fields)
+
+    unsorted_dependencies = copy.deepcopy(summary)
+    unsorted_dependencies["lineage"]["fields"][1]["dependencies"] = [
+        "policy.LOCKED_RETROSPECTIVE_HOLDOUT",
+        "fur_hr.f_pre_temp",
+    ]
+    invalid_instances.append(unsorted_dependencies)
+
+    cycle = copy.deepcopy(summary)
+    reference = copy.deepcopy(cycle["lineage"]["fields"][1])
+    reference["dependencies"] = [
+        "analysis_summary.driftMetrics[].holdout.median"
+    ]
+    holdout = copy.deepcopy(reference)
+    holdout["outputField"] = "driftMetrics[].holdout.median"
+    holdout["dependencies"] = [
+        "analysis_summary.driftMetrics[].reference.median"
+    ]
+    cycle["lineage"]["fields"] = [
+        cycle["lineage"]["fields"][0],
+        holdout,
+        reference,
+    ]
+    invalid_instances.append(cycle)
+
+    wrong_role_terminal = copy.deepcopy(summary)
+    runtime_field = copy.deepcopy(wrong_role_terminal["lineage"]["fields"][1])
+    runtime_field.update(
+        artifactRole="producer_runtime",
+        outputField="producer.sourceSha256",
+        conversion="COPY_VERIFIED_RUNTIME",
+        dependencies=["fur_hr.f_pre_temp"],
+    )
+    wrong_role_terminal["lineage"]["fields"] = [
+        runtime_field,
+        wrong_role_terminal["lineage"]["fields"][0],
+    ]
+    invalid_instances.append(wrong_role_terminal)
+
+    for invalid in invalid_instances:
+        root_validator.validate(invalid)
+        with pytest.raises(ValidationError):
+            schema_module.validate_normative_instance(
+                "analysis_summary.schema.json", invalid
+            )
 
 
 def test_validation_error_cannot_expose_mutable_cached_schema_state():
@@ -758,6 +878,8 @@ def built_wheel(tmp_path_factory) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     wheel_dir = root / "wheel"
+    environment = os.environ.copy()
+    environment["PIP_NO_INDEX"] = "1"
     result = subprocess.run(
         [
             sys.executable,
@@ -770,6 +892,7 @@ def built_wheel(tmp_path_factory) -> Path:
             str(source),
         ],
         cwd=root,
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
@@ -844,22 +967,41 @@ def test_tampered_wheel_schema_member_is_rejected_by_digest_boundary(
     assert probe.stdout.strip() == "tampered-wheel-member-rejected"
 
 
-def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_root_contracts(
+def test_installed_wheel_validates_all_schemas_from_arbitrary_cwd_without_network_or_root_contracts(
     tmp_path, built_wheel
 ):
-    installed = tmp_path / "installed"
-    install = subprocess.run(
+    virtual_environment = tmp_path / "venv"
+    create_environment = subprocess.run(
         [
             sys.executable,
             "-m",
+            "venv",
+            "--system-site-packages",
+            str(virtual_environment),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert create_environment.returncode == 0, (
+        create_environment.stdout + create_environment.stderr
+    )
+    installed_python = virtual_environment / "bin/python"
+    install_environment = os.environ.copy()
+    install_environment["PIP_NO_INDEX"] = "1"
+    install = subprocess.run(
+        [
+            str(installed_python),
+            "-m",
             "pip",
             "install",
+            "--no-index",
             "--no-deps",
-            "--target",
-            str(installed),
             str(built_wheel),
         ],
         cwd=tmp_path,
+        env=install_environment,
         capture_output=True,
         text=True,
         check=False,
@@ -874,18 +1016,24 @@ def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_
     assert not (tmp_path / "contracts").exists()
     assert not (cwd / "contracts").exists()
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(installed)
+    environment["PYTHONPATH"] = str(
+        Path(jsonschema.__file__).resolve().parent.parent
+    )
     environment["PYTHONNOUSERSITE"] = "1"
-    environment["SFEP_INSTALLED_ROOT"] = str(installed)
+    environment["SFEP_VENV"] = str(virtual_environment)
     environment["SFEP_REPLAY_INSTANCE"] = json.dumps(
         _valid_replay_row(), ensure_ascii=False, separators=(",", ":")
     )
     environment["SFEP_SCHEMA_DIGESTS"] = json.dumps(
         LITERAL_ROOT_SHA256, sort_keys=True, separators=(",", ":")
     )
+    environment["SFEP_SUMMARY_INSTANCE"] = json.dumps(
+        _transitional_summary(), ensure_ascii=False, separators=(",", ":")
+    )
+    environment["PIP_NO_INDEX"] = "1"
     probe = subprocess.run(
         [
-            sys.executable,
+            str(installed_python),
             "-c",
             (
                 "import copy, hashlib, json, os\n"
@@ -893,8 +1041,8 @@ def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_
                 "from jsonschema import ValidationError\n"
                 "import equipment_quality\n"
                 "from equipment_quality.schema import load_analysis_config, normative_schema_bytes, validate_normative_instance\n"
-                "installed = Path(os.environ['SFEP_INSTALLED_ROOT']).resolve()\n"
-                "assert Path(equipment_quality.__file__).resolve().is_relative_to(installed)\n"
+                "venv = Path(os.environ['SFEP_VENV']).resolve()\n"
+                "assert Path(equipment_quality.__file__).resolve().is_relative_to(venv)\n"
                 "assert not (Path.cwd() / 'contracts').exists()\n"
                 "expected_digests = json.loads(os.environ['SFEP_SCHEMA_DIGESTS'])\n"
                 "for name, expected_digest in expected_digests.items():\n"
@@ -904,6 +1052,16 @@ def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_
                 "assert load_analysis_config(Path('analysis_config.json')).analysis_config_version == 'quality-analysis-v1'\n"
                 "row = json.loads(os.environ['SFEP_REPLAY_INSTANCE'])\n"
                 "validate_normative_instance('replay_event_row.schema.json', row)\n"
+                "summary = json.loads(os.environ['SFEP_SUMMARY_INSTANCE'])\n"
+                "validate_normative_instance('analysis_summary.schema.json', summary)\n"
+                "invalid_summary = copy.deepcopy(summary)\n"
+                "invalid_summary['splitCounts']['reference']['total'] += 1\n"
+                "try:\n"
+                "    validate_normative_instance('analysis_summary.schema.json', invalid_summary)\n"
+                "except ValidationError:\n"
+                "    pass\n"
+                "else:\n"
+                "    raise AssertionError('application-invalid summary accepted')\n"
                 "invalid = copy.deepcopy(row)\n"
                 "invalid['replay_date'] = '2025-02-30'\n"
                 "try:\n"
