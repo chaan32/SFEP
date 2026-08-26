@@ -1,0 +1,1 @@
+{"alerts":[],"bundleId":"@BUNDLE_ID@","criteriaId":"@CRITERIA_ID@","expectedReplayEventCount":8,"provenance":{"analysisConfigSchemaSha256":"@SCHEMA_ANALYSIS_CONFIG_SHA256@","analysisSummaryArtifactSha256":"@ARTIFACT_ANALYSIS_SUMMARY_SHA256@","producerRuntimeSha256":"@PRODUCER_RUNTIME_SHA256@","smCcSourceSha256":"@SOURCE_SM_CC_SHA256@"},"schemaVersion":"sfep-expected-alerts/v1"}
