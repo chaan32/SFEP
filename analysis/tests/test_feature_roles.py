@@ -13,50 +13,86 @@ from equipment_quality.schema import load_analysis_config
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
-# Hand-authored from the approved three source headers plus the three approved
-# derived gas fractions.  Identifier, time, result, and ignored source-percent
-# columns are deliberately absent; no production helper derives this oracle.
-EXPECTED_MONITORED_AND_CONTEXT_COLUMNS = frozenset(
-    {
-        "sm_plant",
+# This is intentionally a hand-authored oracle. It neither loads config values
+# nor calls production helpers to construct expected semantics.
+SM_CONTEXT = (
+    ("sm_plant", "steel_grade", "steel_usage"),
+    ("sm_plant", "steel_grade"),
+    ("sm_plant",),
+)
+FURNACE_CONTEXT = (
+    (
+        "furnace_no",
         "steel_grade",
         "steel_usage",
-        "delta_ferrite",
-        "ingre_cr",
-        "ingre_ni",
-        "ingre_s",
-        "cc_gubun",
-        "tundish_temp",
-        "mlac_ratio",
-        "slab_gubun",
-        "slab_grind",
-        "furnace_no",
         "f_jangip_gubun",
-        "f_jangip_temp",
-        "f_bfg",
-        "f_cog",
-        "f_ldg",
-        "f_bfg_ratio",
-        "f_cog_ratio",
-        "f_ldg_ratio",
-        "f_pre_temp",
-        "f_heat_temp",
-        "f_sock_temp",
-        "f_pre_interval",
-        "f_heat_interval",
-        "f_sock_interval",
-        "hr_thick",
-        "hr_width",
-        "rm4_temp",
-        "rm_pitch",
-        "slab_width",
-        "ap_plant",
-        "ap_shift",
-        "ap_thick",
-        "ap_width",
-        "ap_line_speed",
-    }
+        "slab_width_band",
+    ),
+    ("furnace_no", "steel_grade", "f_jangip_gubun"),
+    ("furnace_no", "f_jangip_gubun"),
+    ("furnace_no",),
 )
+RM4_CONTEXT = (
+    ("steel_grade", "steel_usage", "hr_thick_band", "hr_width_band"),
+    ("steel_grade", "steel_usage"),
+    ("steel_grade",),
+    (),
+)
+AP_CONTEXT = (
+    (
+        "ap_plant",
+        "steel_grade",
+        "steel_usage",
+        "ap_shift",
+        "ap_thick_band",
+        "ap_width_band",
+    ),
+    ("ap_plant", "steel_grade", "steel_usage"),
+    ("ap_plant", "steel_grade"),
+    ("ap_plant",),
+)
+
+# Values are: role, data type, first stage, event date, equipment type,
+# source equipment-ID column, process equipment-ID value, context hierarchy.
+EXPECTED_FEATURE_DEFINITIONS = {
+    "sm_plant": ("EQUIPMENT_IDENTIFIER", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "steel_grade": ("CONTEXT", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "steel_usage": ("CONTEXT", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "cc_gubun": ("CONTEXT", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "slab_gubun": ("CONTEXT", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "tundish_temp": ("DIRECT_OPERATION", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "mlac_ratio": ("DIRECT_OPERATION", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "delta_ferrite": ("PRODUCT_STATE_REFERENCE", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "ingre_cr": ("PRODUCT_STATE_REFERENCE", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "ingre_ni": ("PRODUCT_STATE_REFERENCE", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "ingre_s": ("PRODUCT_STATE_REFERENCE", "NUMBER", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "slab_grind": ("PRODUCT_STATE_REFERENCE", "STRING", "CAST_RECORDED", "cast_date", "SM_CC", "sm_plant", None, SM_CONTEXT),
+    "furnace_no": ("EQUIPMENT_IDENTIFIER", "STRING", "FURNACE_CHARGED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_jangip_gubun": ("CONTEXT", "STRING", "FURNACE_CHARGED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_jangip_temp": ("DIRECT_OPERATION", "NUMBER", "FURNACE_CHARGED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "slab_width": ("PRODUCT_STATE_REFERENCE", "NUMBER", "FURNACE_CHARGED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_pre_temp": ("DIRECT_OPERATION", "NUMBER", "PREHEAT_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_pre_interval": ("DIRECT_OPERATION", "NUMBER", "PREHEAT_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_heat_temp": ("DIRECT_OPERATION", "NUMBER", "HEAT_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_heat_interval": ("DIRECT_OPERATION", "NUMBER", "HEAT_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_sock_temp": ("DIRECT_OPERATION", "NUMBER", "SOAK_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_sock_interval": ("DIRECT_OPERATION", "NUMBER", "SOAK_COMPLETE", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_bfg": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_cog": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_ldg": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_bfg_ratio": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_cog_ratio": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "f_ldg_ratio": ("DIRECT_OPERATION", "NUMBER", "FURNACE_EXTRACTED", "f_ext_date", "FURNACE", "furnace_no", None, FURNACE_CONTEXT),
+    "hr_thick": ("PRODUCT_STATE_REFERENCE", "NUMBER", "RM4_RECORDED", "f_ext_date", "RM4", None, "RM4_PROCESS", RM4_CONTEXT),
+    "hr_width": ("PRODUCT_STATE_REFERENCE", "NUMBER", "RM4_RECORDED", "f_ext_date", "RM4", None, "RM4_PROCESS", RM4_CONTEXT),
+    "rm4_temp": ("DIRECT_OPERATION", "NUMBER", "RM4_RECORDED", "f_ext_date", "RM4", None, "RM4_PROCESS", RM4_CONTEXT),
+    "rm_pitch": ("DIRECT_OPERATION", "NUMBER", "RM4_RECORDED", "f_ext_date", "RM4", None, "RM4_PROCESS", RM4_CONTEXT),
+    "ap_plant": ("EQUIPMENT_IDENTIFIER", "STRING", "AP_RECORDED_WITH_RESULT", "ap_date", "AP", "ap_plant", None, AP_CONTEXT),
+    "ap_shift": ("CONTEXT", "STRING", "AP_RECORDED_WITH_RESULT", "ap_date", "AP", "ap_plant", None, AP_CONTEXT),
+    "ap_thick": ("PRODUCT_STATE_REFERENCE", "NUMBER", "AP_RECORDED_WITH_RESULT", "ap_date", "AP", "ap_plant", None, AP_CONTEXT),
+    "ap_width": ("PRODUCT_STATE_REFERENCE", "NUMBER", "AP_RECORDED_WITH_RESULT", "ap_date", "AP", "ap_plant", None, AP_CONTEXT),
+    "ap_line_speed": ("DIRECT_OPERATION", "NUMBER", "AP_RECORDED_WITH_RESULT", "ap_date", "AP", "ap_plant", None, AP_CONTEXT),
+}
 
 EXCLUDED_IDENTITY_TIME_RESULT_COLUMNS = frozenset(
     {
@@ -88,15 +124,25 @@ def _replace_field(config, field_name: str, **changes: object):
     return replace(config, fields=tuple(fields))
 
 
-def test_every_non_identity_source_or_derived_column_has_one_role_and_stage():
+def test_every_feature_definition_matches_the_hand_authored_semantic_oracle():
     produced = definitions(analysis_config())
-    names = [definition.name for definition in produced]
+    observed = {
+        definition.name: (
+            definition.field_role,
+            definition.data_type,
+            definition.first_stage,
+            definition.event_date_column,
+            definition.equipment_type,
+            definition.equipment_id_column,
+            definition.equipment_id_value,
+            definition.context_hierarchy,
+        )
+        for definition in produced
+    }
 
-    assert frozenset(names) == EXPECTED_MONITORED_AND_CONTEXT_COLUMNS
-    assert len(names) == len(set(names)) == 37
-    assert EXCLUDED_IDENTITY_TIME_RESULT_COLUMNS.isdisjoint(names)
-    assert all(definition.field_role for definition in produced)
-    assert all(definition.first_stage for definition in produced)
+    assert observed == EXPECTED_FEATURE_DEFINITIONS
+    assert len(observed) == 37
+    assert EXCLUDED_IDENTITY_TIME_RESULT_COLUMNS.isdisjoint(observed)
 
 
 def test_product_state_roles_and_structural_event_and_equipment_mappings_are_exact():
@@ -130,6 +176,36 @@ def test_definition_role_is_driven_by_config_without_a_second_field_table():
     produced = next(item for item in definitions(config) if item.name == "f_pre_temp")
 
     assert produced.field_role == "PRODUCT_STATE_REFERENCE"
+
+
+def test_source_equipment_identifier_column_is_derived_from_config_role():
+    config = _replace_field(
+        _replace_field(analysis_config(), "furnace_no", featureRole="CONTEXT"),
+        "f_jangip_gubun",
+        featureRole="EQUIPMENT_IDENTIFIER",
+    )
+
+    produced = definitions(config)
+
+    assert {
+        item.equipment_id_column
+        for item in produced
+        if item.equipment_type == "FURNACE"
+    } == {"f_jangip_gubun"}
+
+
+def test_zero_or_multiple_source_equipment_identifiers_fail_closed():
+    zero = _replace_field(
+        analysis_config(), "furnace_no", featureRole="CONTEXT"
+    )
+    multiple = _replace_field(
+        analysis_config(), "f_jangip_gubun", featureRole="EQUIPMENT_IDENTIFIER"
+    )
+
+    with pytest.raises(ValueError, match="exactly one.*FURNACE"):
+        definitions(zero)
+    with pytest.raises(ValueError, match="exactly one.*FURNACE"):
+        definitions(multiple)
 
 
 def test_context_hierarchy_is_config_owned_and_future_stage_fields_are_removed():

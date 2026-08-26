@@ -30,15 +30,50 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LITERAL_SIMPLE_RANGE_RULE_ID = (
     "sha256:cce7219c5b31e1379e9710b21ab7f1f06a88ab7c2f1d079ab5f8e8aecbeeb88e"
 )
+LITERAL_MUTATED_EQUIPMENT_RULE_IDS = [
+    "sha256:1b657ba349fa4910ce58420dfe6bb5406857d4936b9ff042dbff6560de52cc25",
+    "sha256:6d6bd2ee3f89da842c47ed368cf9b491164bc5a5b012496449db9920157db876",
+]
 
 
 def analysis_config():
     return load_analysis_config(REPOSITORY_ROOT / "analysis/analysis_config.json")
 
 
-def _definitions_for(config, *names: str):
-    wanted = set(names)
-    return tuple(item for item in definitions(config) if item.name in wanted)
+def _replace_field(config, field_name: str, **changes: object):
+    fields = []
+    for field in config.fields:
+        item = dict(field)
+        if item["field"] == field_name:
+            item.update(changes)
+        fields.append(item)
+    return replace(config, fields=tuple(fields))
+
+
+def test_range_group_equipment_and_rule_id_follow_mutated_identifier_role():
+    config = _replace_field(
+        _replace_field(analysis_config(), "furnace_no", featureRole="CONTEXT"),
+        "f_jangip_gubun",
+        featureRole="EQUIPMENT_IDENTIFIER",
+    )
+    hierarchies = dict(config.range_context_hierarchies)
+    hierarchies["FURNACE"] = ((),)
+    config = replace(config, range_context_hierarchies=hierarchies)
+    rows = range_rows(
+        values=range(1, 801),
+        furnace_no="1호기",
+        f_jangip_gubun=["CCR"] * 400 + ["HCR"] * 400,
+    )
+
+    records = build_operating_ranges(
+        split_with_reference(rows), definitions(config), config
+    )
+    records = [record for record in records if record["field"] == "f_pre_temp"]
+
+    assert [record["equipmentId"] for record in records] == ["CCR", "HCR"]
+    assert [record["context"] for record in records] == [{}, {}]
+    assert [record["support"] for record in records] == [400, 400]
+    assert [record["ruleId"] for record in records] == LITERAL_MUTATED_EQUIPMENT_RULE_IDS
 
 
 def test_range_uses_type1_quantiles_and_disables_extremes_below_2000():
@@ -47,7 +82,7 @@ def test_range_uses_type1_quantiles_and_disables_extremes_below_2000():
 
     record = only(
         build_operating_ranges(
-            split_with_reference(rows), _definitions_for(config, "f_pre_temp"), config
+            split_with_reference(rows), definitions(config), config
         )
     )
 
@@ -81,7 +116,7 @@ def test_minimum_support_boundary_is_exact(support: int, expected_count: int):
     rows = range_rows(values=range(1, support + 1))
 
     records = build_operating_ranges(
-        split_with_reference(rows), _definitions_for(config, "f_pre_temp"), config
+        split_with_reference(rows), definitions(config), config
     )
 
     assert len(records) == expected_count
@@ -97,7 +132,7 @@ def test_support_thresholds_are_read_from_config_without_fallback_defaults():
     record = only(
         build_operating_ranges(
             split_with_reference(range_rows(values=[1.0, 2.0, 3.0, 4.0])),
-            _definitions_for(changed, "f_pre_temp"),
+            definitions(changed),
             changed,
         )
     )
@@ -124,7 +159,7 @@ def test_extreme_support_boundary_is_exact(
     record = only(
         build_operating_ranges(
             split_with_reference(range_rows(values=range(1, support + 1))),
-            _definitions_for(config, "f_pre_temp"),
+            definitions(config),
             config,
         )
     )
@@ -141,7 +176,7 @@ def test_missing_and_nonfinite_numeric_values_never_contribute_support():
     record = only(
         build_operating_ranges(
             split_with_reference(range_rows(values=values)),
-            _definitions_for(config, "f_pre_temp"),
+            definitions(config),
             config,
         )
     )
@@ -161,7 +196,7 @@ def test_same_date_value_is_included_and_future_stage_event_is_excluded():
     )
 
     record = only(
-        build_operating_ranges(split, _definitions_for(config, "f_pre_temp"), config)
+        build_operating_ranges(split, definitions(config), config)
     )
 
     assert record["support"] == 400
@@ -173,7 +208,7 @@ def test_sparse_specific_context_uses_exact_config_fallback_level_and_context():
 
     record = only(
         build_operating_ranges(
-            sparse_context_fixture(), _definitions_for(config, "f_pre_temp"), config
+            sparse_context_fixture(), definitions(config), config
         )
     )
 
@@ -198,15 +233,11 @@ def test_future_stage_context_is_removed_before_grouping_and_cannot_change_range
     mutated_rows["hr_thick"] = list(reversed(mutated_rows["hr_thick"].tolist()))
     mutated = split_with_reference(mutated_rows)
 
-    before = build_operating_ranges(
-        original, _definitions_for(changed, "f_pre_temp"), changed
-    )
-    after = build_operating_ranges(
-        mutated, _definitions_for(changed, "f_pre_temp"), changed
-    )
+    before = build_operating_ranges(original, definitions(changed), changed)
+    after = build_operating_ranges(mutated, definitions(changed), changed)
 
     assert before == after
-    record = only(before)
+    record = only([item for item in before if item["field"] == "f_pre_temp"])
     assert record["contextLevel"] == 0
     assert record["context"] == {"furnace_no": "1호기"}
     assert "hr_thick_band" not in record["context"]
@@ -225,9 +256,10 @@ def test_dimension_context_bands_are_fixed_type1_quartiles_on_reference_only():
 
     records = build_operating_ranges(
         split_with_reference(rows, holdout_rows=holdout),
-        _definitions_for(config, "f_pre_temp"),
+        definitions(config),
         config,
     )
+    records = [record for record in records if record["field"] == "f_pre_temp"]
 
     assert [record["context"]["slab_width_band"] for record in records] == [
         "Q1",
@@ -244,7 +276,7 @@ def test_tied_lower_tail_disables_only_lower_tail():
     record = only(
         build_operating_ranges(
             collapsed_lower_tail_fixture(),
-            _definitions_for(config, "f_pre_temp"),
+            definitions(config),
             config,
         )
     )
@@ -261,7 +293,7 @@ def test_tied_upper_tail_disables_only_upper_tail():
     record = only(
         build_operating_ranges(
             split_with_reference(range_rows(values=values)),
-            _definitions_for(config, "f_pre_temp"),
+            definitions(config),
             config,
         )
     )
@@ -277,14 +309,64 @@ def test_empty_and_insufficient_groups_produce_no_ranges():
 
     assert build_operating_ranges(
         split_with_reference(pd.DataFrame()),
-        _definitions_for(config, "f_pre_temp"),
+        definitions(config),
         config,
     ) == []
     assert build_operating_ranges(
         split_with_reference(range_rows(values=range(1, 400))),
-        _definitions_for(config, "f_pre_temp"),
+        definitions(config),
         config,
     ) == []
+
+
+def test_empty_definition_surface_fails_closed():
+    config = analysis_config()
+
+    with pytest.raises(ValueError, match="complete"):
+        build_operating_ranges(
+            split_with_reference(pd.DataFrame()),
+            (),
+            config,
+        )
+
+
+def test_subset_definition_surface_cannot_masquerade_as_insufficient_evidence():
+    config = analysis_config()
+    subset = tuple(
+        item for item in definitions(config) if item.name == "f_pre_temp"
+    )
+
+    with pytest.raises(ValueError, match="complete"):
+        build_operating_ranges(
+            split_with_reference(range_rows(values=range(1, 400))),
+            subset,
+            config,
+        )
+
+
+def test_duplicate_definition_surface_fails_closed():
+    config = analysis_config()
+    complete = definitions(config)
+
+    with pytest.raises(ValueError, match="unique"):
+        build_operating_ranges(
+            split_with_reference(pd.DataFrame()),
+            (*complete, complete[0]),
+            config,
+        )
+
+
+def test_semantically_mutated_definition_surface_fails_closed():
+    config = analysis_config()
+    complete = definitions(config)
+    changed = replace(complete[0], data_type="NUMBER")
+
+    with pytest.raises(ValueError, match="immutable config"):
+        build_operating_ranges(
+            split_with_reference(pd.DataFrame()),
+            (changed, *complete[1:]),
+            config,
+        )
 
 
 def test_holdout_feature_mutation_cannot_change_ranges_or_ids():
@@ -293,7 +375,7 @@ def test_holdout_feature_mutation_cannot_change_ranges_or_ids():
     holdout = range_rows(values=range(1001, 1401))
     mutated_holdout = holdout.copy(deep=True)
     mutated_holdout["f_pre_temp"] = [-999999.0] * 400
-    wanted = _definitions_for(config, "f_pre_temp")
+    wanted = definitions(config)
 
     before = build_operating_ranges(
         split_with_reference(reference, holdout_rows=holdout), wanted, config
@@ -310,12 +392,12 @@ def test_product_state_numeric_ranges_preserve_role_but_categorical_state_is_exc
     config = analysis_config()
     numeric = build_operating_ranges(
         split_with_reference(range_rows(values=range(1, 401), field="slab_width")),
-        _definitions_for(config, "slab_width"),
+        definitions(config),
         config,
     )
     categorical = build_operating_ranges(
         split_with_reference(range_rows(values=["HSHS"] * 400, field="slab_grind")),
-        _definitions_for(config, "slab_grind"),
+        definitions(config),
         config,
     )
 
@@ -327,7 +409,7 @@ def test_input_and_definition_order_do_not_change_output_order_or_rule_ids():
     config = analysis_config()
     rows = range_rows(values=range(1, 401))
     rows["f_heat_temp"] = [float(value) for value in range(1001, 1401)]
-    wanted = _definitions_for(config, "f_pre_temp", "f_heat_temp")
+    wanted = definitions(config)
 
     first = build_operating_ranges(split_with_reference(rows), wanted, config)
     second = build_operating_ranges(
@@ -354,7 +436,7 @@ def test_rule_id_collision_between_distinct_ranges_is_fatal(monkeypatch):
     with pytest.raises(ValueError, match="rule ID collision"):
         build_operating_ranges(
             split_with_reference(rows),
-            _definitions_for(config, "f_pre_temp"),
+            definitions(config),
             config,
         )
 
@@ -363,7 +445,7 @@ def test_range_records_validate_against_normative_contract():
     config = analysis_config()
     records = build_operating_ranges(
         split_with_reference(range_rows(values=range(1, 2001))),
-        _definitions_for(config, "f_pre_temp"),
+        definitions(config),
         config,
     )
     schema = json.loads(

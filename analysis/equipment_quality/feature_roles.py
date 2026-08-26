@@ -30,12 +30,9 @@ _EVENT_DATE_BY_STAGE = {
     "RM4_RECORDED": "f_ext_date",
     "AP_RECORDED_WITH_RESULT": "ap_date",
 }
-_EQUIPMENT_ID_COLUMN = {
-    "SM_CC": "sm_plant",
-    "FURNACE": "furnace_no",
-    "RM4": None,
-    "AP": "ap_plant",
-}
+# RM4 has no source equipment identifier in the binding source model. This is
+# the sole equipment-type identity policy that cannot be inferred from fields.
+_PROCESS_EQUIPMENT_IDS = {"RM4": "RM4_PROCESS"}
 _EXCLUDED_ROLES = {"IDENTIFIER", "TIME", "RESULT"}
 
 
@@ -43,10 +40,12 @@ _EXCLUDED_ROLES = {"IDENTIFIER", "TIME", "RESULT"}
 class FeatureDefinition:
     name: str
     field_role: str
+    data_type: str
     first_stage: str
     event_date_column: str
     equipment_type: str
     equipment_id_column: str | None
+    equipment_id_value: str | None
     context_hierarchy: tuple[tuple[str, ...], ...]
 
 
@@ -82,9 +81,43 @@ def _context_stage(
     return str(stage)
 
 
+def _equipment_identities(
+    fields: dict[str, dict[str, object]],
+) -> dict[str, tuple[str | None, str | None]]:
+    equipment_types = {
+        str(configured["equipmentType"]) for configured in fields.values()
+    }
+    result: dict[str, tuple[str | None, str | None]] = {}
+    for equipment_type in sorted(
+        equipment_types, key=lambda value: value.encode("utf-8")
+    ):
+        identifiers = tuple(
+            str(configured["field"])
+            for configured in fields.values()
+            if configured["equipmentType"] == equipment_type
+            and configured["featureRole"] == "EQUIPMENT_IDENTIFIER"
+        )
+        process_id = _PROCESS_EQUIPMENT_IDS.get(equipment_type)
+        if process_id is not None:
+            if identifiers:
+                raise ValueError(
+                    f"process equipment type {equipment_type} must have no source "
+                    "equipment identifier"
+                )
+            result[equipment_type] = (None, process_id)
+            continue
+        if len(identifiers) != 1:
+            raise ValueError(
+                f"exactly one equipment identifier is required for {equipment_type}"
+            )
+        result[equipment_type] = (identifiers[0], None)
+    return result
+
+
 def definitions(config: AnalysisConfig) -> tuple[FeatureDefinition, ...]:
     """Return each config-eligible field exactly once with stage-safe contexts."""
     fields = _configured_fields(config)
+    equipment_identities = _equipment_identities(fields)
     produced: list[FeatureDefinition] = []
     for field in fields.values():
         role = field["featureRole"]
@@ -95,8 +128,6 @@ def definitions(config: AnalysisConfig) -> tuple[FeatureDefinition, ...]:
         equipment_type = str(field["equipmentType"])
         if stage not in STAGE_RANK:
             raise ValueError(f"unknown first available stage: {stage}")
-        if equipment_type not in _EQUIPMENT_ID_COLUMN:
-            raise ValueError(f"unknown equipment type: {equipment_type}")
         try:
             configured_hierarchy = config.range_context_hierarchies[equipment_type]
         except KeyError as error:
@@ -116,10 +147,12 @@ def definitions(config: AnalysisConfig) -> tuple[FeatureDefinition, ...]:
             FeatureDefinition(
                 name=name,
                 field_role=str(role),
+                data_type=str(field["dataType"]),
                 first_stage=stage,
                 event_date_column=_EVENT_DATE_BY_STAGE[stage],
                 equipment_type=equipment_type,
-                equipment_id_column=_EQUIPMENT_ID_COLUMN[equipment_type],
+                equipment_id_column=equipment_identities[equipment_type][0],
+                equipment_id_value=equipment_identities[equipment_type][1],
                 context_hierarchy=hierarchy,
             )
         )

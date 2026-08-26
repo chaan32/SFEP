@@ -72,16 +72,6 @@ def _available_by(
     return event_date is not None and event_date <= as_of
 
 
-def _field_map(config: AnalysisConfig) -> dict[str, Mapping[str, object]]:
-    result: dict[str, Mapping[str, object]] = {}
-    for field in config.fields:
-        name = str(field["field"])
-        if name in result:
-            raise ValueError(f"configured field names must be unique: {name}")
-        result[name] = field
-    return result
-
-
 def _validated_policy(config: AnalysisConfig) -> tuple[int, int, tuple[float, ...]]:
     policy = config.operating_ranges
     if policy["quantileMethod"] != "INVERTED_CDF_TYPE_1":
@@ -118,22 +108,33 @@ def _validated_policy(config: AnalysisConfig) -> tuple[int, int, tuple[float, ..
     return int(minimum_support), int(extreme_support), quantiles
 
 
-def _validated_definition_subset(
+def _validated_definition_surface(
     requested: Sequence[FeatureDefinition], config: AnalysisConfig
 ) -> tuple[FeatureDefinition, ...]:
     expected = {item.name: item for item in configured_definitions(config)}
-    result: list[FeatureDefinition] = []
+    snapshot = tuple(requested)
     seen: set[str] = set()
-    for definition in tuple(requested):
+    for definition in snapshot:
         if definition.name in seen:
             raise ValueError(f"feature definitions must be unique: {definition.name}")
         seen.add(definition.name)
+    if seen != set(expected):
+        missing = sorted(
+            set(expected) - seen, key=lambda value: value.encode("utf-8")
+        )
+        extra = sorted(
+            seen - set(expected), key=lambda value: value.encode("utf-8")
+        )
+        raise ValueError(
+            "feature definitions must be complete "
+            f"(missing={missing}, extra={extra})"
+        )
+    for definition in snapshot:
         if expected.get(definition.name) != definition:
             raise ValueError(
                 f"feature definition does not match immutable config: {definition.name}"
             )
-        result.append(definition)
-    return tuple(result)
+    return snapshot
 
 
 def _band_base(band_field: str) -> str:
@@ -147,15 +148,13 @@ def _fixed_band_boundaries(
     row_count: int,
     band_fields: set[str],
     all_definitions: Mapping[str, FeatureDefinition],
-    configured_fields: Mapping[str, Mapping[str, object]],
     as_of: date,
 ) -> dict[str, tuple[float, float, float] | None]:
     result: dict[str, tuple[float, float, float] | None] = {}
     for band_field in sorted(band_fields, key=lambda value: value.encode("utf-8")):
         base = _band_base(band_field)
         base_definition = all_definitions.get(base)
-        field = configured_fields.get(base)
-        if base_definition is None or field is None or field["dataType"] != "NUMBER":
+        if base_definition is None or base_definition.data_type != "NUMBER":
             raise ValueError(f"dimension band has no configured numeric base: {band_field}")
         values: list[float] = []
         if base in columns and base_definition.event_date_column in columns:
@@ -238,10 +237,10 @@ def _equipment_id(
     index: int,
     definition: FeatureDefinition,
 ) -> str | None:
-    if definition.equipment_id_column is None:
-        return "RM4_PROCESS"
+    if definition.equipment_id_value is not None:
+        return definition.equipment_id_value
     column = definition.equipment_id_column
-    if column not in columns:
+    if column is None or column not in columns:
         return None
     value = _scalar(columns[column][index])
     if value is _MISSING:
@@ -390,8 +389,7 @@ def build_operating_ranges(
 ) -> list[dict[str, object]]:
     """Build deterministic numeric ranges from reference rows available by ``as_of``."""
     minimum_support, extreme_support, quantiles = _validated_policy(config)
-    requested = _validated_definition_subset(definitions, config)
-    configured_fields = _field_map(config)
+    requested = _validated_definition_surface(definitions, config)
     all_definitions = {
         item.name: item for item in configured_definitions(config)
     }
@@ -399,7 +397,7 @@ def build_operating_ranges(
         definition
         for definition in requested
         if definition.field_role in _RANGE_ROLES
-        and configured_fields[definition.name]["dataType"] == "NUMBER"
+        and definition.data_type == "NUMBER"
     )
     if not numeric or split.reference_rows.empty:
         return []
@@ -422,7 +420,6 @@ def build_operating_ranges(
         reference_row_count,
         band_fields,
         all_definitions,
-        configured_fields,
         split.as_of,
     )
     records: list[dict[str, object]] = []
