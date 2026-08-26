@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from numbers import Integral, Real
@@ -14,6 +16,7 @@ from equipment_quality.deterministic import canonical_json_bytes, sha256_uri, ty
 from equipment_quality.feature_roles import STAGE_RANK, FeatureDefinition, definitions as configured_definitions
 from equipment_quality.models import AnalysisConfig, TimeSplitResult
 from equipment_quality.statistics import (
+    BootstrapCi,
     Stratum,
     benjamini_hochberg,
     charge_bootstrap_rr_ci,
@@ -32,6 +35,8 @@ _CANDIDATE_ROLES = {
 }
 _EQUIPMENT_IDENTIFIER_ROLE = "EQUIPMENT_IDENTIFIER"
 _MISSING = object()
+_PARALLEL_BOOTSTRAP_MINIMUM = 16
+_MAX_BOOTSTRAP_WORKERS = 10
 
 
 def _is_missing(value: object) -> bool:
@@ -234,6 +239,18 @@ class QualityMetric:
         }
 
 
+def _validate_sha256_uri(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{label} must be a built-in string")
+    if (
+        len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError(f"{label} must use the lowercase sha256 URI form")
+    return value
+
+
 @dataclass(frozen=True)
 class QualityRule:
     candidate: Candidate
@@ -241,6 +258,55 @@ class QualityRule:
     confirmation: QualityMetric
     grade: str
     display_merge_rule_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, Candidate):
+            raise TypeError("candidate must be a Candidate")
+        if not isinstance(self.discovery, QualityMetric):
+            raise TypeError("discovery must be a QualityMetric")
+        if not isinstance(self.confirmation, QualityMetric):
+            raise TypeError("confirmation must be a QualityMetric")
+        if type(self.grade) is not str:
+            raise TypeError("grade must be a built-in string")
+        if self.grade not in {
+            "NORMAL",
+            "UNCONFIRMED",
+            "INSUFFICIENT_EVIDENCE",
+            "CAUTION",
+            "DANGER",
+        }:
+            raise ValueError(f"unknown quality rule grade: {self.grade}")
+        if any(
+            value is not None
+            for value in (
+                self.confirmation.relative_risk_ci_lower,
+                self.confirmation.relative_risk_ci_upper,
+                self.confirmation.p_value,
+                self.confirmation.q_value,
+            )
+        ):
+            raise ValueError("confirmation RR CI, pValue, and qValue must be null")
+        if self.grade == "DANGER" and (
+            self.candidate.adjustment_kind != "STRATIFIED"
+            or self.discovery.relative_risk_ci_lower is None
+            or self.discovery.relative_risk_ci_lower <= 1.0
+        ):
+            raise ValueError("DANGER requires STRATIFIED discovery with RR CI lower > 1")
+        try:
+            display_ids = tuple(self.display_merge_rule_ids)
+        except TypeError as error:
+            raise TypeError("display_merge_rule_ids must be an iterable of SHA IDs") from error
+        checked = tuple(
+            _validate_sha256_uri(value, "display_merge_rule_ids item")
+            for value in display_ids
+        )
+        if len(checked) != len(set(checked)):
+            raise ValueError("display_merge_rule_ids must be unique")
+        object.__setattr__(
+            self,
+            "display_merge_rule_ids",
+            tuple(sorted(checked, key=lambda value: value.encode("utf-8"))),
+        )
 
     def to_wire(self) -> dict[str, object]:
         candidate = self.candidate
@@ -893,11 +959,7 @@ def _metric(
 
 
 def _validate_criteria_id(value: object) -> str:
-    if type(value) is not str or len(value) != 71 or not value.startswith("sha256:") or any(
-        character not in "0123456789abcdef" for character in value[7:]
-    ):
-        raise ValueError("criteria_id must use the lowercase sha256 URI form")
-    return value
+    return _validate_sha256_uri(value, "criteria_id")
 
 
 def _metric_is_insufficient(metric: QualityMetric) -> bool:
@@ -935,6 +997,18 @@ def _discovery_danger_prebootstrap(metric: QualityMetric, config: AnalysisConfig
         and metric.relative_risk >= float(policy["relativeRisk"]["danger"])
         and metric.risk_difference >= float(policy["riskDifference"]["danger"])
         and metric.q_value <= float(policy["bhQ"]["danger"])
+    )
+
+
+def _bootstrap_applicable(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    return (
+        metric.support >= int(config.quality_risk["minimumDiscoverySupport"])
+        and metric.defects >= int(config.quality_risk["minimumCautionDefects"])
+        and metric.adjusted_rate is not None
+        and metric.comparator_adjusted_rate is not None
+        and metric.relative_risk is not None
+        and math.isfinite(metric.relative_risk)
+        and metric.relative_risk > 0.0
     )
 
 
@@ -997,6 +1071,122 @@ def _bootstrap_rows(
         records,
         columns=("charge_id", "stratum", "candidate", "judge"),
     )
+
+
+def _bootstrap_task(
+    task: tuple[int, pd.DataFrame, str, str, int],
+) -> tuple[int, BootstrapCi]:
+    index, rows, criteria_id, rule_id, replicates = task
+    return index, charge_bootstrap_rr_ci(
+        rows,
+        criteria_id,
+        rule_id,
+        replicates=replicates,
+    )
+
+
+def _write_all(file_descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(file_descriptor, payload[offset:])
+
+
+def _parallel_bootstrap_tasks(
+    tasks: list[tuple[int, pd.DataFrame, str, str, int]],
+    worker_count: int,
+) -> tuple[tuple[int, BootstrapCi], ...]:
+    partitions = [tasks[index::worker_count] for index in range(worker_count)]
+    children: list[tuple[int, int]] = []
+    for partition in partitions:
+        read_descriptor, write_descriptor = os.pipe()
+        process_id = os.fork()
+        if process_id == 0:
+            os.close(read_descriptor)
+            for _, inherited_read_descriptor in children:
+                os.close(inherited_read_descriptor)
+            try:
+                payload = pickle.dumps(
+                    ("OK", tuple(_bootstrap_task(task) for task in partition)),
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            except BaseException as error:
+                payload = pickle.dumps(
+                    ("ERROR", type(error).__name__, str(error)),
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            try:
+                _write_all(write_descriptor, payload)
+            finally:
+                os.close(write_descriptor)
+            os._exit(0)
+        os.close(write_descriptor)
+        children.append((process_id, read_descriptor))
+
+    results: list[tuple[int, BootstrapCi]] = []
+    errors: list[str] = []
+    for process_id, read_descriptor in children:
+        chunks: list[bytes] = []
+        while chunk := os.read(read_descriptor, 65536):
+            chunks.append(chunk)
+        os.close(read_descriptor)
+        _, status = os.waitpid(process_id, 0)
+        if status != 0 or not chunks:
+            errors.append(f"bootstrap worker {process_id} exited with status {status}")
+            continue
+        response = pickle.loads(b"".join(chunks))
+        if response[0] == "ERROR":
+            errors.append(f"bootstrap worker {response[1]}: {response[2]}")
+        else:
+            results.extend(response[1])
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return tuple(sorted(results, key=lambda item: item[0]))
+
+
+def _bootstrap_discovery_metrics(
+    rows: _Rows,
+    candidates: tuple[Candidate, ...],
+    discovery: list[QualityMetric],
+    strata_cache: _StrataCache,
+    criteria_id: str,
+    config: AnalysisConfig,
+) -> list[QualityMetric]:
+    replicates = int(config.bootstrap["replicates"])
+    tasks = [
+        (
+            index,
+            _bootstrap_rows(rows, candidate, strata_cache),
+            criteria_id,
+            candidate.rule_id,
+            replicates,
+        )
+        for index, candidate in enumerate(candidates)
+        if _bootstrap_applicable(discovery[index], config)
+    ]
+    worker_count = min(
+        len(tasks),
+        _MAX_BOOTSTRAP_WORKERS,
+        os.cpu_count() or 1,
+    )
+    if len(tasks) >= _PARALLEL_BOOTSTRAP_MINIMUM and worker_count > 1:
+        intervals = _parallel_bootstrap_tasks(tasks, worker_count)
+    else:
+        intervals = tuple(_bootstrap_task(task) for task in tasks)
+
+    result = list(discovery)
+    for index, interval in intervals:
+        metric = result[index]
+        result[index] = replace(
+            metric,
+            relative_risk_ci_lower=interval.lower,
+            relative_risk_ci_upper=interval.upper,
+            reason_code=(
+                interval.reason_code
+                if metric.reason_code == "NONE"
+                else metric.reason_code
+            ),
+        )
+    return result
 
 
 def _grade(
@@ -1129,30 +1319,14 @@ def build_quality_rules(
         )
         for index, q_value in zip(indexes, adjusted, strict=True):
             discovery[index] = replace(discovery[index], q_value=q_value)
-    for index, candidate in enumerate(candidates):
-        metric = discovery[index]
-        if (
-            candidate.adjustment_kind == "STRATIFIED"
-            and _discovery_danger_prebootstrap(metric, config)
-        ):
-            interval = charge_bootstrap_rr_ci(
-                _bootstrap_rows(discovery_rows, candidate, discovery_cache),
-                criteria_id,
-                candidate.rule_id,
-                replicates=int(config.bootstrap["replicates"]),
-            )
-            discovery[index] = replace(
-                metric,
-                relative_risk_ci_lower=interval.lower,
-                relative_risk_ci_upper=interval.upper,
-                reason_code=(
-                    interval.reason_code
-                    if interval.reason_code != "NONE"
-                    else metric.reason_code
-                ),
-            )
-        elif metric.reason_code == "NONE":
-            discovery[index] = replace(metric, reason_code="NOT_APPLICABLE")
+    discovery = _bootstrap_discovery_metrics(
+        discovery_rows,
+        candidates,
+        discovery,
+        discovery_cache,
+        criteria_id,
+        config,
+    )
 
     rules: list[QualityRule] = []
     for index, candidate in enumerate(candidates):

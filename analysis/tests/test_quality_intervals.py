@@ -18,11 +18,13 @@ from equipment_quality.deterministic import canonical_json_bytes
 from equipment_quality.feature_roles import definitions
 from equipment_quality import quality_intervals
 from equipment_quality.quality_intervals import build_quality_rules, generate_candidates
+from equipment_quality.statistics import BootstrapCi
 from factories.quality import (
     analysis_config,
     adjacent_numeric_fixture,
     ap_candidate_fixture,
     caution_only_fixture,
+    caution_unconfirmed_fixture,
     equipment_category_fixture,
     future_context_quality_fixture,
     grade_boundary_fixture,
@@ -37,6 +39,7 @@ from factories.quality import (
     strong_repeated_fixture,
     tied_numeric_fixture,
     too_few_bootstraps_fixture,
+    zero_variance_fixture,
 )
 
 
@@ -395,6 +398,124 @@ def test_no_qualified_interval_returns_zero_danger_rules():
 
 
 @pytest.mark.parametrize(
+    ("split_factory", "expected_grade"),
+    [
+        (caution_only_fixture, "CAUTION"),
+        (null_fixture, "NORMAL"),
+        (caution_unconfirmed_fixture, "UNCONFIRMED"),
+    ],
+)
+def test_supported_discovery_metrics_keep_charge_bootstrap_ci_independent_of_grade(
+    split_factory, expected_grade
+):
+    config = analysis_config()
+    rule = _risk_rule(
+        build_quality_rules(split_factory(), definitions(config), config, CRITERIA_ID)
+    )
+
+    assert rule["grade"] == expected_grade
+    assert rule["discovery"]["relativeRiskCiLower"] is not None
+    assert rule["discovery"]["relativeRiskCiUpper"] is not None
+    assert rule["discovery"]["reasonCode"] == "NONE"
+    assert rule["confirmation"]["relativeRiskCiLower"] is None
+    assert rule["confirmation"]["relativeRiskCiUpper"] is None
+    assert rule["confirmation"]["pValue"] is None
+    assert rule["confirmation"]["qValue"] is None
+    if expected_grade == "CAUTION":
+        assert rule["discovery"]["relativeRiskCiLower"] == pytest.approx(
+            1.1925243227955165
+        )
+        assert rule["discovery"]["relativeRiskCiUpper"] == pytest.approx(
+            2.2188319134993444
+        )
+
+
+def test_bootstrap_selection_uses_metric_applicability_once_per_rule_not_grade(
+    monkeypatch,
+):
+    config = analysis_config()
+    cases = (
+        (caution_only_fixture(), "slab_grind", "RISK", "CAUTION", "STRATIFIED"),
+        (null_fixture(), "slab_grind", "RISK", "NORMAL", "STRATIFIED"),
+        (
+            caution_unconfirmed_fixture(),
+            "slab_grind",
+            "RISK",
+            "UNCONFIRMED",
+            "STRATIFIED",
+        ),
+        (
+            adjacent_numeric_fixture(),
+            "f_pre_temp",
+            0.0,
+            "CAUTION",
+            "UNADJUSTED_FALLBACK",
+        ),
+    )
+
+    for split, field, predicate_value, grade, adjustment_kind in cases:
+        calls: list[str] = []
+
+        def successful_bootstrap(_rows, _criteria_id, rule_id, *, replicates):
+            assert replicates == 2000
+            calls.append(rule_id)
+            return BootstrapCi(0.5, 2.5, 2000, "NONE")
+
+        monkeypatch.setattr(
+            quality_intervals, "charge_bootstrap_rr_ci", successful_bootstrap
+        )
+        rules = build_quality_rules(split, definitions(config), config, CRITERIA_ID)
+        if field == "slab_grind":
+            target = _risk_rule(rules)
+        else:
+            target = next(
+                rule
+                for rule in rules
+                if rule["fieldNames"] == [field]
+                and rule["predicate"]["allOf"][0]["upper"] == predicate_value
+            )
+
+        assert target["grade"] == grade
+        assert target["adjustmentKind"] == adjustment_kind
+        assert target["discovery"]["relativeRiskCiLower"] == 0.5
+        assert Counter(calls)[target["ruleId"]] == 1
+        populated_ids = {
+            rule["ruleId"]
+            for rule in rules
+            if rule["discovery"]["relativeRiskCiLower"] is not None
+        }
+        assert set(calls) == populated_ids
+        assert all(count == 1 for count in Counter(calls).values())
+        for rule in rules:
+            if rule["ruleId"] not in populated_ids:
+                assert rule["discovery"]["reasonCode"] in {
+                    "LOW_SUPPORT",
+                    "LOW_DEFECT_COUNT",
+                    "NO_INFORMATIVE_STRATA",
+                    "ZERO_COMPARATOR_RISK",
+                    "NON_FINITE_ESTIMATE",
+                }
+
+
+def test_successful_bootstrap_preserves_a_genuine_metric_reason():
+    config = analysis_config()
+    rule = _risk_rule(
+        build_quality_rules(
+            zero_variance_fixture(), definitions(config), config, CRITERIA_ID
+        )
+    )
+
+    assert rule["grade"] == "NORMAL"
+    assert rule["discovery"]["relativeRiskCiLower"] is not None
+    assert rule["discovery"]["relativeRiskCiUpper"] is not None
+    assert (
+        rule["discovery"]["relativeRiskCiLower"]
+        <= rule["discovery"]["relativeRiskCiUpper"]
+    )
+    assert rule["discovery"]["reasonCode"] == "ZERO_VARIANCE"
+
+
+@pytest.mark.parametrize(
     ("fixture_name", "expected_grade"),
     [
         ("below_support", "INSUFFICIENT_EVIDENCE"),
@@ -487,6 +608,87 @@ def test_discovery_and_confirmation_threshold_inclusion_is_exact_on_each_side():
     assert not quality_intervals._confirmation_danger_pass(
         replace(confirmation, relative_risk=math.nextafter(1.5, -math.inf)), config
     )
+
+
+def _direct_quality_rule(display_merge_rule_ids=(), *, grade="NORMAL", confirmation=None):
+    config = analysis_config()
+    split = null_fixture()
+    candidate = next(
+        item
+        for item in generate_candidates(
+            split.discovery_rows, definitions(config), config
+        )
+        if item.field_names == ("slab_grind",)
+        and item.predicate[0].values == ("RISK",)
+    )
+    discovery = _literal_metric(
+        relative_risk=1.0, risk_difference=0.0, q_value=1.0
+    )
+    confirmation_metric = confirmation or replace(
+        discovery,
+        p_value=None,
+        q_value=None,
+    )
+    return quality_intervals.QualityRule(
+        candidate,
+        discovery,
+        confirmation_metric,
+        grade,
+        display_merge_rule_ids,
+    )
+
+
+def test_quality_rule_snapshots_sorts_and_detaches_display_merge_id_alias():
+    first = "sha256:" + "a" * 64
+    second = "sha256:" + "b" * 64
+    external = [second, first]
+
+    rule = _direct_quality_rule(external)
+    before = canonical_json_bytes(rule.to_wire())
+    external.append("sha256:" + "c" * 64)
+
+    assert rule.display_merge_rule_ids == (first, second)
+    assert canonical_json_bytes(rule.to_wire()) == before
+    replaced = replace(
+        rule,
+        display_merge_rule_ids=["sha256:" + "d" * 64, first],
+    )
+    assert replaced.display_merge_rule_ids == (first, "sha256:" + "d" * 64)
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    [
+        None,
+        "sha256:" + "a" * 63,
+        "sha256:" + "A" * 64,
+        "sha256:" + "g" * 64,
+        "a" * 64,
+    ],
+)
+def test_quality_rule_rejects_noncanonical_display_merge_ids(invalid_id):
+    with pytest.raises((TypeError, ValueError), match="display_merge_rule_ids"):
+        _direct_quality_rule([invalid_id])
+
+
+def test_quality_rule_rejects_duplicate_display_merge_ids():
+    duplicate = "sha256:" + "a" * 64
+    with pytest.raises(ValueError, match="unique"):
+        _direct_quality_rule([duplicate, duplicate])
+
+
+def test_quality_rule_validates_grade_and_confirmation_only_fields():
+    with pytest.raises(ValueError, match="grade"):
+        _direct_quality_rule(grade="SEVERE")
+    invalid_confirmation = replace(
+        _literal_metric(),
+        relative_risk_ci_lower=0.8,
+        relative_risk_ci_upper=2.2,
+        p_value=0.01,
+        q_value=0.05,
+    )
+    with pytest.raises(ValueError, match="confirmation"):
+        _direct_quality_rule(confirmation=invalid_confirmation)
 
 
 def test_future_stage_context_and_same_event_continuous_proxy_are_dropped():
@@ -740,3 +942,24 @@ def test_actual_scale_candidate_surface_completes_within_bounded_cost():
 
     assert len(candidates) >= 250
     assert elapsed < 8.0
+
+
+def test_many_applicable_bootstraps_complete_with_bounded_parallel_cost(monkeypatch):
+    config = analysis_config()
+    rows = performance_fixture()
+    rows["judge"] = ["불량" if index % 3 == 0 else "양품" for index in range(len(rows))]
+
+    def slow_bootstrap(_rows, _criteria_id, _rule_id, *, replicates):
+        assert replicates == 2000
+        time.sleep(0.02)
+        return BootstrapCi(0.8, 1.2, 2000, "NONE")
+
+    monkeypatch.setattr(quality_intervals, "charge_bootstrap_rr_ci", slow_bootstrap)
+    started = time.perf_counter()
+    rules = build_quality_rules(
+        split_from_rows(rows), definitions(config), config, CRITERIA_ID
+    )
+    elapsed = time.perf_counter() - started
+
+    assert len(rules) >= 250
+    assert elapsed < 18.0

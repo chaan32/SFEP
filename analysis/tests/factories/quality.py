@@ -200,12 +200,32 @@ def caution_only_fixture() -> TimeSplitResult:
     return _split(discovery, confirmation)
 
 
+def caution_unconfirmed_fixture() -> TimeSplitResult:
+    discovery = _group_rows(
+        per_cell=500, risk_defects=50, comparator_defects=31, prefix="CUD"
+    )
+    confirmation = _group_rows(
+        per_cell=250, risk_defects=16, comparator_defects=25, prefix="CUC"
+    )
+    return _split(discovery, confirmation)
+
+
 def null_fixture() -> TimeSplitResult:
     discovery = _group_rows(
         per_cell=100, risk_defects=5, comparator_defects=5, prefix="ND"
     )
     confirmation = _group_rows(
         per_cell=50, risk_defects=5, comparator_defects=5, prefix="NC"
+    )
+    return _split(discovery, confirmation)
+
+
+def zero_variance_fixture() -> TimeSplitResult:
+    discovery = _group_rows(
+        per_cell=100, risk_defects=100, comparator_defects=100, prefix="ZVD"
+    )
+    confirmation = _group_rows(
+        per_cell=50, risk_defects=50, comparator_defects=50, prefix="ZVC"
     )
     return _split(discovery, confirmation)
 
