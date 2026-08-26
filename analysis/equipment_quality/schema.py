@@ -9,6 +9,7 @@ import importlib.resources
 import json
 import math
 import re
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 from threading import RLock
@@ -205,10 +206,12 @@ def _decode_local_json_pointer(reference: object) -> tuple[str, ...]:
     )
 
 
-def _resolve_local_json_pointer(schema: dict[str, object], reference: object) -> object:
+def _resolve_local_json_pointer(
+    schema: Mapping[str, object], reference: object
+) -> object:
     target: object = schema
     for token in _decode_local_json_pointer(reference):
-        if type(target) is dict:
+        if isinstance(target, Mapping):
             if token not in target:
                 raise _InvalidLocalSchemaReference("object member does not exist")
             target = target[token]
@@ -224,16 +227,46 @@ def _resolve_local_json_pointer(schema: dict[str, object], reference: object) ->
     return target
 
 
-def _assert_local_schema_references(schema: dict[str, object]) -> None:
-    pending: list[object] = [schema]
+def _assert_local_schema_references(schema: Mapping[str, object]) -> None:
+    pending: list[tuple[object, bool]] = [(schema, True)]
+    visited: set[int] = set()
     while pending:
-        value = pending.pop()
-        if type(value) is dict:
+        value, is_document_root = pending.pop()
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if "$id" in value and (
+                not is_document_root or type(value["$id"]) is not str
+            ):
+                raise _InvalidLocalSchemaReference(
+                    "$id is allowed only as a built-in string at document root"
+                )
+            if "$dynamicRef" in value or "$recursiveRef" in value:
+                raise _InvalidLocalSchemaReference(
+                    "dynamic and recursive references are not allowed"
+                )
             if "$ref" in value:
-                _resolve_local_json_pointer(schema, value["$ref"])
-            pending.extend(value.values())
+                reference = value["$ref"]
+                if type(reference) is not str:
+                    raise _InvalidLocalSchemaReference(
+                        "$ref must be a built-in string"
+                    )
+                target = _resolve_local_json_pointer(schema, reference)
+                if type(target) is not bool and not isinstance(target, Mapping):
+                    raise _InvalidLocalSchemaReference(
+                        "$ref target is not a schema"
+                    )
+                if isinstance(target, Mapping):
+                    pending.append((target, target is schema))
+            pending.extend((item, False) for item in value.values())
         elif type(value) is list:
-            pending.extend(value)
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            pending.extend((item, False) for item in value)
 
 
 def _read_authenticated_normative_schema(name: str) -> bytes:

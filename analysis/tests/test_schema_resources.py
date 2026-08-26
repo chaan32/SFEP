@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import zipfile
 
 import pytest
@@ -451,6 +452,241 @@ def test_local_reference_preflight_resolves_escaped_members_and_list_indexes():
             "$ref": "#/$defs/a~1b/items/0/properties/~0name",
         }
     )
+
+
+def test_external_dynamic_reference_is_rejected_without_network_access(monkeypatch):
+    module = importlib.reload(schema_module)
+    network_calls = 0
+
+    def forbidden_urlopen(*args, **kwargs):
+        nonlocal network_calls
+        network_calls += 1
+        raise AssertionError("network access attempted")
+
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$dynamicRef": "https://example.invalid/schema.json",
+        },
+        separators=(",", ":"),
+    ).encode()
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden_urlopen)
+    monkeypatch.setattr(module, "_normative_schema_bytes", lambda name: payload)
+    try:
+        with pytest.raises(RuntimeError) as error:
+            module.validate_normative_instance(
+                "replay_event_row.schema.json", {}
+            )
+        assert str(error.value) == (
+            "normative schema has invalid local reference: replay_event_row.schema.json"
+        )
+        assert network_calls == 0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(module)
+
+
+@pytest.mark.parametrize("reference_keyword", ["$dynamicRef", "$recursiveRef"])
+def test_network_capable_reference_vocabularies_are_rejected_recursively(
+    reference_keyword,
+):
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "unused": {
+                    "properties": {
+                        "nested": {
+                            reference_keyword: "#/$defs/unused",
+                        }
+                    }
+                }
+            },
+            "type": "object",
+        },
+        separators=(",", ":"),
+    ).encode()
+    with pytest.raises(RuntimeError) as error:
+        schema_module._compile_normative_validator(
+            "replay_event_row.schema.json", payload
+        )
+    assert str(error.value) == (
+        "normative schema has invalid local reference: replay_event_row.schema.json"
+    )
+
+
+@pytest.mark.parametrize("reference", [17, True, None])
+def test_local_ref_requires_an_exact_builtin_string(reference):
+    with pytest.raises(schema_module._InvalidLocalSchemaReference):
+        schema_module._assert_local_schema_references(
+            {"$defs": {"value": {}}, "$ref": reference}
+        )
+
+
+def test_local_ref_rejects_string_subclasses():
+    class Reference(str):
+        pass
+
+    with pytest.raises(schema_module._InvalidLocalSchemaReference):
+        schema_module._assert_local_schema_references(
+            {"$defs": {"value": {}}, "$ref": Reference("#/$defs/value")}
+        )
+
+
+@pytest.mark.parametrize("reference", ["#/$defs/value", 17, None])
+def test_dynamic_ref_is_rejected_regardless_of_value_type(reference):
+    with pytest.raises(schema_module._InvalidLocalSchemaReference):
+        schema_module._assert_local_schema_references(
+            {"$defs": {"value": {}}, "$dynamicRef": reference}
+        )
+
+
+def test_dynamic_ref_rejects_string_subclasses():
+    class Reference(str):
+        pass
+
+    with pytest.raises(schema_module._InvalidLocalSchemaReference):
+        schema_module._assert_local_schema_references(
+            {"$dynamicRef": Reference("#")}
+        )
+
+
+@pytest.mark.parametrize("reference", ["child.json", "#/$defs/value"])
+def test_nested_id_is_rejected_with_relative_or_local_reference(reference):
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://sfep.local/root.schema.json",
+            "$defs": {"value": {"type": "string"}},
+            "properties": {
+                "nested": {
+                    "$id": "nested/",
+                    "$ref": reference,
+                }
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+    with pytest.raises(RuntimeError) as error:
+        schema_module._compile_normative_validator(
+            "replay_event_row.schema.json", payload
+        )
+    assert str(error.value) == (
+        "normative schema has invalid local reference: replay_event_row.schema.json"
+    )
+
+
+def test_root_id_allows_only_an_exact_builtin_string():
+    schema_module._assert_local_schema_references(
+        {"$id": "https://sfep.local/root.schema.json", "$ref": "#"}
+    )
+
+    class Identifier(str):
+        pass
+
+    for invalid in (Identifier("https://sfep.local/root.schema.json"), 17):
+        with pytest.raises(schema_module._InvalidLocalSchemaReference):
+            schema_module._assert_local_schema_references({"$id": invalid})
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        pytest.param("#/title", id="string"),
+        pytest.param("#/examples", id="list"),
+        pytest.param("#/examples/0", id="number"),
+    ],
+)
+def test_ref_target_must_be_a_boolean_or_mapping_schema(reference):
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "not a schema",
+            "examples": [17],
+            "$ref": reference,
+        },
+        separators=(",", ":"),
+    ).encode()
+    with pytest.raises(RuntimeError) as error:
+        schema_module._compile_normative_validator(
+            "replay_event_row.schema.json", payload
+        )
+    assert str(error.value) == (
+        "normative schema has invalid local reference: replay_event_row.schema.json"
+    )
+
+
+def test_true_and_false_boolean_ref_targets_are_valid_schemas():
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"allow": True, "deny": False},
+            "allOf": [
+                {"$ref": "#/$defs/allow"},
+                {"$ref": "#/$defs/deny"},
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    validator = schema_module._compile_normative_validator(
+        "replay_event_row.schema.json", payload
+    )
+    with pytest.raises(ValidationError):
+        validator.validate({})
+
+
+def test_reference_cycles_and_duplicate_targets_finish_preflight():
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "left": {"$ref": "#/$defs/right"},
+                "right": {"$ref": "#/$defs/left"},
+            },
+            "anyOf": [
+                {"$ref": "#/$defs/left"},
+                {"$ref": "#/$defs/left"},
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    schema_module._compile_normative_validator(
+        "replay_event_row.schema.json", payload
+    )
+
+
+def test_reference_preflight_failure_does_not_poison_validator_cache(monkeypatch):
+    module = importlib.reload(schema_module)
+    invalid = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"value": {"type": "string"}},
+            "properties": {
+                "nested": {
+                    "$id": "nested/",
+                    "$ref": "#/$defs/value",
+                }
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+    valid = (CONTRACT_ROOT / "replay_event_row.schema.json").read_bytes()
+    payloads = iter((invalid, valid))
+    monkeypatch.setattr(module, "_normative_schema_bytes", lambda name: next(payloads))
+    try:
+        with pytest.raises(RuntimeError) as error:
+            module.validate_normative_instance(
+                "replay_event_row.schema.json", _valid_replay_row()
+            )
+        assert str(error.value) == (
+            "normative schema has invalid local reference: replay_event_row.schema.json"
+        )
+        module.validate_normative_instance(
+            "replay_event_row.schema.json", _valid_replay_row()
+        )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(module)
 
 
 @pytest.mark.parametrize(
