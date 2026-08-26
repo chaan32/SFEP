@@ -7,8 +7,13 @@ from dataclasses import replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import pickle
+import signal
+import threading
 import time
+import warnings
 
 import pandas as pd
 import pytest
@@ -515,6 +520,487 @@ def test_successful_bootstrap_preserves_a_genuine_metric_reason():
     assert rule["discovery"]["reasonCode"] == "ZERO_VARIANCE"
 
 
+def _bootstrap_ci() -> BootstrapCi:
+    return BootstrapCi(0.75, 1.25, 2000, "NONE")
+
+
+def _bootstrap_rule_id(digit: str) -> str:
+    return "sha256:" + digit * 64
+
+
+def _bootstrap_response(index: int, rule_id: str, interval=None):
+    return quality_intervals._BootstrapResponse(
+        index,
+        rule_id,
+        _bootstrap_ci() if interval is None else interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("responses", "message"),
+    [
+        (
+            lambda first, second: (first, first),
+            "duplicate",
+        ),
+        (
+            lambda first, second: (first,),
+            "cardinality",
+        ),
+        (
+            lambda first, second: (
+                first,
+                _bootstrap_response(2, second.rule_id),
+            ),
+            "range",
+        ),
+        (
+            lambda first, second: (
+                first,
+                _bootstrap_response(2, second.rule_id),
+            ),
+            "unexpected",
+        ),
+        (
+            lambda first, second: (
+                first,
+                _bootstrap_response(1, _bootstrap_rule_id("3")),
+            ),
+            "ruleId",
+        ),
+        (
+            lambda first, second: (
+                first,
+                _bootstrap_response(1, second.rule_id, object()),
+            ),
+            "BootstrapCi",
+        ),
+    ],
+)
+def test_bootstrap_responses_must_be_an_exact_bijection_before_application(
+    responses, message
+):
+    expected = ((0, _bootstrap_rule_id("1")), (1, _bootstrap_rule_id("2")))
+    first = _bootstrap_response(*expected[0])
+    second = _bootstrap_response(*expected[1])
+    result_size = 3 if message == "unexpected" else 2
+
+    with pytest.raises(RuntimeError, match=message):
+        quality_intervals._validate_bootstrap_responses(
+            expected,
+            responses(first, second),
+            result_size=result_size,
+        )
+
+
+def test_bootstrap_response_rejects_exact_type_with_mutated_shape():
+    interval = _bootstrap_ci()
+    object.__setattr__(interval, "unexpected", "field")
+    expected = ((0, _bootstrap_rule_id("1")),)
+
+    with pytest.raises(RuntimeError, match="shape"):
+        quality_intervals._validate_bootstrap_responses(
+            expected,
+            (_bootstrap_response(*expected[0], interval),),
+            result_size=1,
+        )
+
+
+def test_bootstrap_response_revalidates_finite_interval_semantics():
+    interval = _bootstrap_ci()
+    object.__setattr__(interval, "lower", math.nan)
+    expected = ((0, _bootstrap_rule_id("1")),)
+
+    with pytest.raises(RuntimeError, match="semantics"):
+        quality_intervals._validate_bootstrap_responses(
+            expected,
+            (_bootstrap_response(*expected[0], interval),),
+            result_size=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not-a-pickle",
+        pickle.dumps(("wrong-protocol", ())),
+        pickle.dumps(("sfep-quality-bootstrap/v1", ()))[:-1],
+        pickle.dumps(("sfep-quality-bootstrap/v1", ((0, "short"),))),
+    ],
+)
+def test_worker_response_rejects_malformed_short_or_wrong_protocol(payload):
+    with pytest.raises(RuntimeError, match="bootstrap worker protocol"):
+        quality_intervals._decode_bootstrap_worker_response(payload)
+
+
+class _FakeWorkerProcess:
+    def __init__(
+        self,
+        *,
+        output=b"",
+        error=b"",
+        returncode=0,
+        resist_terminate=False,
+    ):
+        self.pid = 4242
+        self._output = output
+        self._error = error
+        self._configured_returncode = returncode
+        self._resist_terminate = resist_terminate
+        self._complete_on_poll = not resist_terminate
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self):
+        if self.returncode is None and self._complete_on_poll:
+            self.returncode = self._configured_returncode
+            self.waited = True
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if not self._resist_terminate:
+            self.returncode = -signal.SIGTERM
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -signal.SIGKILL
+
+    def wait(self, timeout=None):
+        self.waited = True
+        if self.returncode is None:
+            raise TimeoutError("bootstrap-worker did not exit")
+        return self.returncode
+
+    def reap(self):
+        return self.wait()
+
+
+def _fake_worker_start(process):
+    def start(_input_path, output_path, error_path):
+        process.output_path = output_path
+        process.error_path = error_path
+        output_path.write_bytes(process._output)
+        error_path.write_bytes(process._error)
+        return process
+
+    return start
+
+
+def _tiny_bootstrap_task(index=0, digit="1"):
+    rows = pd.DataFrame(
+        [
+            ("C1", "S", True, "불량"),
+            ("C2", "S", True, "양품"),
+            ("C3", "S", False, "불량"),
+            ("C4", "S", False, "양품"),
+        ],
+        columns=("charge_id", "stratum", "candidate", "judge"),
+    )
+    return index, rows, CRITERIA_ID, _bootstrap_rule_id(digit), 2000
+
+
+def _weighted_bootstrap_task(index: int, digit: str, unique_charges: int):
+    rows = pd.DataFrame(
+        [
+            (f"C{number}", "S", number % 2 == 0, "불량" if number % 3 == 0 else "양품")
+            for number in range(unique_charges)
+        ],
+        columns=("charge_id", "stratum", "candidate", "judge"),
+    )
+    return index, rows, CRITERIA_ID, _bootstrap_rule_id(digit), 2000
+
+
+def test_worker_partitions_use_deterministic_lpt_statistical_cost_balancing():
+    tasks = tuple(
+        _weighted_bootstrap_task(index, digit, unique_charges)
+        for index, (digit, unique_charges) in enumerate(
+            zip("123456", (5, 4, 3, 2, 1, 1), strict=True)
+        )
+    )
+
+    partitions = quality_intervals._partition_bootstrap_tasks(tasks, 2)
+
+    assert tuple(tuple(task[0] for task in partition) for partition in partitions) == (
+        (0, 3, 4),
+        (1, 2, 5),
+    )
+
+
+def test_parent_keyboard_interrupt_closes_terminates_and_reaps_worker(monkeypatch):
+    process = _FakeWorkerProcess(
+        resist_terminate=True,
+    )
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", _fake_worker_start(process)
+    )
+    monkeypatch.setattr(
+        quality_intervals,
+        "_wait_for_bootstrap_workers",
+        lambda _workers, _deadline: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS", 0.0
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+    assert process.terminated and process.killed and process.waited
+
+
+def test_start_failure_after_partial_workers_cleans_every_started_process(monkeypatch):
+    first = _FakeWorkerProcess(resist_terminate=True)
+    starts = iter((first, OSError("spawn failed")))
+
+    def start(_input_path, output_path, error_path):
+        result = next(starts)
+        if isinstance(result, BaseException):
+            raise result
+        return _fake_worker_start(result)(_input_path, output_path, error_path)
+
+    monkeypatch.setattr(quality_intervals, "_start_bootstrap_worker", start)
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS", 0.0
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        quality_intervals._parallel_bootstrap_tasks(
+            [_tiny_bootstrap_task(0, "1"), _tiny_bootstrap_task(1, "2")],
+            2,
+        )
+
+    assert first.terminated and first.killed and first.waited
+
+
+@pytest.mark.parametrize("returncode", [7, -signal.SIGKILL])
+def test_child_nonzero_or_signal_fails_closed_and_reaps(monkeypatch, returncode):
+    process = _FakeWorkerProcess(returncode=returncode, error=b"worker failed")
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", _fake_worker_start(process)
+    )
+
+    with pytest.raises(RuntimeError, match="bootstrap worker"):
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+    assert process.waited
+
+
+def test_partial_worker_payload_fails_closed_and_reaps(monkeypatch):
+    payload = pickle.dumps(("sfep-quality-bootstrap/v1", ()))[:-1]
+    process = _FakeWorkerProcess(output=payload)
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", _fake_worker_start(process)
+    )
+
+    with pytest.raises(RuntimeError, match="bootstrap worker protocol"):
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+    assert process.waited
+
+
+def test_worker_ordinal_mismatch_fails_closed_before_results_are_returned(monkeypatch):
+    payload = pickle.dumps(
+        (
+            "sfep-quality-bootstrap/v1",
+            1,
+            ((0, _bootstrap_rule_id("1"), _bootstrap_ci()),),
+        )
+    )
+    process = _FakeWorkerProcess(output=payload)
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", _fake_worker_start(process)
+    )
+
+    with pytest.raises(RuntimeError, match="worker ordinal"):
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+    assert process.waited
+
+
+def test_worker_serialization_and_write_failures_return_nonzero_not_outer_control(
+    monkeypatch, tmp_path
+):
+    input_path = tmp_path / "worker-input.pickle"
+    input_path.write_bytes(
+        pickle.dumps(
+            (
+                "sfep-quality-bootstrap/v1",
+                0,
+                (_tiny_bootstrap_task(),),
+            )
+        )
+    )
+    original_dumps = pickle.dumps
+
+    def serialization_failure(*_args, **_kwargs):
+        raise OSError("cannot serialize")
+
+    monkeypatch.setattr(quality_intervals.pickle, "dumps", serialization_failure)
+    assert quality_intervals._bootstrap_worker_main(input_path, output_fd=99) != 0
+
+    monkeypatch.setattr(quality_intervals.pickle, "dumps", original_dumps)
+    monkeypatch.setattr(
+        quality_intervals,
+        "_write_all",
+        lambda _fd, _payload: (_ for _ in ()).throw(BrokenPipeError()),
+    )
+    assert quality_intervals._bootstrap_worker_main(input_path, output_fd=99) != 0
+
+
+def test_worker_calls_task5_exactly_once_per_submitted_identity(monkeypatch, tmp_path):
+    tasks = tuple(
+        _tiny_bootstrap_task(index, digit)
+        for index, digit in enumerate("123")
+    )
+    input_path = tmp_path / "worker-input.pickle"
+    input_path.write_bytes(
+        pickle.dumps(("sfep-quality-bootstrap/v1", 7, tasks))
+    )
+    calls = []
+    outputs = []
+
+    def observed(rows, criteria_id, rule_id, *, replicates):
+        calls.append((rows.copy(deep=True), criteria_id, rule_id, replicates))
+        return _bootstrap_ci()
+
+    monkeypatch.setattr(quality_intervals, "charge_bootstrap_rr_ci", observed)
+    monkeypatch.setattr(
+        quality_intervals,
+        "_write_all",
+        lambda output_fd, payload: outputs.append((output_fd, payload)),
+    )
+
+    assert quality_intervals._bootstrap_worker_main(input_path, output_fd=99) == 0
+    ordinal, responses = quality_intervals._decode_bootstrap_worker_response(
+        outputs[0][1]
+    )
+
+    assert ordinal == 7
+    assert outputs[0][0] == 99
+    assert [(response.index, response.rule_id) for response in responses] == [
+        (task[0], task[3]) for task in tasks
+    ]
+    assert [(call[1], call[2], call[3]) for call in calls] == [
+        (CRITERIA_ID, task[3], 2000) for task in tasks
+    ]
+    assert len(calls) == len({call[2] for call in calls}) == 3
+
+
+def test_worker_rejects_malformed_input_without_entering_outer_caller(tmp_path):
+    input_path = tmp_path / "malformed-worker-input.pickle"
+    input_path.write_bytes(b"truncated-pickle")
+
+    assert quality_intervals._bootstrap_worker_main(input_path, output_fd=99) != 0
+
+
+def test_spawn_exec_bootstrap_is_warning_free_with_an_existing_background_thread():
+    ready = threading.Event()
+    release = threading.Event()
+
+    def background():
+        ready.set()
+        release.wait(timeout=30)
+
+    thread = threading.Thread(target=background)
+    thread.start()
+    assert ready.wait(timeout=5)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            responses = quality_intervals._parallel_bootstrap_tasks(
+                [_tiny_bootstrap_task(0, "1"), _tiny_bootstrap_task(1, "2")],
+                2,
+            )
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert [(item.index, item.rule_id) for item in responses] == [
+        (0, _bootstrap_rule_id("1")),
+        (1, _bootstrap_rule_id("2")),
+    ]
+
+
+def test_background_thread_workers_use_direct_posix_spawn_not_fork(
+    monkeypatch,
+):
+    original_spawn = os.posix_spawn
+    spawn_calls = []
+
+    def observed_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        return original_spawn(*args, **kwargs)
+
+    def forbidden_fork():
+        raise AssertionError("bootstrap workers must never call fork")
+
+    monkeypatch.setattr(os, "posix_spawn", observed_spawn)
+    monkeypatch.setattr(os, "fork", forbidden_fork)
+    responses = quality_intervals._parallel_bootstrap_tasks(
+        [_tiny_bootstrap_task()],
+        1,
+    )
+
+    assert len(responses) == 1
+    assert len(spawn_calls) == 1
+
+
+def test_direct_posix_spawn_maps_worker_standard_streams_with_file_actions(
+    monkeypatch, tmp_path
+):
+    observed = {}
+
+    def fake_posix_spawn(executable, arguments, environment, **kwargs):
+        observed.update(
+            executable=executable,
+            arguments=arguments,
+            environment=environment,
+            kwargs=kwargs,
+        )
+        return 4242
+
+    monkeypatch.setattr(os, "posix_spawn", fake_posix_spawn)
+    worker = quality_intervals._start_bootstrap_worker(
+        tmp_path / "input.pickle",
+        tmp_path / "response.pickle",
+        tmp_path / "stderr.txt",
+    )
+
+    assert worker.pid == 4242
+    assert observed["arguments"][1:4] == (
+        "-m",
+        "equipment_quality.quality_intervals",
+        "--bootstrap-worker",
+    )
+    actions = observed["kwargs"]["file_actions"]
+    assert [(action[0], action[1]) for action in actions] == [
+        (os.POSIX_SPAWN_OPEN, 0),
+        (os.POSIX_SPAWN_OPEN, 1),
+        (os.POSIX_SPAWN_OPEN, 2),
+    ]
+
+
+def test_expected_identity_duplicates_fail_before_any_worker_starts(monkeypatch):
+    started = False
+
+    def forbidden_start(*_args):
+        nonlocal started
+        started = True
+        raise AssertionError("invalid expected identities reached a worker")
+
+    monkeypatch.setattr(quality_intervals, "_start_bootstrap_worker", forbidden_start)
+    tasks = [_tiny_bootstrap_task(0, "1"), _tiny_bootstrap_task(0, "2")]
+
+    with pytest.raises(RuntimeError, match="duplicate index"):
+        quality_intervals._parallel_bootstrap_tasks(tasks, 2, result_size=2)
+
+    assert not started
+
+
 @pytest.mark.parametrize(
     ("fixture_name", "expected_grade"),
     [
@@ -944,22 +1430,39 @@ def test_actual_scale_candidate_surface_completes_within_bounded_cost():
     assert elapsed < 8.0
 
 
-def test_many_applicable_bootstraps_complete_with_bounded_parallel_cost(monkeypatch):
-    config = analysis_config()
-    rows = performance_fixture()
-    rows["judge"] = ["불량" if index % 3 == 0 else "양품" for index in range(len(rows))]
-
-    def slow_bootstrap(_rows, _criteria_id, _rule_id, *, replicates):
-        assert replicates == 2000
-        time.sleep(0.02)
-        return BootstrapCi(0.8, 1.2, 2000, "NONE")
-
-    monkeypatch.setattr(quality_intervals, "charge_bootstrap_rr_ci", slow_bootstrap)
+def test_real_bootstrap_workload_is_deterministic_for_1_8_and_10_workers():
+    digits = "123456789abcdef0"
+    tasks = [
+        _tiny_bootstrap_task(index, digit)
+        for index, digit in enumerate(digits)
+    ]
     started = time.perf_counter()
-    rules = build_quality_rules(
-        split_from_rows(rows), definitions(config), config, CRITERIA_ID
-    )
+    sequential = quality_intervals._parallel_bootstrap_tasks(tasks, 1)
+    eight_workers = quality_intervals._parallel_bootstrap_tasks(tasks, 8)
+    ten_workers = quality_intervals._parallel_bootstrap_tasks(tasks, 10)
     elapsed = time.perf_counter() - started
 
-    assert len(rules) >= 250
-    assert elapsed < 18.0
+    assert sequential == eight_workers == ten_workers
+    assert [(response.index, response.rule_id) for response in sequential] == [
+        (index, _bootstrap_rule_id(digit))
+        for index, digit in enumerate(digits)
+    ]
+    assert all(response.interval.valid_replicates == 2000 for response in sequential)
+    assert elapsed < 30.0
+
+
+def test_parallel_bootstrap_handles_zero_one_and_multiple_tasks():
+    assert quality_intervals._parallel_bootstrap_tasks([], 10) == ()
+    one = quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 10)
+    many = quality_intervals._parallel_bootstrap_tasks(
+        [_tiny_bootstrap_task(0, "1"), _tiny_bootstrap_task(1, "2")],
+        2,
+    )
+
+    assert [(response.index, response.rule_id) for response in one] == [
+        (0, _bootstrap_rule_id("1"))
+    ]
+    assert [(response.index, response.rule_id) for response in many] == [
+        (0, _bootstrap_rule_id("1")),
+        (1, _bootstrap_rule_id("2")),
+    ]

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import io
 import math
 import os
 import pickle
+from pathlib import Path
+import signal
+import sys
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from numbers import Integral, Real
@@ -37,6 +43,12 @@ _EQUIPMENT_IDENTIFIER_ROLE = "EQUIPMENT_IDENTIFIER"
 _MISSING = object()
 _PARALLEL_BOOTSTRAP_MINIMUM = 16
 _MAX_BOOTSTRAP_WORKERS = 10
+_BOOTSTRAP_PROTOCOL = "sfep-quality-bootstrap/v1"
+_BOOTSTRAP_WORKER_ARGUMENT = "--bootstrap-worker"
+_MAX_BOOTSTRAP_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MAX_BOOTSTRAP_RESPONSE_BYTES = 1024 * 1024
+_BOOTSTRAP_WORKER_TIMEOUT_SECONDS = 120.0
+_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS = 1.0
 
 
 def _is_missing(value: object) -> bool:
@@ -1073,74 +1085,530 @@ def _bootstrap_rows(
     )
 
 
+@dataclass(frozen=True)
+class _BootstrapResponse:
+    index: int
+    rule_id: str
+    interval: BootstrapCi
+
+
 def _bootstrap_task(
     task: tuple[int, pd.DataFrame, str, str, int],
-) -> tuple[int, BootstrapCi]:
+) -> _BootstrapResponse:
     index, rows, criteria_id, rule_id, replicates = task
-    return index, charge_bootstrap_rr_ci(
-        rows,
-        criteria_id,
+    return _BootstrapResponse(
+        index,
         rule_id,
-        replicates=replicates,
+        charge_bootstrap_rr_ci(
+            rows,
+            criteria_id,
+            rule_id,
+            replicates=replicates,
+        ),
     )
 
 
 def _write_all(file_descriptor: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
-        offset += os.write(file_descriptor, payload[offset:])
+        try:
+            written = os.write(file_descriptor, payload[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("bootstrap worker output made no write progress")
+        offset += written
+
+
+def _decode_bootstrap_worker_input(
+    payload: bytes,
+) -> tuple[int, tuple[tuple[int, pd.DataFrame, str, str, int], ...]]:
+    try:
+        stream = io.BytesIO(payload)
+        message = pickle.Unpickler(stream).load()
+        if stream.tell() != len(payload):
+            raise ValueError("trailing input bytes")
+        if type(message) is not tuple or len(message) != 3:
+            raise ValueError("input envelope must contain protocol, ordinal, and tasks")
+        protocol, worker_ordinal, raw_tasks = message
+        if (
+            protocol != _BOOTSTRAP_PROTOCOL
+            or type(worker_ordinal) is not int
+            or worker_ordinal < 0
+            or type(raw_tasks) is not tuple
+        ):
+            raise ValueError("input protocol or task collection is invalid")
+        tasks: list[tuple[int, pd.DataFrame, str, str, int]] = []
+        for raw_task in raw_tasks:
+            if type(raw_task) is not tuple or len(raw_task) != 5:
+                raise ValueError("input task must contain exactly five fields")
+            index, rows, criteria_id, rule_id, replicates = raw_task
+            if type(index) is not int or index < 0:
+                raise ValueError("input task index must be a non-negative integer")
+            if type(rows) is not pd.DataFrame:
+                raise TypeError("input task rows must be a pandas DataFrame")
+            if type(criteria_id) is not str or type(rule_id) is not str:
+                raise TypeError("input task identifiers must be built-in strings")
+            if type(replicates) is not int or replicates < 1:
+                raise ValueError("input task replicates must be a positive integer")
+            tasks.append((index, rows, criteria_id, rule_id, replicates))
+        return worker_ordinal, tuple(tasks)
+    except Exception as error:
+        raise RuntimeError(f"bootstrap worker input protocol invalid: {error}") from error
+
+
+def _decode_bootstrap_worker_response(
+    payload: bytes,
+) -> tuple[int, tuple[_BootstrapResponse, ...]]:
+    try:
+        if type(payload) is not bytes or not payload:
+            raise ValueError("response must be non-empty built-in bytes")
+        if len(payload) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+            raise ValueError("response exceeds the byte limit")
+        stream = io.BytesIO(payload)
+        message = pickle.Unpickler(stream).load()
+        if stream.tell() != len(payload):
+            raise ValueError("trailing response bytes")
+        if type(message) is not tuple or len(message) != 3:
+            raise ValueError("response envelope must contain protocol, ordinal, and results")
+        protocol, worker_ordinal, raw_responses = message
+        if (
+            protocol != _BOOTSTRAP_PROTOCOL
+            or type(worker_ordinal) is not int
+            or worker_ordinal < 0
+            or type(raw_responses) is not tuple
+        ):
+            raise ValueError("response protocol or result collection is invalid")
+        responses: list[_BootstrapResponse] = []
+        for raw_response in raw_responses:
+            if type(raw_response) is not tuple or len(raw_response) != 3:
+                raise ValueError("response result must contain exactly three fields")
+            responses.append(_BootstrapResponse(*raw_response))
+        return worker_ordinal, tuple(responses)
+    except Exception as error:
+        raise RuntimeError(f"bootstrap worker protocol invalid: {error}") from error
+
+
+def _validate_bootstrap_responses(
+    expected: Sequence[tuple[int, str]],
+    responses: Sequence[_BootstrapResponse],
+    *,
+    result_size: int,
+) -> tuple[_BootstrapResponse, ...]:
+    expected_snapshot, expected_by_index = _validate_expected_bootstrap_identities(
+        expected,
+        result_size=result_size,
+    )
+    response_snapshot = tuple(responses)
+    if len(response_snapshot) != len(expected_snapshot):
+        raise RuntimeError(
+            "bootstrap response cardinality does not match submitted tasks"
+        )
+
+    validated: dict[int, _BootstrapResponse] = {}
+    interval_fields = {
+        "lower",
+        "upper",
+        "valid_replicates",
+        "reason_code",
+    }
+    for response in response_snapshot:
+        if type(response) is not _BootstrapResponse:
+            raise RuntimeError("bootstrap response has an unexpected payload type")
+        if type(response.index) is not int or not 0 <= response.index < result_size:
+            raise RuntimeError("bootstrap response index is outside the result range")
+        if response.index in validated:
+            raise RuntimeError("bootstrap response contains a duplicate or conflicting index")
+        expected_rule_id = expected_by_index.get(response.index)
+        if expected_rule_id is None:
+            raise RuntimeError("bootstrap response contains an unexpected index")
+        if type(response.rule_id) is not str or response.rule_id != expected_rule_id:
+            raise RuntimeError("bootstrap response ruleId does not match its submitted task")
+        interval = response.interval
+        if type(interval) is not BootstrapCi:
+            raise RuntimeError("bootstrap response interval must be an exact BootstrapCi")
+        if set(vars(interval)) != interval_fields:
+            raise RuntimeError("bootstrap response BootstrapCi shape is invalid")
+        try:
+            checked_interval = BootstrapCi(
+                interval.lower,
+                interval.upper,
+                interval.valid_replicates,
+                interval.reason_code,
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"bootstrap response BootstrapCi semantics are invalid: {error}"
+            ) from error
+        validated[response.index] = _BootstrapResponse(
+            response.index,
+            response.rule_id,
+            checked_interval,
+        )
+    if set(validated) != set(expected_by_index):
+        raise RuntimeError("bootstrap response is missing a submitted task")
+    return tuple(validated[index] for index, _ in expected_snapshot)
+
+
+def _validate_expected_bootstrap_identities(
+    expected: Sequence[tuple[int, str]],
+    *,
+    result_size: int,
+) -> tuple[tuple[tuple[int, str], ...], dict[int, str]]:
+    if type(result_size) is not int or result_size < 0:
+        raise RuntimeError("bootstrap result index range is invalid")
+    expected_snapshot = tuple(expected)
+    expected_by_index: dict[int, str] = {}
+    for item in expected_snapshot:
+        if type(item) is not tuple or len(item) != 2:
+            raise RuntimeError("bootstrap expected identity shape is invalid")
+        index, rule_id = item
+        if type(index) is not int or not 0 <= index < result_size:
+            raise RuntimeError("bootstrap expected index range is invalid")
+        try:
+            checked_rule_id = _validate_sha256_uri(rule_id, "bootstrap expected ruleId")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"bootstrap expected ruleId is invalid: {error}") from error
+        if index in expected_by_index:
+            raise RuntimeError("bootstrap expected identities contain a duplicate index")
+        expected_by_index[index] = checked_rule_id
+    if len(set(expected_by_index.values())) != len(expected_by_index):
+        raise RuntimeError("bootstrap expected identities contain a duplicate ruleId")
+    return expected_snapshot, expected_by_index
+
+
+def _best_effort_worker_error(error: BaseException) -> None:
+    message = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")[:4096]
+    try:
+        _write_all(2, message + b"\n")
+    except BaseException:
+        pass
+
+
+def _bootstrap_worker_main(input_path: Path, *, output_fd: int = 1) -> int:
+    try:
+        path = Path(input_path)
+        if path.stat().st_size > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise ValueError("bootstrap worker input exceeds the byte limit")
+        with path.open("rb") as input_file:
+            payload = input_file.read(_MAX_BOOTSTRAP_PAYLOAD_BYTES + 1)
+        if len(payload) > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise ValueError("bootstrap worker input exceeds the byte limit")
+        worker_ordinal, tasks = _decode_bootstrap_worker_input(payload)
+        responses = tuple(_bootstrap_task(task) for task in tasks)
+        result = pickle.dumps(
+            (
+                _BOOTSTRAP_PROTOCOL,
+                worker_ordinal,
+                tuple(
+                    (response.index, response.rule_id, response.interval)
+                    for response in responses
+                ),
+            ),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        if len(result) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+            raise ValueError("bootstrap worker response exceeds the byte limit")
+    except BaseException as error:
+        _best_effort_worker_error(error)
+        return 70
+    try:
+        _write_all(output_fd, result)
+    except BaseException as error:
+        _best_effort_worker_error(error)
+        return 74
+    return 0
+
+
+@dataclass
+class _SpawnedBootstrapWorker:
+    pid: int
+    output_path: Path
+    error_path: Path
+    returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        while True:
+            try:
+                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+                break
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                self.returncode = 255
+                return self.returncode
+        if waited_pid == self.pid:
+            self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def terminate(self) -> None:
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        os.kill(self.pid, signal.SIGKILL)
+
+    def reap(self) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        while True:
+            try:
+                waited_pid, status = os.waitpid(self.pid, 0)
+                break
+            except InterruptedError:
+                continue
+        if waited_pid != self.pid:
+            raise RuntimeError("bootstrap worker wait returned an unexpected pid")
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+
+def _start_bootstrap_worker(
+    input_path: Path,
+    output_path: Path,
+    error_path: Path,
+) -> _SpawnedBootstrapWorker:
+    arguments = (
+        sys.executable,
+        "-m",
+        "equipment_quality.quality_intervals",
+        _BOOTSTRAP_WORKER_ARGUMENT,
+        str(input_path),
+    )
+    output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    file_actions = (
+        (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 1, str(output_path), output_flags, 0o600),
+        (os.POSIX_SPAWN_OPEN, 2, str(error_path), output_flags, 0o600),
+    )
+    process_id = os.posix_spawn(
+        sys.executable,
+        arguments,
+        dict(os.environ),
+        file_actions=file_actions,
+        setsigmask=(),
+    )
+    return _SpawnedBootstrapWorker(
+        process_id,
+        output_path,
+        error_path,
+    )
+
+
+def _cleanup_bootstrap_workers(processes: Sequence[_SpawnedBootstrapWorker]) -> None:
+    snapshot = tuple(processes)
+    running: list[_SpawnedBootstrapWorker] = []
+    for process in snapshot:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                running.append(process)
+        except ProcessLookupError:
+            try:
+                process.reap()
+            except (ChildProcessError, OSError):
+                pass
+        except OSError:
+            running.append(process)
+    deadline = time.monotonic() + _BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS
+    while running and time.monotonic() < deadline:
+        still_running: list[_SpawnedBootstrapWorker] = []
+        for process in running:
+            try:
+                if process.poll() is None:
+                    still_running.append(process)
+            except OSError:
+                still_running.append(process)
+        running = still_running
+        if running:
+            time.sleep(0.005)
+    for process in running:
+        try:
+            needs_kill = process.poll() is None
+        except OSError:
+            needs_kill = True
+        if needs_kill:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    for process in running:
+        try:
+            process.reap()
+        except (ChildProcessError, OSError):
+            pass
+
+
+def _write_bootstrap_worker_inputs(
+    directory: Path,
+    partitions: Sequence[Sequence[tuple[int, pd.DataFrame, str, str, int]]],
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for index, partition in enumerate(partitions):
+        try:
+            payload = pickle.dumps(
+                (_BOOTSTRAP_PROTOCOL, index, tuple(partition)),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"bootstrap worker input serialization failed: {error}"
+            ) from error
+        if len(payload) > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise RuntimeError(
+                "bootstrap worker input partition exceeds the bounded byte limit"
+            )
+        path = directory / f"worker-{index:02d}.pickle"
+        with path.open("xb") as output_file:
+            output_file.write(payload)
+        paths.append(path)
+    return tuple(paths)
+
+
+def _wait_for_bootstrap_workers(
+    processes: Sequence[_SpawnedBootstrapWorker], deadline: float
+) -> None:
+    pending = list(processes)
+    while pending:
+        pending = [process for process in pending if process.poll() is None]
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("bootstrap workers exceeded their global timeout")
+        time.sleep(min(0.005, remaining))
+
+
+def _read_bounded_worker_file(path: Path, *, label: str) -> bytes:
+    with path.open("rb") as input_file:
+        payload = input_file.read(_MAX_BOOTSTRAP_RESPONSE_BYTES + 1)
+    if len(payload) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+        raise RuntimeError(f"bootstrap worker {label} exceeded the byte limit")
+    return payload
+
+
+def _partition_bootstrap_tasks(
+    tasks: Sequence[tuple[int, pd.DataFrame, str, str, int]],
+    worker_count: int,
+) -> tuple[tuple[tuple[int, pd.DataFrame, str, str, int], ...], ...]:
+    weighted: list[
+        tuple[int, int, bytes, tuple[int, pd.DataFrame, str, str, int]]
+    ] = []
+    for task in tasks:
+        index, rows, _, rule_id, _ = task
+        statistical_cost = int(rows["charge_id"].nunique(dropna=False)) + int(
+            rows[["charge_id", "stratum"]].drop_duplicates().shape[0]
+        )
+        weighted.append((statistical_cost, index, rule_id.encode("utf-8"), task))
+    weighted.sort(key=lambda item: (-item[0], item[1], item[2]))
+    loads = [0] * worker_count
+    partitions: list[list[tuple[int, pd.DataFrame, str, str, int]]] = [
+        [] for _ in range(worker_count)
+    ]
+    for cost, _, _, task in weighted:
+        worker = min(range(worker_count), key=lambda item: (loads[item], item))
+        partitions[worker].append(task)
+        loads[worker] += cost
+    return tuple(tuple(partition) for partition in partitions)
 
 
 def _parallel_bootstrap_tasks(
     tasks: list[tuple[int, pd.DataFrame, str, str, int]],
     worker_count: int,
-) -> tuple[tuple[int, BootstrapCi], ...]:
-    partitions = [tasks[index::worker_count] for index in range(worker_count)]
-    children: list[tuple[int, int]] = []
-    for partition in partitions:
-        read_descriptor, write_descriptor = os.pipe()
-        process_id = os.fork()
-        if process_id == 0:
-            os.close(read_descriptor)
-            for _, inherited_read_descriptor in children:
-                os.close(inherited_read_descriptor)
-            try:
-                payload = pickle.dumps(
-                    ("OK", tuple(_bootstrap_task(task) for task in partition)),
-                    protocol=pickle.HIGHEST_PROTOCOL,
+    *,
+    result_size: int | None = None,
+) -> tuple[_BootstrapResponse, ...]:
+    task_snapshot = tuple(tasks)
+    if not task_snapshot:
+        return ()
+    if type(worker_count) is not int or worker_count < 1:
+        raise ValueError("bootstrap worker_count must be a positive integer")
+    worker_count = min(worker_count, len(task_snapshot))
+    expected_items: list[tuple[int, str]] = []
+    for task in task_snapshot:
+        if type(task) is not tuple or len(task) != 5:
+            raise RuntimeError("bootstrap submitted task shape is invalid")
+        index, _, _, rule_id, _ = task
+        if type(index) is not int or index < 0:
+            raise RuntimeError("bootstrap submitted task index range is invalid")
+        expected_items.append((index, rule_id))
+    expected = tuple(expected_items)
+    if result_size is None:
+        result_size = max(index for index, _ in expected) + 1
+    _validate_expected_bootstrap_identities(expected, result_size=result_size)
+    partitions = _partition_bootstrap_tasks(task_snapshot, worker_count)
+    processes: list[_SpawnedBootstrapWorker] = []
+    raw_results: list[_BootstrapResponse] = []
+    with tempfile.TemporaryDirectory(prefix="sfep-quality-bootstrap-") as raw_directory:
+        directory = Path(raw_directory)
+        paths = _write_bootstrap_worker_inputs(directory, partitions)
+        try:
+            for ordinal, path in enumerate(paths):
+                processes.append(
+                    _start_bootstrap_worker(
+                        path,
+                        directory / f"worker-{ordinal:02d}.response",
+                        directory / f"worker-{ordinal:02d}.stderr",
+                    )
                 )
-            except BaseException as error:
-                payload = pickle.dumps(
-                    ("ERROR", type(error).__name__, str(error)),
-                    protocol=pickle.HIGHEST_PROTOCOL,
+            deadline = time.monotonic() + _BOOTSTRAP_WORKER_TIMEOUT_SECONDS
+            _wait_for_bootstrap_workers(processes, deadline)
+            errors: list[str] = []
+            for ordinal, process in enumerate(processes):
+                error = _read_bounded_worker_file(
+                    process.error_path,
+                    label="stderr",
                 )
-            try:
-                _write_all(write_descriptor, payload)
-            finally:
-                os.close(write_descriptor)
-            os._exit(0)
-        os.close(write_descriptor)
-        children.append((process_id, read_descriptor))
-
-    results: list[tuple[int, BootstrapCi]] = []
-    errors: list[str] = []
-    for process_id, read_descriptor in children:
-        chunks: list[bytes] = []
-        while chunk := os.read(read_descriptor, 65536):
-            chunks.append(chunk)
-        os.close(read_descriptor)
-        _, status = os.waitpid(process_id, 0)
-        if status != 0 or not chunks:
-            errors.append(f"bootstrap worker {process_id} exited with status {status}")
-            continue
-        response = pickle.loads(b"".join(chunks))
-        if response[0] == "ERROR":
-            errors.append(f"bootstrap worker {response[1]}: {response[2]}")
-        else:
-            results.extend(response[1])
-    if errors:
-        raise RuntimeError("; ".join(errors))
-    return tuple(sorted(results, key=lambda item: item[0]))
+                returncode = process.returncode
+                if returncode != 0:
+                    if returncode is not None and returncode < 0:
+                        status = f"terminated by signal {-returncode}"
+                    else:
+                        status = f"exited with status {returncode}"
+                    detail = error[:4096].decode("utf-8", errors="replace").strip()
+                    errors.append(
+                        f"bootstrap worker {process.pid} {status}"
+                        + (f": {detail}" if detail else "")
+                    )
+                    continue
+                output = _read_bounded_worker_file(
+                    process.output_path,
+                    label="response",
+                )
+                response_ordinal, worker_results = (
+                    _decode_bootstrap_worker_response(output)
+                )
+                if response_ordinal != ordinal:
+                    raise RuntimeError(
+                        "bootstrap worker protocol returned an unexpected worker ordinal"
+                    )
+                partition_expected = tuple(
+                    (task[0], task[3]) for task in partitions[ordinal]
+                )
+                if tuple(
+                    (response.index, response.rule_id)
+                    for response in worker_results
+                ) != partition_expected:
+                    raise RuntimeError(
+                        "bootstrap worker partition identities or order do not match submission"
+                    )
+                raw_results.extend(
+                    _validate_bootstrap_responses(
+                        partition_expected,
+                        worker_results,
+                        result_size=result_size,
+                    )
+                )
+            if errors:
+                raise RuntimeError("; ".join(errors))
+        finally:
+            _cleanup_bootstrap_workers(processes)
+    return _validate_bootstrap_responses(
+        expected,
+        raw_results,
+        result_size=result_size,
+    )
 
 
 def _bootstrap_discovery_metrics(
@@ -1163,25 +1631,39 @@ def _bootstrap_discovery_metrics(
         for index, candidate in enumerate(candidates)
         if _bootstrap_applicable(discovery[index], config)
     ]
+    expected = tuple((task[0], task[3]) for task in tasks)
+    _validate_expected_bootstrap_identities(
+        expected,
+        result_size=len(discovery),
+    )
     worker_count = min(
         len(tasks),
         _MAX_BOOTSTRAP_WORKERS,
         os.cpu_count() or 1,
     )
     if len(tasks) >= _PARALLEL_BOOTSTRAP_MINIMUM and worker_count > 1:
-        intervals = _parallel_bootstrap_tasks(tasks, worker_count)
+        responses = _parallel_bootstrap_tasks(
+            tasks,
+            worker_count,
+            result_size=len(discovery),
+        )
     else:
-        intervals = tuple(_bootstrap_task(task) for task in tasks)
+        responses = tuple(_bootstrap_task(task) for task in tasks)
+    validated = _validate_bootstrap_responses(
+        expected,
+        responses,
+        result_size=len(discovery),
+    )
 
     result = list(discovery)
-    for index, interval in intervals:
-        metric = result[index]
-        result[index] = replace(
+    for response in validated:
+        metric = result[response.index]
+        result[response.index] = replace(
             metric,
-            relative_risk_ci_lower=interval.lower,
-            relative_risk_ci_upper=interval.upper,
+            relative_risk_ci_lower=response.interval.lower,
+            relative_risk_ci_upper=response.interval.upper,
             reason_code=(
-                interval.reason_code
+                response.interval.reason_code
                 if metric.reason_code == "NONE"
                 else metric.reason_code
             ),
@@ -1345,3 +1827,14 @@ def build_quality_rules(
         )
     rules = _annotate_display_merges(rules)
     return [rule.to_wire() for rule in rules]
+
+
+def _module_main(arguments: Sequence[str] | None = None) -> int:
+    argv = tuple(sys.argv[1:] if arguments is None else arguments)
+    if len(argv) == 2 and argv[0] == _BOOTSTRAP_WORKER_ARGUMENT:
+        return _bootstrap_worker_main(Path(argv[1]))
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(_module_main())
