@@ -1,0 +1,1 @@
+[{"expected":"1120","hex":"0x1.1800000000000p+10","name":"integral-float"},{"expected":"0","hex":"-0x0.0p+0","name":"negative-zero"},{"expected":"1e-7","hex":"0x1.ad7f29abcaf48p-24","name":"small-exponent"},{"expected":"1e20","hex":"0x1.5af1d78b58c40p+66","name":"positive-exponent"},{"expected":"1.7976931348623157e308","hex":"0x1.fffffffffffffp+1023","name":"maximum-finite"}]

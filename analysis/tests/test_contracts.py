@@ -5,6 +5,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import re
 from pathlib import Path
 
@@ -23,13 +24,22 @@ SCHEMA_NAMES = [
     "analysis_summary.schema.json",
     "replay_event_row.schema.json",
 ]
+EXACT_ALLOWED_TOKENS = {
+    b"@PRODUCER_RUNTIME_SHA256@", b"@CRITERIA_ID@", b"@BUNDLE_ID@",
+    b"@SCHEMA_BUNDLE_MANIFEST_SHA256@", b"@SCHEMA_ANALYSIS_CONFIG_SHA256@",
+    b"@SCHEMA_PRODUCER_RUNTIME_SHA256@", b"@SCHEMA_EQUIPMENT_OPERATING_RANGES_SHA256@",
+    b"@SCHEMA_QUALITY_RISK_INTERVALS_SHA256@", b"@SCHEMA_ANALYSIS_SUMMARY_SHA256@",
+    b"@SCHEMA_REPLAY_EVENTS_SHA256@", b"@SOURCE_SM_CC_SHA256@",
+    b"@SOURCE_FUR_HR_SHA256@", b"@SOURCE_AP_SHA256@",
+    b"@ARTIFACT_ANALYSIS_CONFIG_SHA256@", b"@ARTIFACT_PRODUCER_RUNTIME_SHA256@",
+    b"@ARTIFACT_EQUIPMENT_OPERATING_RANGES_SHA256@",
+    b"@ARTIFACT_QUALITY_RISK_INTERVALS_SHA256@", b"@ARTIFACT_REPLAY_EVENTS_SHA256@",
+    b"@ARTIFACT_ANALYSIS_SUMMARY_SHA256@",
+}
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
-TOKEN_RE = re.compile(
-    rb"@(?:PRODUCER_RUNTIME_SHA256|CRITERIA_ID|BUNDLE_ID|"
-    rb"SCHEMA_[A-Z0-9_]+_SHA256|SOURCE_[A-Z0-9_]+_SHA256|"
-    rb"ARTIFACT_[A-Z0-9_]+_SHA256)@"
-)
+MATERIAL_CH1_1 = "sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a"
+TOKEN_RE = re.compile(rb"(?:" + rb"|".join(re.escape(token) for token in sorted(EXACT_ALLOWED_TOKENS)) + rb")")
 
 
 def _load_schema(name: str) -> dict:
@@ -55,12 +65,9 @@ def _validator(schema_name: str):
 
 
 def _digest_id(namespace: str, value: dict) -> tuple[str, str]:
-    canonical = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ) + "\n"
-    preimage = namespace + "\n" + canonical
-    digest = hashlib.sha256(preimage.encode("utf-8")).hexdigest()
-    return preimage, "sha256:" + digest
+    preimage_bytes = namespace.encode("utf-8") + b"\n" + _canonical_json_bytes(value)
+    digest = hashlib.sha256(preimage_bytes).hexdigest()
+    return preimage_bytes.decode("utf-8"), "sha256:" + digest
 
 
 def _replace_tokens(data: bytes) -> bytes:
@@ -68,10 +75,62 @@ def _replace_tokens(data: bytes) -> bytes:
 
 
 def _canonical_json_bytes(value: object) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    def encode(node: object) -> str:
+        if node is None:
+            return "null"
+        if node is True:
+            return "true"
+        if node is False:
+            return "false"
+        if isinstance(node, int):
+            return str(node)
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("JSON numbers must be finite binary64 values")
+            if node == 0.0:
+                return "0"
+            spelling = repr(node).lower()
+            if "e" in spelling:
+                mantissa, exponent = spelling.split("e", 1)
+                if mantissa.endswith(".0"):
+                    mantissa = mantissa[:-2]
+                return f"{mantissa}e{int(exponent)}"
+            return spelling[:-2] if spelling.endswith(".0") else spelling
+        if isinstance(node, str):
+            return json.dumps(node, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(node, list):
+            return "[" + ",".join(encode(item) for item in node) + "]"
+        if isinstance(node, dict):
+            if not all(isinstance(key, str) for key in node):
+                raise TypeError("canonical JSON object keys must be strings")
+            return "{" + ",".join(
+                encode(key) + ":" + encode(node[key]) for key in sorted(node)
+            ) + "}"
+        raise TypeError(f"unsupported canonical JSON value: {type(node).__name__}")
+
+    return (encode(value) + "\n").encode("utf-8")
 
 
 def _validate_summary_application_contract(summary: dict) -> None:
+    config = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))
+    source_names = {
+        "sm_cc": "sts_1sm_cc_1.csv", "fur_hr": "sts_2fur_hr_2.csv", "ap": "sts_3ap_3.csv",
+    }
+    source_rows: dict[str, list[dict[str, str]]] = {}
+    source_headers: dict[str, set[str]] = {}
+    for role, name in source_names.items():
+        text = (CONTRACT / "golden-source" / name).read_text(encoding="cp949")
+        reader = csv.DictReader(io.StringIO(text))
+        source_headers[role] = set(reader.fieldnames or [])
+        source_rows[role] = list(reader)
+    config_fields = {
+        (item["sourceRole"], item["sourceColumn"]): item
+        for item in config["fields"] if item["sourceRole"] is not None
+    }
+    source_dependencies = {
+        f"{role}.{column}" for role, columns in source_headers.items() for column in columns
+    }
+
     for count in summary["splitCounts"].values():
         assert count["total"] == count["defects"] + count["nonDefects"] + count["unknownOrCensored"]
 
@@ -80,6 +139,25 @@ def _validate_summary_application_contract(summary: dict) -> None:
     assert material_keys == sorted(material_keys, key=lambda item: item.encode("utf-8"))
     assert len(material_keys) == len(set(material_keys))
     known_materials = set(material_keys)
+    for material in lineage["materials"]:
+        expected_key = _digest_id(
+            "sfep-material-key/v1", {"chargeId": material["chargeId"], "slabNo": material["slabNo"]}
+        )[1]
+        assert material["materialKey"] == expected_key
+        for source_record in material["sourceRecords"]:
+            role = source_record["role"]
+            assert source_record["name"] == source_names[role]
+            record_index = source_record["recordNumber"] - 2
+            assert 0 <= record_index < len(source_rows[role])
+            row = source_rows[role][record_index]
+            if role == "sm_cc":
+                assert row["charge_id"].strip() == material["chargeId"]
+            elif role == "fur_hr":
+                assert row["charge_id"].strip() == material["chargeId"]
+                assert row["slab_no"].strip() == material["slabNo"]
+                assert row["hr_coil_id"].strip() == material["hrCoilId"]
+            else:
+                assert row["hr_coil_id"].strip() == material["hrCoilId"]
     populations = {item["populationRef"]: item for item in lineage["populations"]}
     assert len(populations) == len(lineage["populations"])
     for population in populations.values():
@@ -90,18 +168,48 @@ def _validate_summary_application_contract(summary: dict) -> None:
         keys = aggregate["inputMaterialKeys"]
         assert keys == sorted(keys, key=lambda item: item.encode("utf-8"))
         assert set(keys) <= set(populations[aggregate["populationRef"]]["materialKeys"])
+        assert aggregate["split"] == populations[aggregate["populationRef"]]["split"]
         if aggregate["artifactRole"] == "equipment_operating_ranges":
             assert aggregate["comparatorDefinition"] == "NOT_APPLICABLE"
         else:
             assert aggregate["comparatorDefinition"] == "FIXED_POPULATION_STRATA_MINUS_CANDIDATE"
+    lineage_node_ids = {
+        f'{field["artifactRole"]}.{field["outputField"]}' for field in lineage["fields"]
+    }
+    dependency_graph: dict[str, list[str]] = {}
     for field in lineage["fields"]:
+        node_id = f'{field["artifactRole"]}.{field["outputField"]}'
         raw = field["sourceRole"] is not None
         if raw:
             assert field["sourceColumn"] is not None
             assert field["firstAvailableStage"] is not None
+            assert field["sourceColumn"] in source_headers[field["sourceRole"]]
+            definition = config_fields[(field["sourceRole"], field["sourceColumn"])]
+            assert field["firstAvailableStage"] == definition["firstAvailableStage"]
         else:
             assert field["sourceColumn"] is None
             assert field["dependencies"]
+        for dependency in field["dependencies"]:
+            assert dependency in source_dependencies or dependency in lineage_node_ids
+        dependency_graph[node_id] = [
+            dependency for dependency in field["dependencies"] if dependency in lineage_node_ids
+        ]
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        assert node_id not in visiting, "lineage dependency cycle"
+        if node_id in visited:
+            return
+        visiting.add(node_id)
+        for dependency in dependency_graph[node_id]:
+            visit(dependency)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    for node_id in dependency_graph:
+        visit(node_id)
 
 
 def _manifest() -> dict:
@@ -352,13 +460,13 @@ def _summary() -> dict:
                 "dependencies": ["fur_hr.f_pre_temp"], "firstAvailableStage": None,
             }],
             "materials": [{
-                "materialKey": SHA_A, "chargeId": "CH1", "slabNo": "1", "hrCoilId": "H001",
+                "materialKey": MATERIAL_CH1_1, "chargeId": "CH1", "slabNo": "1", "hrCoilId": "H001",
                 "sourceRecords": [{"role": "sm_cc", "name": "sts_1sm_cc_1.csv", "recordNumber": 2}, {"role": "fur_hr", "name": "sts_2fur_hr_2.csv", "recordNumber": 2}, {"role": "ap", "name": "sts_3ap_3.csv", "recordNumber": 2}],
             }],
-            "populations": [{"populationRef": "DISCOVERY", "split": "DISCOVERY", "materialKeys": [SHA_A]}],
+            "populations": [{"populationRef": "DISCOVERY", "split": "DISCOVERY", "materialKeys": [MATERIAL_CH1_1]}],
             "aggregates": [{
                 "artifactRole": "equipment_operating_ranges", "ruleId": SHA_B,
-                "split": "REFERENCE", "populationRef": "DISCOVERY", "inputMaterialKeys": [SHA_A],
+                "split": "DISCOVERY", "populationRef": "DISCOVERY", "inputMaterialKeys": [MATERIAL_CH1_1],
                 "comparatorDefinition": "NOT_APPLICABLE",
                 "filters": ["isfinite(f_pre_temp)"], "transformations": ["TYPE1_QUANTILE"],
             }],
@@ -374,7 +482,13 @@ def _replay_row() -> dict:
         "equipment_batch_id": None, "batch_step": "CAST_RECORDED", "time_precision": "DAY",
         "material_key": SHA_B, "equipment_type": "SM_CC", "equipment_id": "SM1",
         "charge_id": "CH1", "slab_no": "1", "hr_coil_id": None, "ap_prod_id": None,
-        "values_json": {"steel_grade": "STS304", "tundish_temp": 1540.0},
+        "values_json": {
+            "sm_plant": "SM1", "steel_grade": "STS304", "steel_usage": "A",
+            "cc_gubun": "CC1", "slab_gubun": "NORMAL", "tundish_temp": 1540.0,
+            "mlac_ratio": 0.92, "delta_ferrite": 7.1, "ingre_cr": 18.2,
+            "ingre_ni": 8.1, "ingre_s": 0.005, "slab_grind": 0.0,
+            "cast_date": "2025-01-01",
+        },
     }
 
 
@@ -400,7 +514,10 @@ def test_all_normative_schemas_compile_and_close_every_object_boundary():
 
 
 def test_normative_json_and_json_lines_are_canonical_utf8_bytes():
-    json_paths = [Path("analysis/analysis_config.json"), CONTRACT / "id-test-vectors.json"]
+    json_paths = [
+        Path("analysis/analysis_config.json"), CONTRACT / "id-test-vectors.json",
+        CONTRACT / "canonical-number-test-vectors.json",
+    ]
     json_paths.extend(CONTRACT / name for name in SCHEMA_NAMES)
     json_paths.extend((CONTRACT / "golden-expectation").glob("*.json"))
     for path in json_paths:
@@ -498,6 +615,176 @@ def test_lineage_application_validation_rejects_broken_counts_refs_and_sorting()
     unsorted["lineage"]["materials"].append(second)
     with pytest.raises(AssertionError):
         _validate_summary_application_contract(unsorted)
+
+
+def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and_lineage():
+    root = CONTRACT / "golden-expectation"
+    rules = json.loads(_replace_tokens((root / "quality_risk_intervals.template.json").read_bytes()))
+    summary = json.loads(_replace_tokens((root / "analysis_summary.template.json").read_bytes()))
+    fur_rows = list(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-source" / "sts_2fur_hr_2.csv").read_text(encoding="cp949")
+    )))
+    rule = rules["rules"][0]
+    rule_identity = {
+        key: rule[key] for key in (
+            "analysisFamily", "fieldNames", "predicate", "firstAvailableStage", "equipmentType",
+            "applicationScope", "equipmentId", "applicationContext", "adjustmentLevel",
+            "adjustmentFieldsDropped", "adjustmentKind",
+        )
+    }
+    assert rule["ruleId"] == "sha256:" + hashlib.sha256(_canonical_json_bytes(rule_identity)).hexdigest()
+    term = rule["predicate"]["allOf"][0]
+    population = next(item for item in summary["lineage"]["populations"] if item["populationRef"] == "DISCOVERY")
+    by_key = {
+        _digest_id("sfep-material-key/v1", {"chargeId": row["charge_id"], "slabNo": row["slab_no"]})[1]: row
+        for row in fur_rows
+    }
+
+    def selected(value: float) -> bool:
+        lower_ok = term["lower"] is None or value > term["lower"] or (term["lowerInclusive"] and value == term["lower"])
+        upper_ok = term["upper"] is None or value < term["upper"] or (term["upperInclusive"] and value == term["upper"])
+        return lower_ok and upper_ok
+
+    candidate_keys = [key for key in population["materialKeys"] if selected(float(by_key[key][term["field"]]))]
+    aggregate = next(item for item in summary["lineage"]["aggregates"] if item["ruleId"] == rule["ruleId"])
+    assert candidate_keys
+    assert aggregate["inputMaterialKeys"] == candidate_keys
+    assert rule["discovery"]["support"] == len(candidate_keys)
+    ap_rows = list(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-source" / "sts_3ap_3.csv").read_text(encoding="cp949")
+    )))
+    judge_by_hr = {row["hr_coil_id"]: row["judge"] for row in ap_rows if row["hr_coil_id"] != "H006"}
+    defects = sum(judge_by_hr[by_key[key]["hr_coil_id"]] == "불량" for key in candidate_keys)
+    assert rule["discovery"]["defects"] == defects
+    assert rule["discovery"]["crudeRate"] == defects / len(candidate_keys)
+    z = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))["wilsonZ"]
+    n = len(candidate_keys)
+    rate = defects / n
+    denominator = 1 + z * z / n
+    center = (rate + z * z / (2 * n)) / denominator
+    radius = z * math.sqrt(rate * (1 - rate) / n + z * z / (4 * n * n)) / denominator
+    assert rule["discovery"]["crudeRateCiLower"] == pytest.approx(center - radius)
+    assert rule["discovery"]["crudeRateCiUpper"] == pytest.approx(center + radius)
+    assert rule["discovery"]["adjustedRate"] is None
+    assert rule["discovery"]["reasonCode"] == "LOW_SUPPORT"
+
+
+def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
+    vectors = json.loads((CONTRACT / "canonical-number-test-vectors.json").read_text(encoding="utf-8"))
+    assert vectors == [
+        {"name": "integral-float", "hex": "0x1.1800000000000p+10", "expected": "1120"},
+        {"name": "negative-zero", "hex": "-0x0.0p+0", "expected": "0"},
+        {"name": "small-exponent", "hex": "0x1.ad7f29abcaf48p-24", "expected": "1e-7"},
+        {"name": "positive-exponent", "hex": "0x1.5af1d78b58c40p+66", "expected": "1e20"},
+        {"name": "maximum-finite", "hex": "0x1.fffffffffffffp+1023", "expected": "1.7976931348623157e308"},
+    ]
+    for vector in vectors:
+        value = float.fromhex(vector["hex"])
+        encoded = _canonical_json_bytes({"value": value}).decode("utf-8")
+        assert encoded == '{"value":' + vector["expected"] + "}\n"
+    for value in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            _canonical_json_bytes({"value": value})
+
+
+def test_replay_values_reject_wrong_types_missing_keys_and_future_stage_fields():
+    validator = _validator("replay_event_row.schema.json")
+    bad_values = []
+    bad_number = _replay_row()
+    bad_number["values_json"]["tundish_temp"] = "bad"
+    bad_values.append(bad_number)
+    bad_date = _replay_row()
+    bad_date["values_json"]["cast_date"] = False
+    bad_values.append(bad_date)
+    missing_required = _replay_row()
+    missing_required["values_json"].pop("steel_grade")
+    bad_values.append(missing_required)
+    future_value = _replay_row()
+    future_value["values_json"]["f_pre_temp"] = 1080.0
+    bad_values.append(future_value)
+    for bad in bad_values:
+        with pytest.raises(ValidationError):
+            validator.validate(bad)
+
+
+def test_every_replay_stage_has_exact_keys_typed_values_and_explicit_nulls():
+    rendered = _replace_tokens(
+        (CONTRACT / "golden-expectation" / "replay_events.template.csv").read_bytes()
+    ).decode("utf-8")
+    rows = list(csv.DictReader(io.StringIO(rendered)))
+    assert {row["batch_step"] for row in rows} == {
+        "CAST_RECORDED", "FURNACE_CHARGED", "PREHEAT_COMPLETE", "HEAT_COMPLETE",
+        "SOAK_COMPLETE", "FURNACE_EXTRACTED", "RM4_RECORDED", "AP_RECORDED_WITH_RESULT",
+    }
+    invalid_field = {
+        "CAST_RECORDED": "tundish_temp", "FURNACE_CHARGED": "f_jangip_temp",
+        "PREHEAT_COMPLETE": "f_pre_temp", "HEAT_COMPLETE": "f_heat_temp",
+        "SOAK_COMPLETE": "f_sock_temp", "FURNACE_EXTRACTED": "f_ext_date",
+        "RM4_RECORDED": "hr_date", "AP_RECORDED_WITH_RESULT": "judge",
+    }
+    for row in rows:
+        instance = {key: (None if value == "" else value) for key, value in row.items()}
+        instance["replay_hour"] = None if instance["replay_hour"] is None else int(instance["replay_hour"])
+        values_text = instance["values_json"]
+        instance["values_json"] = json.loads(values_text)
+        assert values_text.encode("utf-8") == _canonical_json_bytes(instance["values_json"])[0:-1]
+        validator = _validator("replay_event_row.schema.json")
+        validator.validate(instance)
+
+        missing = copy.deepcopy(instance)
+        missing["values_json"].pop(next(iter(missing["values_json"])))
+        with pytest.raises(ValidationError):
+            validator.validate(missing)
+
+        future = copy.deepcopy(instance)
+        injected = "f_pre_temp" if instance["batch_step"] == "CAST_RECORDED" else "sm_plant"
+        future["values_json"][injected] = None
+        with pytest.raises(ValidationError):
+            validator.validate(future)
+
+        wrong_type = copy.deepcopy(instance)
+        wrong_type["values_json"][invalid_field[instance["batch_step"]]] = False
+        with pytest.raises(ValidationError):
+            validator.validate(wrong_type)
+
+        explicit_nulls = copy.deepcopy(instance)
+        explicit_nulls["values_json"] = {key: None for key in instance["values_json"]}
+        validator.validate(explicit_nulls)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value["lineage"]["materials"][0]["sourceRecords"][0].update(recordNumber=999),
+    lambda value: value["lineage"]["materials"][0]["sourceRecords"][0].update(name="sts_2fur_hr_2.csv"),
+    lambda value: value["lineage"]["fields"][0].update(sourceColumn="not_a_source_column"),
+    lambda value: value["lineage"]["fields"][0].update(firstAvailableStage="HEAT_COMPLETE"),
+    lambda value: value["lineage"]["fields"][1].update(dependencies=["fur_hr.not_a_source_column"]),
+    lambda value: value["lineage"]["fields"][1].update(dependencies=["analysis_summary.driftMetrics[].reference.median"]),
+    lambda value: value["lineage"]["fields"][0].update(sourceRole="sm_cc"),
+    lambda value: value["lineage"]["aggregates"][0].update(split="CONFIRMATION"),
+    lambda value: (
+        value["lineage"]["materials"][0].update(materialKey=SHA_B),
+        value["lineage"]["populations"][0].update(materialKeys=[SHA_B]),
+        value["lineage"]["aggregates"][0].update(inputMaterialKeys=[SHA_B]),
+    ),
+])
+def test_lineage_resolution_rejects_false_or_dangling_provenance(mutation):
+    summary = _summary()
+    mutation(summary)
+    with pytest.raises((AssertionError, ValidationError, KeyError)):
+        _validate_summary_application_contract(summary)
+
+
+def test_only_exact_fixed_role_provenance_tokens_are_accepted():
+    assert set(TOKEN_RE.findall(b" ".join(EXACT_ALLOWED_TOKENS))) == EXACT_ALLOWED_TOKENS
+    for forbidden in (b"@SOURCE_UNKNOWN_SHA256@", b"@ARTIFACT_FAKE_SHA256@", b"@SCHEMA_OTHER_SHA256@"):
+        assert TOKEN_RE.findall(forbidden) == []
+
+
+def test_ranges_below_extreme_support_cannot_enable_tail_flags():
+    artifact = _range_artifact()
+    artifact["ranges"][0]["lowerTailEnabled"] = True
+    with pytest.raises(ValidationError):
+        _validator("equipment_operating_ranges.schema.json").validate(artifact)
 
 
 def test_manifest_roles_are_exactly_ordered_and_unique():
