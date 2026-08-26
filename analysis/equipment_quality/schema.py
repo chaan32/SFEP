@@ -231,7 +231,31 @@ def read_inputs(data_dir: Path) -> InputTables:
 
 
 def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"analysis config numbers must be finite; found {value}")
+    raise ValueError(
+        f"analysis config JSON contains non-standard numeric token: {value}"
+    )
+
+
+def _reject_duplicate_object_members(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(
+                "analysis config JSON contains duplicate object member name: "
+                f"{name}"
+            )
+        result[name] = value
+    return result
+
+
+def _load_strict_json(text: str) -> object:
+    return json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_object_members,
+        parse_constant=_reject_json_constant,
+    )
 
 
 def _hierarchies(
@@ -256,9 +280,7 @@ def load_analysis_config(path: Path) -> AnalysisConfig:
     """Load the complete normative config without unknowns, defaults, or mutation."""
     path = Path(path)
     try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant
-        )
+        payload = _load_strict_json(path.read_text(encoding="utf-8"))
     except UnicodeDecodeError as error:
         raise ValueError("analysis config must be UTF-8") from error
     schema_bytes = importlib.resources.files("equipment_quality").joinpath(

@@ -439,13 +439,83 @@ def test_load_analysis_config_rejects_missing_and_unknown_keys_without_defaults(
         load_analysis_config(path)
 
 
-def test_load_analysis_config_rejects_non_standard_nan_json(tmp_path):
+def test_load_analysis_config_rejects_duplicate_top_level_json_member(tmp_path):
+    text = (ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8")
+    path = tmp_path / "duplicate-top-level.json"
+    path.write_text(
+        text.replace("{", '{"schemaVersion":"not-a-schema",', 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as error:
+        load_analysis_config(path)
+
+    assert str(error.value) == (
+        "analysis config JSON contains duplicate object member name: schemaVersion"
+    )
+
+
+def test_load_analysis_config_rejects_duplicate_nested_json_member(tmp_path):
+    text = (ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8")
+    path = tmp_path / "duplicate-nested.json"
+    path.write_text(
+        text.replace(
+            '"splits":{',
+            '"splits":{"referenceFraction":0.1,',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as error:
+        load_analysis_config(path)
+
+    assert str(error.value) == (
+        "analysis config JSON contains duplicate object member name: referenceFraction"
+    )
+
+
+@pytest.mark.parametrize(
+    "hierarchy_name",
+    ["rangeContextHierarchies", "riskAdjustmentHierarchies"],
+)
+def test_load_analysis_config_rejects_duplicate_equipment_type_json_member(
+    tmp_path, hierarchy_name
+):
+    text = (ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8")
+    marker = f'"{hierarchy_name}":['
+    before, separator, hierarchy_and_rest = text.partition(marker)
+    assert separator == marker
+    hierarchy_and_rest = hierarchy_and_rest.replace(
+        '{"equipmentType":"SM_CC",',
+        '{"equipmentType":"NOT_A_REAL_TYPE","equipmentType":"SM_CC",',
+        1,
+    )
+    path = tmp_path / f"duplicate-{hierarchy_name}.json"
+    path.write_text(before + separator + hierarchy_and_rest, encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        load_analysis_config(path)
+
+    assert str(error.value) == (
+        "analysis config JSON contains duplicate object member name: equipmentType"
+    )
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_load_analysis_config_rejects_non_standard_numeric_tokens_at_parse_time(
+    tmp_path, token
+):
     text = Path("analysis/analysis_config.json").read_text(encoding="utf-8")
     path = tmp_path / "config.json"
-    path.write_text(text.replace("1.959963984540054", "NaN"), encoding="utf-8")
+    path.write_text(text.replace("1.959963984540054", token), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValueError) as error:
         load_analysis_config(path)
+
+    assert str(error.value) == (
+        f"analysis config JSON contains non-standard numeric token: {token}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -576,6 +646,68 @@ def test_every_ambiguous_key_quarantines_all_rows_without_selecting_one(inputs, 
     assert len(matching) == 2
 
 
+def test_overlapping_fur_duplicate_keys_use_primary_composite_reason_once():
+    result = build_genealogy(
+        tables(
+            sm=[],
+            fur=[
+                {
+                    "charge_id": "C-DUP",
+                    "slab_no": "1",
+                    "hr_coil_id": "H-DUP",
+                    "_source_record_number": 41,
+                },
+                {
+                    "charge_id": "C-DUP",
+                    "slab_no": "1",
+                    "hr_coil_id": "H-DUP",
+                    "_source_record_number": 42,
+                },
+            ],
+            ap=[],
+        )
+    )
+
+    assert list(
+        result.quarantine_rows[
+            ["source_role", "source_record_number", "reason"]
+        ].itertuples(index=False, name=None)
+    ) == [
+        ("fur_hr", 41, "DUPLICATE_FUR_HR_KEY"),
+        ("fur_hr", 42, "DUPLICATE_FUR_HR_KEY"),
+    ]
+
+
+def test_overlapping_ap_duplicate_keys_use_primary_join_reason_once():
+    result = build_genealogy(
+        tables(
+            sm=[],
+            fur=[],
+            ap=[
+                {
+                    "hr_coil_id": "H-DUP",
+                    "ap_prod_id": "A-DUP",
+                    "_source_record_number": 61,
+                },
+                {
+                    "hr_coil_id": "H-DUP",
+                    "ap_prod_id": "A-DUP",
+                    "_source_record_number": 62,
+                },
+            ],
+        )
+    )
+
+    assert list(
+        result.quarantine_rows[
+            ["source_role", "source_record_number", "reason"]
+        ].itertuples(index=False, name=None)
+    ) == [
+        ("ap", 61, "DUPLICATE_AP_KEY"),
+        ("ap", 62, "DUPLICATE_AP_KEY"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("role", "inputs", "reason"),
     [
@@ -596,6 +728,113 @@ def test_missing_required_ids_are_quarantined_with_source_specific_reason(
         & (result.quarantine_rows["reason"] == reason)
     ]
     assert len(matching) == 1
+
+
+def test_overlapping_missing_ids_use_primary_genealogy_reason_once():
+    result = build_genealogy(
+        tables(
+            sm=[
+                {
+                    "charge_id": None,
+                    "slab_no": None,
+                    "_source_record_number": 71,
+                }
+            ],
+            fur=[
+                {
+                    "charge_id": None,
+                    "slab_no": None,
+                    "hr_coil_id": None,
+                    "_source_record_number": 72,
+                }
+            ],
+            ap=[
+                {
+                    "hr_coil_id": None,
+                    "ap_prod_id": None,
+                    "_source_record_number": 73,
+                }
+            ],
+        )
+    )
+
+    assert list(
+        result.quarantine_rows[
+            ["source_role", "source_record_number", "reason"]
+        ].itertuples(index=False, name=None)
+    ) == [
+        ("sm_cc", 71, "MISSING_SM_CC_KEY"),
+        ("fur_hr", 72, "MISSING_FUR_HR_KEY"),
+        ("ap", 73, "MISSING_AP_HR_COIL_ID"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "input_factory",
+    [
+        pytest.param(
+            lambda: tables(
+                sm=[
+                    {"charge_id": "C1", "slab_no": "1"},
+                    {"charge_id": "C1", "slab_no": "1"},
+                ],
+                fur=[],
+                ap=[],
+            ),
+            id="sm-duplicate",
+        ),
+        pytest.param(
+            lambda: tables(
+                sm=[],
+                fur=[
+                    {"charge_id": "C1", "slab_no": "1", "hr_coil_id": "H1"},
+                    {"charge_id": "C1", "slab_no": "1", "hr_coil_id": "H1"},
+                ],
+                ap=[],
+            ),
+            id="fur-overlapping-duplicates",
+        ),
+        pytest.param(
+            lambda: tables(
+                sm=[],
+                fur=[],
+                ap=[
+                    {"hr_coil_id": "H1", "ap_prod_id": "A1"},
+                    {"hr_coil_id": "H1", "ap_prod_id": "A1"},
+                ],
+            ),
+            id="ap-overlapping-duplicates",
+        ),
+        pytest.param(
+            lambda: tables(
+                sm=[{"charge_id": None, "slab_no": None}],
+                fur=[{"charge_id": None, "slab_no": None, "hr_coil_id": None}],
+                ap=[{"hr_coil_id": None, "ap_prod_id": None}],
+            ),
+            id="overlapping-missing-ids",
+        ),
+        pytest.param(
+            lambda: tables(
+                sm=[{"cast_date": "2025-01-03"}],
+                fur=[{"f_ext_date": "2025-01-02", "hr_date": "2025-01-04"}],
+                ap=[{"ap_date": "2025-01-05"}],
+            ),
+            id="impossible-date-linked-chain",
+        ),
+        pytest.param(tables_with_unlinked_sm_and_ap, id="unlinked-branches"),
+    ],
+)
+def test_every_quarantine_source_record_pair_is_unique_for_adversarial_branches(
+    input_factory,
+):
+    result = build_genealogy(input_factory())
+    pairs = list(
+        result.quarantine_rows[
+            ["source_role", "source_record_number"]
+        ].itertuples(index=False, name=None)
+    )
+
+    assert len(pairs) == len(set(pairs))
 
 
 def test_unlinked_fur_is_not_replayed_and_unlinked_source_rows_are_audited():
@@ -806,3 +1045,27 @@ def test_quarantine_rows_have_stable_role_record_reason_order():
     )
     role_rank = {"sm_cc": 0, "fur_hr": 1, "ap": 2}
     assert actual == sorted(actual, key=lambda row: (role_rank[row[0]], row[1], row[2]))
+
+
+@pytest.mark.real_data
+def test_approved_real_snapshot_quarantine_uses_51_unique_source_records():
+    data_dir_value = os.environ.get("SFEP_STEEL_DATA_DIR")
+    if data_dir_value is None:
+        pytest.skip("SFEP_STEEL_DATA_DIR is required for the approved real snapshot")
+
+    inputs = read_inputs(Path(data_dir_value))
+    assert tuple(source.sha256 for source in inputs.sources) == (
+        "sha256:0cd3e91428c005dae1785b9af01d30e3d08230e2058c68693c9aa7ffee043075",
+        "sha256:c2bb0b503ec30b0e01e00d2bd88fde536479de59aebf1eae84131380d58f3bcf",
+        "sha256:ff4572a1302459787ddca7458857864182d969e45b6a81edc4241bc47549801d",
+    )
+    result = build_genealogy(inputs)
+    pairs = list(
+        result.quarantine_rows[
+            ["source_role", "source_record_number"]
+        ].itertuples(index=False, name=None)
+    )
+
+    assert len(result.quarantine_rows) == 51
+    assert len(pairs) == len(set(pairs)) == 51
+    assert sum(result.audit["quarantine"].values()) == 51

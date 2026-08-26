@@ -30,6 +30,36 @@ _QUARANTINE_COLUMNS = [
     "ap_prod_id",
 ]
 
+# A source record can violate more than one rule.  Keep exactly one audit row,
+# choosing the earliest applicable reason below: missing primary genealogy IDs,
+# missing secondary IDs, primary join/composite duplicates, secondary identity
+# duplicates, then structural/linkage failures.  In particular, a FUR composite
+# collision is primary to its coil collision, and an AP join-key collision is
+# primary to its product-ID collision.  Looking up every reason in this table
+# also makes an undocumented future reason fail closed.
+_QUARANTINE_REASON_PRECEDENCE = {
+    reason: rank
+    for rank, reason in enumerate(
+        (
+            "MISSING_SM_CC_KEY",
+            "MISSING_FUR_HR_KEY",
+            "MISSING_AP_HR_COIL_ID",
+            "MISSING_FUR_HR_COIL_ID",
+            "MISSING_AP_PROD_ID",
+            "DUPLICATE_SM_CC_KEY",
+            "DUPLICATE_FUR_HR_KEY",
+            "DUPLICATE_AP_KEY",
+            "DUPLICATE_FUR_HR_COIL_KEY",
+            "DUPLICATE_AP_PROD_ID",
+            "INVALID_FUR_HR_DATE",
+            "IMPOSSIBLE_STAGE_DATE_ORDER",
+            "UNLINKED_SM_CC",
+            "UNLINKED_FUR_HR",
+            "UNLINKED_AP",
+        )
+    )
+}
+
 
 def _missing(value: object) -> bool:
     if value is None:
@@ -123,21 +153,27 @@ def build_genealogy(inputs: InputTables) -> GenealogyResult:
         inputs.ap,
         ("hr_coil_id", "ap_prod_id", "ap_date", "judge", "_source_record_number"),
     )
-    quarantine: list[dict[str, object]] = []
+    quarantine_by_record: dict[tuple[str, int], dict[str, object]] = {}
 
     def add_quarantine(role: str, row: pd.Series, reason: str) -> None:
-        quarantine.append(
-            {
-                "source_role": role,
-                "source_name": sources[role].name,
-                "source_record_number": _record_number(row, role),
-                "reason": reason,
-                "charge_id": row.get("charge_id"),
-                "slab_no": row.get("slab_no"),
-                "hr_coil_id": row.get("hr_coil_id"),
-                "ap_prod_id": row.get("ap_prod_id"),
-            }
-        )
+        precedence = _QUARANTINE_REASON_PRECEDENCE[reason]
+        record_number = _record_number(row, role)
+        candidate = {
+            "source_role": role,
+            "source_name": sources[role].name,
+            "source_record_number": record_number,
+            "reason": reason,
+            "charge_id": row.get("charge_id"),
+            "slab_no": row.get("slab_no"),
+            "hr_coil_id": row.get("hr_coil_id"),
+            "ap_prod_id": row.get("ap_prod_id"),
+        }
+        key = (role, record_number)
+        existing = quarantine_by_record.get(key)
+        if existing is None or precedence < (
+            _QUARANTINE_REASON_PRECEDENCE[str(existing["reason"])]
+        ):
+            quarantine_by_record[key] = candidate
 
     sm_key_valid = pd.Series(
         [not _missing(row["charge_id"]) and not _missing(row["slab_no"]) for _, row in sm.iterrows()],
@@ -341,6 +377,7 @@ def build_genealogy(inputs: InputTables) -> GenealogyResult:
         )
     lineage_rows = pd.DataFrame(lineage_records)
 
+    quarantine = list(quarantine_by_record.values())
     quarantine.sort(
         key=lambda item: (
             _ROLE_RANK[str(item["source_role"])],
