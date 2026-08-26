@@ -221,6 +221,7 @@ def _validate_summary_application_contract(summary: dict) -> None:
             row = source_rows[role][record_index]
             if role == "sm_cc":
                 assert row["charge_id"].strip() == material["chargeId"]
+                assert row["slab_no"].strip() == material["slabNo"]
             elif role == "fur_hr":
                 assert row["charge_id"].strip() == material["chargeId"]
                 assert row["slab_no"].strip() == material["slabNo"]
@@ -560,7 +561,7 @@ def _replay_row() -> dict:
             "sm_plant": "SM1", "steel_grade": "STS304", "steel_usage": "A",
             "cc_gubun": "CC1", "slab_gubun": "NORMAL", "tundish_temp": 1540.0,
             "mlac_ratio": 0.92, "delta_ferrite": 7.1, "ingre_cr": 18.2,
-            "ingre_ni": 8.1, "ingre_s": 0.005, "slab_grind": 0.0,
+            "ingre_ni": 8.1, "ingre_s": 0.005, "slab_grind": "HSHS",
             "cast_date": "2025-01-01",
         },
     }
@@ -689,6 +690,15 @@ def test_lineage_application_validation_rejects_broken_counts_refs_and_sorting()
     unsorted["lineage"]["materials"].append(second)
     with pytest.raises(AssertionError):
         _validate_summary_application_contract(unsorted)
+
+
+def test_sm_lineage_source_record_must_match_both_composite_key_parts():
+    wrong_slab_record = _summary()
+    wrong_slab_record["lineage"]["materials"][0]["sourceRecords"][0][
+        "recordNumber"
+    ] = 3
+    with pytest.raises(AssertionError):
+        _validate_summary_application_contract(wrong_slab_record)
 
 
 def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and_lineage():
@@ -981,6 +991,56 @@ def test_analysis_config_contains_the_exact_quality_analysis_v1_policy():
     assert {entry["field"]: entry["firstAvailableStage"] for entry in config["fields"]}["judge"] == "AP_RECORDED_WITH_RESULT"
 
 
+def test_slab_grind_config_is_categorical_product_state_evidence():
+    config = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))
+    slab_grind = next(field for field in config["fields"] if field["field"] == "slab_grind")
+    assert slab_grind == {
+        "field": "slab_grind",
+        "sourceRole": "sm_cc",
+        "sourceColumn": "slab_grind",
+        "dataType": "STRING",
+        "featureRole": "PRODUCT_STATE_REFERENCE",
+        "equipmentType": "SM_CC",
+        "firstAvailableStage": "CAST_RECORDED",
+        "evidenceFamily": "DIMENSIONS",
+        "dependencies": [],
+    }
+
+
+def test_slab_grind_replay_and_semantic_golden_use_a_categorical_code():
+    validator = _validator("replay_event_row.schema.json")
+    categorical = _replay_row()
+    categorical["values_json"]["slab_grind"] = "HSHS"
+    validator.validate(categorical)
+
+    numeric = _replay_row()
+    numeric["values_json"]["slab_grind"] = 0.0
+    with pytest.raises(ValidationError):
+        validator.validate(numeric)
+
+    source_row = next(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-source" / "sts_1sm_cc_1.csv").read_text(encoding="cp949")
+    )))
+    replay_rows = list(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-expectation" / "replay_events.template.csv").read_text(
+            encoding="utf-8"
+        )
+    )))
+    cast_values = json.loads(replay_rows[0]["values_json"])
+    projection = [
+        json.loads(line)
+        for line in (
+            CONTRACT / "golden-expectation" / "criteria_projection.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    mature_features = next(
+        item["features"] for item in projection if item["kind"] == "MATURE_QUALITY_INPUT"
+    )
+    assert source_row["slab_grind"] == "HSHS"
+    assert cast_values["slab_grind"] == "HSHS"
+    assert mature_features["slab_grind"] == "HSHS"
+
+
 def test_id_vectors_match_literal_preimages_and_independent_sha256():
     vectors = json.loads((CONTRACT / "id-test-vectors.json").read_text(encoding="utf-8"))
     assert vectors["materialKey"]["expected"] == (
@@ -994,18 +1054,42 @@ def test_id_vectors_match_literal_preimages_and_independent_sha256():
 
 def test_golden_sources_are_cp949_have_exact_headers_and_cover_edge_populations():
     expected = {
-        "sts_1sm_cc_1.csv": "sm_plant,charge_id,steel_grade",
-        "sts_2fur_hr_2.csv": "charge_id,slab_no,furnace_no",
-        "sts_3ap_3.csv": "judge,hr_coil_id,ap_plant",
+        "sts_1sm_cc_1.csv": (
+            "sm_plant", "charge_id", "steel_grade", "steel_usage", "delta_ferrite",
+            "ingre_cr", "ingre_ni", "ingre_s", "cast_date", "cc_gubun",
+            "tundish_temp", "mlac_ratio", "slab_no", "slab_gubun", "slab_grind",
+        ),
+        "sts_2fur_hr_2.csv": (
+            "charge_id", "slab_no", "furnace_no", "f_jangip_gubun",
+            "f_jangip_temp", "f_bfg", "f_cog", "f_ldg", "f_bfg_per",
+            "f_cog_per", "f_ldg_per", "f_pre_temp", "f_heat_temp", "f_sock_temp",
+            "f_pre_interval", "f_heat_interval", "f_sock_interval", "f_ext_date",
+            "f_ext_time", "hr_coil_id", "hr_date", "hr_thick", "hr_width",
+            "rm4_temp", "rm_pitch", "slab_width",
+        ),
+        "sts_3ap_3.csv": (
+            "judge", "hr_coil_id", "ap_plant", "ap_prod_id", "ap_date", "ap_shift",
+            "ap_thick", "ap_width", "ap_line_speed",
+        ),
     }
     decoded = {}
-    for name, prefix in expected.items():
+    for name, exact_header in expected.items():
         raw = (CONTRACT / "golden-source" / name).read_bytes()
         text = raw.decode("cp949")
-        assert text.splitlines()[0].startswith(prefix)
+        records = list(csv.reader(io.StringIO(text)))
+        assert tuple(records[0]) == exact_header
         assert "\ufffd" not in text
         decoded[name] = list(csv.DictReader(io.StringIO(text)))
+    sm = decoded["sts_1sm_cc_1.csv"]
     fur = decoded["sts_2fur_hr_2.csv"]
+    assert {(row["charge_id"], row["slab_no"]) for row in sm} == {
+        ("CH1", "1"), ("CH1", "2"), ("CH2", "1"), ("CH2", "2"),
+        ("CH3", "1"), ("CH3", "2"), ("CH4", "1"), ("CH4", "2"),
+        ("CH5", "1"), ("CH5", "2"), ("CH6", "1"), ("CH6", "2"),
+    }
+    assert {(row["charge_id"], row["slab_no"]) for row in sm} == {
+        (row["charge_id"], row["slab_no"]) for row in fur
+    }
     assert len({(row["charge_id"], row["slab_no"]) for row in fur}) == 12
     assert {row["furnace_no"] for row in fur} == {"1", "2", "3", "4"}
     ap = decoded["sts_3ap_3.csv"]
