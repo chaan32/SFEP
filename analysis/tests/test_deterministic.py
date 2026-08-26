@@ -6,6 +6,7 @@ import random
 import struct
 import time
 from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -48,10 +49,30 @@ def test_canonical_json_uses_global_lexicographic_tie_break_for_smallest_normal(
     assert canonical_json_bytes(smallest_normal) == b"22250738585072012e-324\n"
 
 
-def test_canonical_json_uses_equal_length_18_digit_lexicographic_alternative():
-    value = float.fromhex("0x1.6345785d8a03fp+56")
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (float.fromhex("0x1.6345785d8a03fp+56"), b"100000000000001001\n"),
+        (-float.fromhex("0x1.6345785d8a03fp+56"), b"-100000000000001001\n"),
+    ],
+)
+def test_canonical_json_uses_equal_length_18_digit_lexicographic_alternative(value, expected):
+    assert canonical_json_bytes(value) == expected
 
-    assert canonical_json_bytes(value) == b"100000000000001008\n"
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (float(2**53), b"9007199254740992\n"),
+        (-float(2**53), b"-9007199254740992\n"),
+        (float(2**54), b"18014398509481983\n"),
+        (-float(2**54), b"-18014398509481983\n"),
+        (float.fromhex("0x1.0000000000001p+54"), b"18014398509481987\n"),
+        (-float.fromhex("0x1.0000000000001p+54"), b"-18014398509481987\n"),
+    ],
+)
+def test_canonical_json_uses_integral_float_rounding_interval_and_ties(value, expected):
+    assert canonical_json_bytes(value) == expected
 
 
 def test_canonical_json_rejects_nested_non_finite_numbers():
@@ -151,6 +172,45 @@ def test_canonical_json_matches_independent_exhaustive_short_decimal_oracle():
                         oracle[parsed] = signed
 
     for value, expected in oracle.items():
+        assert canonical_json_bytes(value) == (expected + "\n").encode("utf-8")
+
+
+def test_canonical_json_matches_independent_integral_rounding_interval_oracle():
+    values = []
+    for binary_exponent in range(54, 61):
+        ulp = 1 << (binary_exponent - 52)
+        values.extend(float((1 << binary_exponent) + offset * ulp) for offset in range(8))
+
+    for value in [*values, *[-item for item in values]]:
+        magnitude = abs(value)
+        target = Fraction.from_float(magnitude)
+        lower = (target + Fraction.from_float(math.nextafter(magnitude, -math.inf))) / 2
+        following = math.nextafter(magnitude, math.inf)
+        upper = (target + Fraction.from_float(following)) / 2
+        candidates = []
+        maximum_length = len(str(int(magnitude))) + (1 if value < 0 else 0)
+        for scale in range(maximum_length + 1):
+            divisor = 10**scale
+            first = (lower.numerator // (lower.denominator * divisor)) - 1
+            last = (upper.numerator // (upper.denominator * divisor)) + 1
+            for coefficient in range(max(1, first), last + 1):
+                if coefficient % 10 == 0:
+                    continue
+                digits = str(coefficient)
+                spellings = [digits + ("0" * scale)]
+                for decimal_point in range(1, len(digits) + 1):
+                    mantissa = (
+                        digits
+                        if decimal_point == len(digits)
+                        else digits[:decimal_point] + "." + digits[decimal_point:]
+                    )
+                    spellings.append(f"{mantissa}e{scale + len(digits) - decimal_point}")
+                for spelling in spellings:
+                    signed = spelling if value > 0 else "-" + spelling
+                    if len(signed) <= maximum_length and float(signed) == value:
+                        candidates.append(signed)
+        expected = min(candidates, key=lambda candidate: (len(candidate), candidate))
+
         assert canonical_json_bytes(value) == (expected + "\n").encode("utf-8")
 
 

@@ -147,7 +147,6 @@ def _canonical_float(number: float) -> str:
     lower, upper = _rounding_interval(magnitude)
     prefix = "-" if negative else ""
     max_digits = best_key[0] - len(prefix)
-    exact_integer = int(magnitude) if magnitude.is_integer() else None
 
     for digits_count in range(1, max_digits + 1):
         for exponent in _feasible_exponents(lower, upper, digits_count):
@@ -156,25 +155,12 @@ def _canonical_float(number: float) -> str:
             coefficients = list(_first_feasible_coefficients(
                 lower, upper, exponent, digits_count
             ))
-            if exact_integer is not None and exponent >= 0:
-                power = _POWER10[exponent] if exponent < len(_POWER10) else 10**exponent
-                if exact_integer % power == 0:
-                    exact_coefficient = exact_integer // power
-                    if len(str(exact_coefficient)) == digits_count:
-                        coefficients.append(exact_coefficient)
             for coefficient in sorted(set(coefficients)):
                 if coefficient % 10 == 0:
                     continue
                 for spelling in _decimal_spellings(
                     coefficient, exponent, best_key[0] - len(prefix)
                 ):
-                    if (
-                        exact_integer is not None
-                        and "." not in spelling
-                        and "e" not in spelling
-                        and int(spelling) != exact_integer
-                    ):
-                        continue
                     candidate = prefix + spelling
                     candidate_key = (len(candidate.encode("utf-8")), candidate.encode("utf-8"))
                     if candidate_key <= best_key and float(candidate) == number:
