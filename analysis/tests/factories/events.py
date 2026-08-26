@@ -118,7 +118,6 @@ def two_furnaces_same_hour() -> GenealogyResult:
         }
     )
     for row in (first, second):
-        row["cast_date"] = None
         row["ap_prod_id"] = None
         row["ap_date"] = None
         row["ap_record_number"] = None

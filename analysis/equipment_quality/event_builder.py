@@ -15,6 +15,7 @@ import pandas as pd
 
 from equipment_quality.deterministic import canonical_json_bytes, digest_json_id
 from equipment_quality.models import AnalysisConfig, GenealogyResult
+from equipment_quality.schema import validate_normative_instance
 
 
 _SCHEMA_VERSION = "sfep-replay-events/v1"
@@ -156,6 +157,31 @@ class ReplayEvent:
             raise ValueError("event_id does not match event semantics")
         object.__setattr__(self, "values_json", _immutable_values(self.values_json))
 
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.schema_version,
+                self.bundle_id,
+                self.criteria_id,
+                self.event_id,
+                self.replay_date,
+                self.replay_hour,
+                self.batch_kind,
+                self.batch_id,
+                self.equipment_batch_id,
+                self.batch_step,
+                self.time_precision,
+                self.material_key,
+                self.equipment_type,
+                self.equipment_id,
+                self.charge_id,
+                self.slab_no,
+                self.hr_coil_id,
+                self.ap_prod_id,
+                canonical_json_bytes(self.values_json),
+            )
+        )
+
 
 def _non_empty_string(value: object, label: str) -> str:
     if type(value) is not str or not value or value.strip() != value:
@@ -254,7 +280,7 @@ class _DigestRegistry:
         *,
         event: bool = False,
     ) -> str:
-        digest = digest_json_id(namespace, value)
+        digest = _validated_digest_json_id(namespace, value)
         preimage = namespace.encode("utf-8") + b"\n" + canonical_json_bytes(value)
         prior = self.preimages.get(digest)
         if prior is not None:
@@ -267,6 +293,15 @@ class _DigestRegistry:
         return digest
 
 
+def _validated_digest_json_id(
+    namespace: str, value: Mapping[str, object]
+) -> str:
+    return _sha256(
+        digest_json_id(namespace, value),
+        "digest_json_id result",
+    )
+
+
 def _digest(
     namespace: str,
     value: Mapping[str, object],
@@ -275,7 +310,7 @@ def _digest(
     event: bool = False,
 ) -> str:
     if registry is None:
-        return digest_json_id(namespace, value)
+        return _validated_digest_json_id(namespace, value)
     return registry.digest(namespace, value, event=event)
 
 
@@ -459,6 +494,73 @@ def _event_sort_key(event: ReplayEvent) -> tuple[object, ...]:
     )
 
 
+@dataclass(frozen=True)
+class _ReplayRowSnapshot:
+    row: Mapping[str, object]
+    material_identity: tuple[str, str]
+    cast_date: date
+    sm_plant: str
+    furnace_date: date
+    furnace_hour: int
+    furnace_no: str
+    hr_coil_id: str
+
+
+@dataclass(frozen=True)
+class _QualityRowSnapshot:
+    row: Mapping[str, object]
+    material_identity: tuple[str, str]
+    ap_date: date
+    ap_plant: str
+    ap_prod_id: str
+
+
+def _required_date(row: Mapping[str, object], field: str) -> date:
+    value = row.get(field)
+    if _missing(value):
+        raise ValueError(f"{field} is required for replay scheduling")
+    return _exact_date(value, field)
+
+
+def _required_hour(row: Mapping[str, object], field: str) -> int:
+    value = row.get(field)
+    if _missing(value):
+        raise ValueError(f"{field} is required for replay scheduling")
+    return _hour(value, field)
+
+
+def _snapshot_replay_row(row: Mapping[str, object]) -> _ReplayRowSnapshot:
+    copied = MappingProxyType(dict(row))
+    charge = _non_empty_string(copied.get("charge_id"), "charge_id")
+    slab = _non_empty_string(copied.get("slab_no"), "slab_no")
+    furnace = _non_empty_string(copied.get("furnace_no"), "furnace_no")
+    if _FURNACE_NUMBER.fullmatch(furnace) is None:
+        raise ValueError("furnace_no must be 1..4 or 1호기..4호기")
+    return _ReplayRowSnapshot(
+        row=copied,
+        material_identity=(charge, slab),
+        cast_date=_required_date(copied, "cast_date"),
+        sm_plant=_non_empty_string(copied.get("sm_plant"), "sm_plant"),
+        furnace_date=_required_date(copied, "f_ext_date"),
+        furnace_hour=_required_hour(copied, "f_ext_time"),
+        furnace_no=furnace,
+        hr_coil_id=_non_empty_string(copied.get("hr_coil_id"), "hr_coil_id"),
+    )
+
+
+def _snapshot_quality_row(row: Mapping[str, object]) -> _QualityRowSnapshot:
+    copied = MappingProxyType(dict(row))
+    charge = _non_empty_string(copied.get("charge_id"), "quality charge_id")
+    slab = _non_empty_string(copied.get("slab_no"), "quality slab_no")
+    return _QualityRowSnapshot(
+        row=copied,
+        material_identity=(charge, slab),
+        ap_date=_required_date(copied, "ap_date"),
+        ap_plant=_non_empty_string(copied.get("ap_plant"), "ap_plant"),
+        ap_prod_id=_non_empty_string(copied.get("ap_prod_id"), "ap_prod_id"),
+    )
+
+
 def _make_event(
     *,
     row: Mapping[str, object],
@@ -535,100 +637,100 @@ def build_replay_events(
     bundle = _sha256(bundle_id, "bundle_id")
     criteria = _sha256(criteria_id, "criteria_id")
     fields_by_stage = _stage_fields(config)
-    registry = _DigestRegistry(preimages={})
-    events: list[ReplayEvent] = []
-    rows = tuple(genealogy.replay_rows.to_dict(orient="records"))
-    quality_rows = tuple(genealogy.quality_rows.to_dict(orient="records"))
-    replay_keys = {
-        (
-            _non_empty_string(row.get("charge_id"), "charge_id"),
-            _non_empty_string(row.get("slab_no"), "slab_no"),
-        )
-        for row in rows
-    }
-    quality_keys_list = [
-        (
-            _non_empty_string(row.get("charge_id"), "quality charge_id"),
-            _non_empty_string(row.get("slab_no"), "quality slab_no"),
-        )
-        for row in quality_rows
-    ]
+    rows = tuple(
+        _snapshot_replay_row(row)
+        for row in genealogy.replay_rows.to_dict(orient="records")
+    )
+    quality_rows = tuple(
+        _snapshot_quality_row(row)
+        for row in genealogy.quality_rows.to_dict(orient="records")
+    )
+    replay_keys = {row.material_identity for row in rows}
+    quality_keys_list = [row.material_identity for row in quality_rows]
     if len(set(quality_keys_list)) != len(quality_keys_list):
         raise ValueError("quality rows must contain unique material identities")
-    quality_keys = set(quality_keys_list)
+    quality_by_key = {
+        row.material_identity: row
+        for row in quality_rows
+    }
+    quality_keys = set(quality_by_key)
     if not quality_keys.issubset(replay_keys):
         raise ValueError("quality rows must be a subset of replay rows")
-    for row in rows:
-        row_key = (
-            _non_empty_string(row.get("charge_id"), "charge_id"),
-            _non_empty_string(row.get("slab_no"), "slab_no"),
-        )
+    registry = _DigestRegistry(preimages={})
+    events: list[ReplayEvent] = []
+    for snapshot in rows:
+        row = snapshot.row
+        row_key = snapshot.material_identity
         material = _material_key(*row_key, registry)
 
-        cast_date = row.get("cast_date")
-        if not _missing(cast_date):
-            cast_day = _exact_date(cast_date, "cast_date")
-            cast_batch = _batch_id("CAST_DAY", cast_day, None, registry)
+        cast_batch = _batch_id("CAST_DAY", snapshot.cast_date, None, registry)
+        events.append(
+            _make_event(
+                row=row, bundle_id_value=bundle, criteria_id_value=criteria,
+                replay_date=snapshot.cast_date, replay_hour=None, batch_kind="CAST_DAY",
+                batch_value=cast_batch, batch_step="CAST_RECORDED",
+                time_precision="DAY", equipment_type="SM_CC",
+                equipment_id_value=snapshot.sm_plant,
+                equipment_batch_value=None, material_value=material,
+                stage_fields=fields_by_stage["CAST_RECORDED"],
+                registry=registry,
+            )
+        )
+
+        furnace_batch = _batch_id(
+            "FURNACE_HOUR", snapshot.furnace_date, snapshot.furnace_hour, registry
+        )
+        furnace_equipment_batch = _equipment_batch_id(
+            furnace_batch, "FURNACE", snapshot.furnace_no, registry
+        )
+        for stage in _FURNACE_STAGES:
+            is_rm4 = stage == "RM4_RECORDED"
             events.append(
                 _make_event(
                     row=row, bundle_id_value=bundle, criteria_id_value=criteria,
-                    replay_date=cast_day, replay_hour=None, batch_kind="CAST_DAY",
-                    batch_value=cast_batch, batch_step="CAST_RECORDED",
-                    time_precision="DAY", equipment_type="SM_CC",
-                    equipment_id_value=_non_empty_string(row.get("sm_plant"), "sm_plant"),
-                    equipment_batch_value=None, material_value=material,
-                    stage_fields=fields_by_stage["CAST_RECORDED"],
+                    replay_date=snapshot.furnace_date,
+                    replay_hour=snapshot.furnace_hour,
+                    batch_kind="FURNACE_HOUR", batch_value=furnace_batch,
+                    batch_step=stage,
+                    time_precision="SEQUENCE_ONLY" if is_rm4 else "HOUR_BUCKET",
+                    equipment_type="RM4" if is_rm4 else "FURNACE",
+                    equipment_id_value=(
+                        "RM4_PROCESS" if is_rm4 else snapshot.furnace_no
+                    ),
+                    equipment_batch_value=(
+                        None if is_rm4 else furnace_equipment_batch
+                    ),
+                    material_value=material, stage_fields=fields_by_stage[stage],
                     registry=registry,
                 )
             )
 
-        furnace_date = row.get("f_ext_date")
-        furnace_hour = row.get("f_ext_time")
-        if not _missing(furnace_date) and not _missing(furnace_hour):
-            replay_day = _exact_date(furnace_date, "f_ext_date")
-            replay_hour = _hour(furnace_hour, "f_ext_time")
-            furnace_batch = _batch_id(
-                "FURNACE_HOUR", replay_day, replay_hour, registry
-            )
-            furnace_id = _non_empty_string(row.get("furnace_no"), "furnace_no")
-            furnace_equipment_batch = _equipment_batch_id(
-                furnace_batch, "FURNACE", furnace_id, registry
-            )
-            for stage in _FURNACE_STAGES:
-                is_rm4 = stage == "RM4_RECORDED"
-                events.append(
-                    _make_event(
-                        row=row, bundle_id_value=bundle, criteria_id_value=criteria,
-                        replay_date=replay_day, replay_hour=replay_hour,
-                        batch_kind="FURNACE_HOUR", batch_value=furnace_batch,
-                        batch_step=stage,
-                        time_precision="SEQUENCE_ONLY" if is_rm4 else "HOUR_BUCKET",
-                        equipment_type="RM4" if is_rm4 else "FURNACE",
-                        equipment_id_value="RM4_PROCESS" if is_rm4 else furnace_id,
-                        equipment_batch_value=None if is_rm4 else furnace_equipment_batch,
-                        material_value=material, stage_fields=fields_by_stage[stage],
-                        registry=registry,
-                    )
-                )
-
-        ap_date = row.get("ap_date")
         if row_key in quality_keys:
-            if _missing(ap_date):
-                raise ValueError("AP quality row requires ap_date")
-            ap_day = _exact_date(ap_date, "ap_date")
-            ap_batch = _batch_id("AP_DAY", ap_day, None, registry)
+            quality = quality_by_key[row_key]
+            ap_row = dict(row)
+            for name, _ in fields_by_stage["AP_RECORDED_WITH_RESULT"]:
+                ap_row[name] = quality.row.get(name)
+            ap_row["ap_date"] = quality.ap_date
+            ap_row["ap_plant"] = quality.ap_plant
+            ap_row["ap_prod_id"] = quality.ap_prod_id
+            ap_batch = _batch_id("AP_DAY", quality.ap_date, None, registry)
             events.append(
                 _make_event(
-                    row=row, bundle_id_value=bundle, criteria_id_value=criteria,
-                    replay_date=ap_day, replay_hour=None, batch_kind="AP_DAY",
+                    row=ap_row, bundle_id_value=bundle, criteria_id_value=criteria,
+                    replay_date=quality.ap_date, replay_hour=None, batch_kind="AP_DAY",
                     batch_value=ap_batch, batch_step="AP_RECORDED_WITH_RESULT",
                     time_precision="DAY", equipment_type="AP",
-                    equipment_id_value=_non_empty_string(row.get("ap_plant"), "ap_plant"),
+                    equipment_id_value=quality.ap_plant,
                     equipment_batch_value=None, material_value=material,
                     stage_fields=fields_by_stage["AP_RECORDED_WITH_RESULT"],
                     registry=registry,
                 )
             )
+    expected_count = 7 * len(rows) + len(quality_rows)
+    if len(events) != expected_count:
+        raise RuntimeError(
+            f"replay event cardinality mismatch: expected {expected_count}, got {len(events)}"
+        )
     return sorted(events, key=_event_sort_key)
 
 
@@ -636,12 +738,38 @@ def serialize_replay_events(events: Sequence[ReplayEvent]) -> bytes:
     """Serialize an already strictly sorted event stream as normative CSV bytes."""
     snapshot = tuple(events)
     registry = _DigestRegistry(preimages={})
-    rows: list[tuple[object, ...]] = []
     prior_sort_key: tuple[object, ...] | None = None
     envelope_identity: tuple[str, str] | None = None
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(_CSV_FIELDS)
     for event in snapshot:
         if type(event) is not ReplayEvent:
             raise TypeError("replay CSV input must contain exact ReplayEvent instances")
+        values = _immutable_values(event.values_json)
+        replay_date = _exact_date(event.replay_date, "replay_date")
+        row = {
+            "schema_version": event.schema_version,
+            "bundle_id": event.bundle_id,
+            "criteria_id": event.criteria_id,
+            "event_id": event.event_id,
+            "replay_date": replay_date.isoformat(),
+            "replay_hour": event.replay_hour,
+            "batch_kind": event.batch_kind,
+            "batch_id": event.batch_id,
+            "equipment_batch_id": event.equipment_batch_id,
+            "batch_step": event.batch_step,
+            "time_precision": event.time_precision,
+            "material_key": event.material_key,
+            "equipment_type": event.equipment_type,
+            "equipment_id": event.equipment_id,
+            "charge_id": event.charge_id,
+            "slab_no": event.slab_no,
+            "hr_coil_id": event.hr_coil_id,
+            "ap_prod_id": event.ap_prod_id,
+            "values_json": dict(values),
+        }
+        validate_normative_instance("replay_event_row.schema.json", row)
         current_identity = (event.bundle_id, event.criteria_id)
         if envelope_identity is None:
             envelope_identity = current_identity
@@ -655,38 +783,33 @@ def serialize_replay_events(events: Sequence[ReplayEvent]) -> bytes:
         if prior_sort_key is not None and sort_key <= prior_sort_key:
             raise ValueError("replay events must be strictly monotonic by the exact sort tuple")
         prior_sort_key = sort_key
-        values_bytes = canonical_json_bytes(event.values_json)
+        values_bytes = canonical_json_bytes(values)
         if not values_bytes.endswith(b"\n"):
             raise ValueError("canonical values_json must end with LF")
         values_text = values_bytes[:-1].decode("utf-8")
-        rows.append(
+        writer.writerow(
             (
-                event.schema_version,
-                event.bundle_id,
-                event.criteria_id,
-                event.event_id,
-                event.replay_date.isoformat(),
-                event.replay_hour,
-                event.batch_kind,
-                event.batch_id,
-                event.equipment_batch_id,
-                event.batch_step,
-                event.time_precision,
-                event.material_key,
-                event.equipment_type,
-                event.equipment_id,
-                event.charge_id,
-                event.slab_no,
-                event.hr_coil_id,
-                event.ap_prod_id,
+                row["schema_version"],
+                row["bundle_id"],
+                row["criteria_id"],
+                row["event_id"],
+                row["replay_date"],
+                row["replay_hour"],
+                row["batch_kind"],
+                row["batch_id"],
+                row["equipment_batch_id"],
+                row["batch_step"],
+                row["time_precision"],
+                row["material_key"],
+                row["equipment_type"],
+                row["equipment_id"],
+                row["charge_id"],
+                row["slab_no"],
+                row["hr_coil_id"],
+                row["ap_prod_id"],
                 values_text,
             )
         )
-
-    output = io.StringIO(newline="")
-    writer = csv.writer(output, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
-    writer.writerow(_CSV_FIELDS)
-    writer.writerows(rows)
     return output.getvalue().encode("utf-8")
 
 

@@ -11,11 +11,15 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import numpy as np
 import pytest
-from jsonschema import FormatChecker
+from jsonschema import FormatChecker, ValidationError
 from jsonschema.validators import validator_for
 
 from equipment_quality import event_builder
@@ -134,8 +138,9 @@ def test_same_hour_all_furnaces_advance_in_lockstep_with_raw_equipment_ids():
     events = build_replay_events(
         two_furnaces_same_hour(), BUNDLE_ID, CRITERIA_ID, analysis_config()
     )
+    furnace_events = [event for event in events if event.batch_kind == "FURNACE_HOUR"]
 
-    assert [event.batch_step for event in events] == [
+    assert [event.batch_step for event in furnace_events] == [
         "FURNACE_CHARGED",
         "FURNACE_CHARGED",
         "PREHEAT_COMPLETE",
@@ -149,7 +154,92 @@ def test_same_hour_all_furnaces_advance_in_lockstep_with_raw_equipment_ids():
         "RM4_RECORDED",
         "RM4_RECORDED",
     ]
-    assert [event.equipment_id for event in events[:2]] == ["1", "2호기"]
+    assert [event.equipment_id for event in furnace_events[:2]] == ["1", "2호기"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("charge_id", ""),
+        ("slab_no", " 1"),
+        ("cast_date", None),
+        ("cast_date", datetime(2025, 1, 1)),
+        ("f_ext_date", None),
+        ("f_ext_time", None),
+        ("f_ext_time", True),
+        ("f_ext_time", 24),
+        ("sm_plant", ""),
+        ("furnace_no", ""),
+        ("furnace_no", "5호기"),
+        ("hr_coil_id", 1),
+    ],
+)
+def test_required_replay_facts_fail_before_any_digest_is_computed(
+    monkeypatch, field, value
+):
+    genealogy = one_material_chain(overrides={field: value})
+    original_digest = event_builder.digest_json_id
+    digest_calls = []
+
+    def recording_digest(namespace, payload):
+        digest_calls.append((namespace, payload))
+        return original_digest(namespace, payload)
+
+    monkeypatch.setattr(event_builder, "digest_json_id", recording_digest)
+
+    with pytest.raises((TypeError, ValueError), match=field):
+        build_replay_events(
+            genealogy, BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+    assert digest_calls == []
+
+
+@pytest.mark.parametrize("field", ["ap_date", "ap_plant", "ap_prod_id"])
+def test_required_quality_ap_facts_fail_before_any_digest_is_computed(
+    monkeypatch, field
+):
+    genealogy = one_material_chain()
+    quality_rows = genealogy.quality_rows.copy(deep=True)
+    quality_rows.at[quality_rows.index[0], field] = None
+    invalid = replace(genealogy, quality_rows=quality_rows)
+    original_digest = event_builder.digest_json_id
+    digest_calls = []
+
+    def recording_digest(namespace, payload):
+        digest_calls.append((namespace, payload))
+        return original_digest(namespace, payload)
+
+    monkeypatch.setattr(event_builder, "digest_json_id", recording_digest)
+
+    with pytest.raises((TypeError, ValueError), match=field):
+        build_replay_events(invalid, BUNDLE_ID, CRITERIA_ID, analysis_config())
+    assert digest_calls == []
+
+
+def test_builder_uses_preflight_snapshots_if_source_frames_mutate_during_hashing(
+    monkeypatch,
+):
+    genealogy = one_material_chain()
+    expected = build_replay_events(
+        genealogy, BUNDLE_ID, CRITERIA_ID, analysis_config()
+    )
+    original_digest = event_builder.digest_json_id
+    mutated = False
+
+    def mutating_digest(namespace, payload):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            genealogy.replay_rows.loc[:, "cast_date"] = None
+            genealogy.replay_rows.loc[:, "f_ext_time"] = 22
+            genealogy.quality_rows.loc[:, "ap_date"] = None
+        return original_digest(namespace, payload)
+
+    monkeypatch.setattr(event_builder, "digest_json_id", mutating_digest)
+
+    assert build_replay_events(
+        genealogy, BUNDLE_ID, CRITERIA_ID, analysis_config()
+    ) == expected
 
 
 def test_stage_payloads_are_exact_newly_visible_config_fields_without_raw_ratios():
@@ -220,6 +310,45 @@ def test_cross_namespace_digest_preimage_collision_is_fatal(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "backend_result",
+    [123, [], {}, "sha256:" + "A" * 64, "sha256:1234"],
+)
+@pytest.mark.parametrize(
+    "api_name",
+    ["material_key", "batch_id", "equipment_batch_id", "event_id", "builder"],
+)
+def test_every_digest_backend_result_is_an_exact_lowercase_sha256_uri(
+    monkeypatch, backend_result, api_name
+):
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    furnace_batch = batch_id("FURNACE_HOUR", date(2025, 1, 2), 7)
+    monkeypatch.setattr(
+        event_builder, "digest_json_id", lambda *_: backend_result
+    )
+
+    calls = {
+        "material_key": lambda: material_key("CH1", "1"),
+        "batch_id": lambda: batch_id("CAST_DAY", date(2025, 1, 1), None),
+        "equipment_batch_id": lambda: equipment_batch_id(
+            furnace_batch, "FURNACE", "1"
+        ),
+        "event_id": lambda: event_id(cast),
+        "builder": lambda: build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        ),
+    }
+
+    with pytest.raises((TypeError, ValueError), match="digest_json_id result"):
+        calls[api_name]()
+
+
 def test_replay_event_is_frozen_and_defensively_snapshots_values_mapping():
     original = build_replay_events(
         one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
@@ -265,6 +394,40 @@ def test_replay_event_reads_a_stateful_mapping_once_and_blocks_later_aliases():
 
     assert source.calls == 1
     assert copied.values_json == {"field": "first"}
+
+
+def test_replay_event_hash_matches_equality_and_canonical_payload_bytes():
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    reordered_values = dict(reversed(tuple(cast.values_json.items())))
+    wire_equivalent = replace(cast, values_json=reordered_values)
+    equal_copy = replace(cast)
+
+    assert cast == equal_copy == wire_equivalent
+    assert hash(cast) == hash(equal_copy) == hash(wire_equivalent)
+    assert len({cast, equal_copy, wire_equivalent}) == 1
+
+
+def test_replay_event_hash_is_stable_after_caller_mapping_mutation():
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    caller_values = dict(cast.values_json)
+    copied = replace(cast, values_json=caller_values)
+    before = hash(copied)
+    caller_values["sm_plant"] = "MUTATED"
+
+    assert copied == cast
+    assert hash(copied) == before == hash(cast)
 
 
 @pytest.mark.parametrize(
@@ -432,6 +595,108 @@ def test_serialized_rows_validate_against_normative_replay_schema():
         validator.validate(instance)
 
 
+def test_serializer_rejects_missing_and_future_stage_payload_keys():
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    missing = dict(cast.values_json)
+    missing.pop("cast_date")
+    future = dict(cast.values_json)
+    future["f_pre_temp"] = 1080.0
+
+    for invalid in (
+        replace(cast, values_json={"judge": "불량"}),
+        replace(cast, values_json=missing),
+        replace(cast, values_json=future),
+    ):
+        with pytest.raises(ValidationError):
+            serialize_replay_events([invalid])
+
+
+def test_serializer_rejects_wrong_payload_scalar_date_and_hour_types():
+    events = build_replay_events(
+        one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+    )
+    cast = next(event for event in events if event.batch_step == "CAST_RECORDED")
+    extracted = next(
+        event for event in events if event.batch_step == "FURNACE_EXTRACTED"
+    )
+    wrong_number = dict(cast.values_json)
+    wrong_number["tundish_temp"] = "1540"
+    impossible_date = dict(cast.values_json)
+    impossible_date["cast_date"] = "2025-02-30"
+    wrong_hour = dict(extracted.values_json)
+    wrong_hour["f_ext_time"] = 24
+
+    for invalid in (
+        replace(cast, values_json=wrong_number),
+        replace(cast, values_json=impossible_date),
+        replace(extracted, values_json=wrong_hour),
+    ):
+        with pytest.raises(ValidationError):
+            serialize_replay_events([invalid])
+
+
+def test_serializer_rejects_object_setattr_forged_row_before_writing_bytes():
+    events = build_replay_events(
+        one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+    )
+    cast = next(event for event in events if event.batch_step == "CAST_RECORDED")
+    rm4 = next(event for event in events if event.batch_step == "RM4_RECORDED")
+
+    forged_cases = (
+        (cast, "bundle_id", "SHA256:" + "a" * 64),
+        (cast, "replay_date", "2025-01-01"),
+        (cast, "hr_coil_id", "TOO_EARLY"),
+        (rm4, "hr_coil_id", None),
+    )
+    for original, field, value in forged_cases:
+        forged = replace(original)
+        object.__setattr__(forged, field, value)
+        with pytest.raises((ValidationError, TypeError, ValueError)):
+            serialize_replay_events([forged])
+
+
+def test_serializer_snapshots_a_forged_stateful_values_mapping_exactly_once():
+    class StatefulMapping(Mapping):
+        def __init__(self, values):
+            self.values = values
+            self.calls = 0
+
+        def __getitem__(self, key):
+            return self.values[key]
+
+        def __iter__(self):
+            return iter(self.values)
+
+        def __len__(self):
+            return len(self.values)
+
+        def items(self):
+            self.calls += 1
+            return tuple(self.values.items())
+
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    source = StatefulMapping(dict(cast.values_json))
+    forged = replace(cast)
+    object.__setattr__(forged, "values_json", source)
+
+    payload = serialize_replay_events([forged])
+
+    assert source.calls == 1
+    assert b'""sm_plant"":""SM1""' in payload
+
+
 def test_csv_round_trips_unicode_commas_quotes_and_newlines_deterministically():
     genealogy = one_material_chain(
         overrides={"sm_plant": '한글,\n"인용"'}
@@ -488,7 +753,7 @@ def test_serializer_rejects_mixed_bundle_or_criteria_identity(field):
 
 
 def test_furnace_equipment_sort_rejects_unknown_unit_without_rewriting_raw_id():
-    with pytest.raises(ValueError, match="furnace equipment_id"):
+    with pytest.raises(ValueError, match="furnace_no"):
         build_replay_events(
             one_material_chain(overrides={"furnace_no": "5호기"}),
             BUNDLE_ID,
@@ -525,6 +790,123 @@ def test_config_cannot_move_judge_before_ap_result():
         )
 
 
+def test_installed_wheel_serializer_uses_packaged_schema_from_arbitrary_cwd(
+    tmp_path,
+):
+    wheel_source = tmp_path / "wheel-source"
+    wheel_source.mkdir()
+    shutil.copy2(
+        REPOSITORY_ROOT / "analysis/pyproject.toml",
+        wheel_source / "pyproject.toml",
+    )
+    shutil.copytree(
+        REPOSITORY_ROOT / "analysis/equipment_quality",
+        wheel_source / "equipment_quality",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    wheel_dir = tmp_path / "wheel"
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(wheel_dir),
+            str(wheel_source),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+
+    installed_root = tmp_path / "installed"
+    install = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed_root),
+            str(wheels[0]),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+
+    outside_checkout = tmp_path / "outside-checkout"
+    outside_checkout.mkdir()
+    assert not (outside_checkout / "contracts").exists()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(installed_root)
+    environment["PYTHONNOUSERSITE"] = "1"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from dataclasses import replace
+from datetime import date
+from jsonschema import ValidationError
+from equipment_quality.event_builder import ReplayEvent, serialize_replay_events
+
+event = ReplayEvent(
+    schema_version="sfep-replay-events/v1",
+    bundle_id="sha256:" + "a" * 64,
+    criteria_id="sha256:" + "b" * 64,
+    event_id="sha256:d3b1e46114fbb696c042b30bb54a23540ede1df3c6357f7ad093097042642770",
+    replay_date=date(2025, 1, 1),
+    replay_hour=None,
+    batch_kind="CAST_DAY",
+    batch_id="sha256:3cc8574421de7b7f3e7e1bb44f370ab280b114ff37ce8ce199b828da9a724821",
+    equipment_batch_id=None,
+    batch_step="CAST_RECORDED",
+    time_precision="DAY",
+    material_key="sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a",
+    equipment_type="SM_CC",
+    equipment_id="SM1",
+    charge_id="CH1",
+    slab_no="1",
+    hr_coil_id=None,
+    ap_prod_id=None,
+    values_json={
+        "sm_plant":"SM1","steel_grade":"STS304","steel_usage":"A",
+        "cc_gubun":"CC1","slab_gubun":"NORMAL","tundish_temp":1540.0,
+        "mlac_ratio":0.92,"delta_ferrite":7.1,"ingre_cr":18.2,
+        "ingre_ni":8.1,"ingre_s":0.005,"slab_grind":"HSHS",
+        "cast_date":"2025-01-01",
+    },
+)
+assert serialize_replay_events([event]).startswith(b"schema_version,")
+try:
+    serialize_replay_events([replace(event, values_json={"judge":"불량"})])
+except ValidationError:
+    print("installed-serializer-schema-ok")
+else:
+    raise AssertionError("installed serializer accepted a future-leaking row")
+""",
+        ],
+        cwd=outside_checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == "installed-serializer-schema-ok"
+
+
 def test_non_result_field_stage_is_driven_only_by_passed_config():
     config = analysis_config()
     fields = []
@@ -535,17 +917,20 @@ def test_non_result_field_stage_is_driven_only_by_passed_config():
         fields.append(item)
     moved = replace(config, fields=tuple(fields))
 
+    moved_events = build_replay_events(
+        one_material_chain(), BUNDLE_ID, CRITERIA_ID, moved
+    )
     by_step = {
         event.batch_step: event
-        for event in build_replay_events(
-            one_material_chain(), BUNDLE_ID, CRITERIA_ID, moved
-        )
+        for event in moved_events
     }
 
     assert set(by_step["PREHEAT_COMPLETE"].values_json) == {"f_pre_interval"}
     assert set(by_step["HEAT_COMPLETE"].values_json) == {
         "f_pre_temp", "f_heat_temp", "f_heat_interval"
     }
+    with pytest.raises(ValidationError):
+        serialize_replay_events(moved_events)
 
 
 def test_full_golden_source_stream_has_95_events_and_stable_sha256():
@@ -637,7 +1022,6 @@ def test_actual_snapshot_builds_one_unique_schema_safe_deterministic_stream():
     )
     assert payload.startswith(EXACT_19_COLUMN_HEADER.encode("ascii") + b"\n")
     assert b"\r" not in payload
-    assert serialize_replay_events(events) == payload
     assert hashlib.sha256(payload).hexdigest() == (
         "980bd764a0fce16405646985f24c9d43022cf8c40eed91233d38781300c2c56f"
     )
