@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 import os
@@ -49,6 +50,9 @@ _MAX_BOOTSTRAP_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MAX_BOOTSTRAP_RESPONSE_BYTES = 1024 * 1024
 _BOOTSTRAP_WORKER_TIMEOUT_SECONDS = 120.0
 _BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS = 1.0
+_BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS = 1.0
+_WAITPID_RETRY_SECONDS = 0.001
+_UINT64_MAX = (1 << 64) - 1
 
 
 def _is_missing(value: object) -> bool:
@@ -1149,7 +1153,10 @@ def _decode_bootstrap_worker_input(
                 raise TypeError("input task rows must be a pandas DataFrame")
             if type(criteria_id) is not str or type(rule_id) is not str:
                 raise TypeError("input task identifiers must be built-in strings")
-            if type(replicates) is not int or replicates < 1:
+            if (
+                type(replicates) is not int
+                or not 1 <= replicates <= _UINT64_MAX
+            ):
                 raise ValueError("input task replicates must be a positive integer")
             tasks.append((index, rows, criteria_id, rule_id, replicates))
         return worker_ordinal, tuple(tasks)
@@ -1190,7 +1197,7 @@ def _decode_bootstrap_worker_response(
 
 
 def _validate_bootstrap_responses(
-    expected: Sequence[tuple[int, str]],
+    expected: Sequence[tuple[int, str, int]],
     responses: Sequence[_BootstrapResponse],
     *,
     result_size: int,
@@ -1219,9 +1226,10 @@ def _validate_bootstrap_responses(
             raise RuntimeError("bootstrap response index is outside the result range")
         if response.index in validated:
             raise RuntimeError("bootstrap response contains a duplicate or conflicting index")
-        expected_rule_id = expected_by_index.get(response.index)
-        if expected_rule_id is None:
+        expected_metadata = expected_by_index.get(response.index)
+        if expected_metadata is None:
             raise RuntimeError("bootstrap response contains an unexpected index")
+        expected_rule_id, submitted_replicates = expected_metadata
         if type(response.rule_id) is not str or response.rule_id != expected_rule_id:
             raise RuntimeError("bootstrap response ruleId does not match its submitted task")
         interval = response.interval
@@ -1229,6 +1237,14 @@ def _validate_bootstrap_responses(
             raise RuntimeError("bootstrap response interval must be an exact BootstrapCi")
         if set(vars(interval)) != interval_fields:
             raise RuntimeError("bootstrap response BootstrapCi shape is invalid")
+        if (
+            type(interval.valid_replicates) is not int
+            or not 0 <= interval.valid_replicates <= submitted_replicates
+        ):
+            raise RuntimeError(
+                "bootstrap response validReplicates must be a built-in integer "
+                "bounded by the submitted replicates"
+            )
         try:
             checked_interval = BootstrapCi(
                 interval.lower,
@@ -1247,32 +1263,42 @@ def _validate_bootstrap_responses(
         )
     if set(validated) != set(expected_by_index):
         raise RuntimeError("bootstrap response is missing a submitted task")
-    return tuple(validated[index] for index, _ in expected_snapshot)
+    return tuple(validated[index] for index, _, _ in expected_snapshot)
 
 
 def _validate_expected_bootstrap_identities(
-    expected: Sequence[tuple[int, str]],
+    expected: Sequence[tuple[int, str, int]],
     *,
     result_size: int,
-) -> tuple[tuple[tuple[int, str], ...], dict[int, str]]:
+) -> tuple[
+    tuple[tuple[int, str, int], ...],
+    dict[int, tuple[str, int]],
+]:
     if type(result_size) is not int or result_size < 0:
         raise RuntimeError("bootstrap result index range is invalid")
     expected_snapshot = tuple(expected)
-    expected_by_index: dict[int, str] = {}
+    expected_by_index: dict[int, tuple[str, int]] = {}
     for item in expected_snapshot:
-        if type(item) is not tuple or len(item) != 2:
-            raise RuntimeError("bootstrap expected identity shape is invalid")
-        index, rule_id = item
+        if type(item) is not tuple or len(item) != 3:
+            raise RuntimeError("bootstrap expected metadata shape is invalid")
+        index, rule_id, replicates = item
         if type(index) is not int or not 0 <= index < result_size:
             raise RuntimeError("bootstrap expected index range is invalid")
         try:
             checked_rule_id = _validate_sha256_uri(rule_id, "bootstrap expected ruleId")
         except (TypeError, ValueError) as error:
             raise RuntimeError(f"bootstrap expected ruleId is invalid: {error}") from error
+        if (
+            type(replicates) is not int
+            or not 1 <= replicates <= _UINT64_MAX
+        ):
+            raise RuntimeError(
+                "bootstrap expected replicates must be a positive built-in integer"
+            )
         if index in expected_by_index:
             raise RuntimeError("bootstrap expected identities contain a duplicate index")
-        expected_by_index[index] = checked_rule_id
-    if len(set(expected_by_index.values())) != len(expected_by_index):
+        expected_by_index[index] = (checked_rule_id, replicates)
+    if len({item[0] for item in expected_by_index.values()}) != len(expected_by_index):
         raise RuntimeError("bootstrap expected identities contain a duplicate ruleId")
     return expected_snapshot, expected_by_index
 
@@ -1327,7 +1353,14 @@ class _SpawnedBootstrapWorker:
     error_path: Path
     returncode: int | None = None
 
-    def poll(self) -> int | None:
+    @staticmethod
+    def _retry_after_interruption(deadline: float, operation: str) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"bootstrap worker {operation} exceeded its deadline")
+        time.sleep(min(_WAITPID_RETRY_SECONDS, remaining))
+
+    def poll(self, deadline: float) -> int | None:
         if self.returncode is not None:
             return self.returncode
         while True:
@@ -1335,33 +1368,56 @@ class _SpawnedBootstrapWorker:
                 waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
                 break
             except InterruptedError:
-                continue
+                self._retry_after_interruption(deadline, "poll")
             except ChildProcessError:
+                self.returncode = 255
+                return self.returncode
+            except OSError as error:
+                if error.errno != errno.ECHILD:
+                    raise
                 self.returncode = 255
                 return self.returncode
         if waited_pid == self.pid:
             self.returncode = os.waitstatus_to_exitcode(status)
         return self.returncode
 
-    def terminate(self) -> None:
-        os.kill(self.pid, signal.SIGTERM)
+    def _signal(self, signal_number: int, deadline: float, operation: str) -> None:
+        while True:
+            try:
+                os.kill(self.pid, signal_number)
+                return
+            except InterruptedError:
+                self._retry_after_interruption(deadline, operation)
 
-    def kill(self) -> None:
-        os.kill(self.pid, signal.SIGKILL)
+    def terminate(self, deadline: float) -> None:
+        self._signal(signal.SIGTERM, deadline, "TERM")
 
-    def reap(self) -> int:
+    def kill(self, deadline: float) -> None:
+        self._signal(signal.SIGKILL, deadline, "KILL")
+
+    def reap(self, deadline: float) -> int:
         if self.returncode is not None:
             return self.returncode
         while True:
             try:
-                waited_pid, status = os.waitpid(self.pid, 0)
-                break
+                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
             except InterruptedError:
+                self._retry_after_interruption(deadline, "reap")
                 continue
-        if waited_pid != self.pid:
-            raise RuntimeError("bootstrap worker wait returned an unexpected pid")
-        self.returncode = os.waitstatus_to_exitcode(status)
-        return self.returncode
+            except ChildProcessError:
+                self.returncode = 255
+                return self.returncode
+            except OSError as error:
+                if error.errno != errno.ECHILD:
+                    raise
+                self.returncode = 255
+                return self.returncode
+            if waited_pid == self.pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                return self.returncode
+            if waited_pid != 0:
+                raise RuntimeError("bootstrap worker wait returned an unexpected pid")
+            self._retry_after_interruption(deadline, "reap")
 
 
 def _start_bootstrap_worker(
@@ -1372,7 +1428,7 @@ def _start_bootstrap_worker(
     arguments = (
         sys.executable,
         "-m",
-        "equipment_quality.quality_intervals",
+        "equipment_quality._bootstrap_worker",
         _BOOTSTRAP_WORKER_ARGUMENT,
         str(input_path),
     )
@@ -1398,46 +1454,102 @@ def _start_bootstrap_worker(
 
 def _cleanup_bootstrap_workers(processes: Sequence[_SpawnedBootstrapWorker]) -> None:
     snapshot = tuple(processes)
+    terminate_deadline = time.monotonic() + _BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS
+    targeted: list[_SpawnedBootstrapWorker] = []
     running: list[_SpawnedBootstrapWorker] = []
+    errors: list[str] = []
     for process in snapshot:
+        poll_deadline = min(
+            terminate_deadline,
+            time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+        )
         try:
-            if process.poll() is None:
-                process.terminate()
+            if process.poll(poll_deadline) is None:
+                targeted.append(process)
                 running.append(process)
-        except ProcessLookupError:
-            try:
-                process.reap()
-            except (ChildProcessError, OSError):
-                pass
-        except OSError:
+                try:
+                    process.terminate(terminate_deadline)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    errors.append(
+                        f"worker {process.pid} TERM failed: {type(error).__name__}: {error}"
+                    )
+        except TimeoutError:
+            targeted.append(process)
             running.append(process)
-    deadline = time.monotonic() + _BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS
-    while running and time.monotonic() < deadline:
+            try:
+                process.terminate(terminate_deadline)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                errors.append(
+                    f"worker {process.pid} TERM failed: {type(error).__name__}: {error}"
+                )
+        except OSError as error:
+            targeted.append(process)
+            running.append(process)
+            errors.append(
+                f"worker {process.pid} initial poll failed: {type(error).__name__}: {error}"
+            )
+    while running:
+        if time.monotonic() >= terminate_deadline:
+            break
         still_running: list[_SpawnedBootstrapWorker] = []
         for process in running:
+            poll_deadline = min(
+                terminate_deadline,
+                time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+            )
             try:
-                if process.poll() is None:
+                if process.poll(poll_deadline) is None:
                     still_running.append(process)
-            except OSError:
+            except TimeoutError:
+                still_running.append(process)
+            except OSError as error:
+                errors.append(
+                    f"worker {process.pid} TERM poll failed: {type(error).__name__}: {error}"
+                )
                 still_running.append(process)
         running = still_running
         if running:
-            time.sleep(0.005)
+            remaining = terminate_deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(0.005, remaining))
+    reap_deadline = time.monotonic() + _BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS
     for process in running:
         try:
-            needs_kill = process.poll() is None
-        except OSError:
-            needs_kill = True
-        if needs_kill:
-            try:
-                process.kill()
-            except OSError:
-                pass
-    for process in running:
-        try:
-            process.reap()
-        except (ChildProcessError, OSError):
+            process.kill(reap_deadline)
+        except ProcessLookupError:
             pass
+        except OSError as error:
+            errors.append(
+                f"worker {process.pid} KILL failed: {type(error).__name__}: {error}"
+            )
+    pending_reap = list(targeted)
+    while pending_reap and time.monotonic() < reap_deadline:
+        still_pending: list[_SpawnedBootstrapWorker] = []
+        for process in pending_reap:
+            process_deadline = min(
+                reap_deadline,
+                time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+            )
+            try:
+                process.reap(process_deadline)
+            except TimeoutError:
+                still_pending.append(process)
+            except (OSError, RuntimeError) as error:
+                errors.append(
+                    f"worker {process.pid} reap failed: {type(error).__name__}: {error}"
+                )
+        pending_reap = still_pending
+    for process in pending_reap:
+        errors.append(
+            f"worker {process.pid} reap failed: TimeoutError: "
+            "bootstrap worker reap exceeded its deadline"
+        )
+    if errors:
+        raise RuntimeError("bootstrap worker cleanup failed: " + "; ".join(errors))
 
 
 def _write_bootstrap_worker_inputs(
@@ -1471,7 +1583,7 @@ def _wait_for_bootstrap_workers(
 ) -> None:
     pending = list(processes)
     while pending:
-        pending = [process for process in pending if process.poll() is None]
+        pending = [process for process in pending if process.poll(deadline) is None]
         if not pending:
             return
         remaining = deadline - time.monotonic()
@@ -1525,17 +1637,24 @@ def _parallel_bootstrap_tasks(
     if type(worker_count) is not int or worker_count < 1:
         raise ValueError("bootstrap worker_count must be a positive integer")
     worker_count = min(worker_count, len(task_snapshot))
-    expected_items: list[tuple[int, str]] = []
+    expected_items: list[tuple[int, str, int]] = []
     for task in task_snapshot:
         if type(task) is not tuple or len(task) != 5:
             raise RuntimeError("bootstrap submitted task shape is invalid")
-        index, _, _, rule_id, _ = task
+        index, _, _, rule_id, replicates = task
         if type(index) is not int or index < 0:
             raise RuntimeError("bootstrap submitted task index range is invalid")
-        expected_items.append((index, rule_id))
+        if (
+            type(replicates) is not int
+            or not 1 <= replicates <= _UINT64_MAX
+        ):
+            raise RuntimeError(
+                "bootstrap submitted task replicates must be a positive built-in integer"
+            )
+        expected_items.append((index, rule_id, replicates))
     expected = tuple(expected_items)
     if result_size is None:
-        result_size = max(index for index, _ in expected) + 1
+        result_size = max(index for index, _, _ in expected) + 1
     _validate_expected_bootstrap_identities(expected, result_size=result_size)
     partitions = _partition_bootstrap_tasks(task_snapshot, worker_count)
     processes: list[_SpawnedBootstrapWorker] = []
@@ -1584,12 +1703,15 @@ def _parallel_bootstrap_tasks(
                         "bootstrap worker protocol returned an unexpected worker ordinal"
                     )
                 partition_expected = tuple(
-                    (task[0], task[3]) for task in partitions[ordinal]
+                    (task[0], task[3], task[4]) for task in partitions[ordinal]
                 )
                 if tuple(
                     (response.index, response.rule_id)
                     for response in worker_results
-                ) != partition_expected:
+                ) != tuple(
+                    (index, rule_id)
+                    for index, rule_id, _ in partition_expected
+                ):
                     raise RuntimeError(
                         "bootstrap worker partition identities or order do not match submission"
                     )
@@ -1603,7 +1725,16 @@ def _parallel_bootstrap_tasks(
             if errors:
                 raise RuntimeError("; ".join(errors))
         finally:
-            _cleanup_bootstrap_workers(processes)
+            active_error = sys.exception()
+            try:
+                _cleanup_bootstrap_workers(processes)
+            except BaseException as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "bootstrap cleanup also failed without replacing the original error: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
     return _validate_bootstrap_responses(
         expected,
         raw_results,
@@ -1631,7 +1762,7 @@ def _bootstrap_discovery_metrics(
         for index, candidate in enumerate(candidates)
         if _bootstrap_applicable(discovery[index], config)
     ]
-    expected = tuple((task[0], task[3]) for task in tasks)
+    expected = tuple((task[0], task[3], task[4]) for task in tasks)
     _validate_expected_bootstrap_identities(
         expected,
         result_size=len(discovery),

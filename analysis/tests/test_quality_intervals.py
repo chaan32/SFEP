@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import pickle
+import select
 import signal
+import sys
 import threading
 import time
 import warnings
@@ -580,9 +584,12 @@ def _bootstrap_response(index: int, rule_id: str, interval=None):
 def test_bootstrap_responses_must_be_an_exact_bijection_before_application(
     responses, message
 ):
-    expected = ((0, _bootstrap_rule_id("1")), (1, _bootstrap_rule_id("2")))
-    first = _bootstrap_response(*expected[0])
-    second = _bootstrap_response(*expected[1])
+    expected = (
+        (0, _bootstrap_rule_id("1"), 2000),
+        (1, _bootstrap_rule_id("2"), 2000),
+    )
+    first = _bootstrap_response(expected[0][0], expected[0][1])
+    second = _bootstrap_response(expected[1][0], expected[1][1])
     result_size = 3 if message == "unexpected" else 2
 
     with pytest.raises(RuntimeError, match=message):
@@ -596,12 +603,12 @@ def test_bootstrap_responses_must_be_an_exact_bijection_before_application(
 def test_bootstrap_response_rejects_exact_type_with_mutated_shape():
     interval = _bootstrap_ci()
     object.__setattr__(interval, "unexpected", "field")
-    expected = ((0, _bootstrap_rule_id("1")),)
+    expected = ((0, _bootstrap_rule_id("1"), 2000),)
 
     with pytest.raises(RuntimeError, match="shape"):
         quality_intervals._validate_bootstrap_responses(
             expected,
-            (_bootstrap_response(*expected[0], interval),),
+            (_bootstrap_response(expected[0][0], expected[0][1], interval),),
             result_size=1,
         )
 
@@ -609,14 +616,72 @@ def test_bootstrap_response_rejects_exact_type_with_mutated_shape():
 def test_bootstrap_response_revalidates_finite_interval_semantics():
     interval = _bootstrap_ci()
     object.__setattr__(interval, "lower", math.nan)
-    expected = ((0, _bootstrap_rule_id("1")),)
+    expected = ((0, _bootstrap_rule_id("1"), 2000),)
 
     with pytest.raises(RuntimeError, match="semantics"):
         quality_intervals._validate_bootstrap_responses(
             expected,
-            (_bootstrap_response(*expected[0], interval),),
+            (_bootstrap_response(expected[0][0], expected[0][1], interval),),
             result_size=1,
         )
+
+
+@pytest.mark.parametrize("valid_replicates", [2001, 2**64 - 1, True, -1])
+def test_bootstrap_response_valid_replicates_are_bounded_by_submitted_task(
+    valid_replicates,
+):
+    interval = _bootstrap_ci()
+    object.__setattr__(interval, "valid_replicates", valid_replicates)
+    rule_id = _bootstrap_rule_id("1")
+    expected = ((0, rule_id, 2000),)
+
+    with pytest.raises(RuntimeError, match="validReplicates"):
+        quality_intervals._validate_bootstrap_responses(
+            expected,
+            (_bootstrap_response(0, rule_id, interval),),
+            result_size=1,
+        )
+
+
+def test_bootstrap_response_accepts_partial_valid_replicates_within_submission():
+    interval = BootstrapCi(0.75, 1.25, 1900, "NONE")
+    rule_id = _bootstrap_rule_id("1")
+
+    validated = quality_intervals._validate_bootstrap_responses(
+        ((0, rule_id, 2000),),
+        (_bootstrap_response(0, rule_id, interval),),
+        result_size=1,
+    )
+
+    assert validated[0].interval.valid_replicates == 1900
+
+
+@pytest.mark.parametrize("replicates", [True, 0, -1, 2**64])
+def test_submitted_replicates_fail_preflight_before_worker_start(
+    monkeypatch, replicates
+):
+    started = False
+
+    def forbidden_start(*_args):
+        nonlocal started
+        started = True
+        raise AssertionError("invalid submitted replicates reached a worker")
+
+    monkeypatch.setattr(quality_intervals, "_start_bootstrap_worker", forbidden_start)
+    task = (*_tiny_bootstrap_task()[:-1], replicates)
+
+    with pytest.raises(RuntimeError, match="replicates"):
+        quality_intervals._parallel_bootstrap_tasks([task], 1)
+
+    assert not started
+
+
+def test_worker_input_rejects_replicates_outside_uint64_range():
+    task = (*_tiny_bootstrap_task()[:-1], 2**64)
+    payload = pickle.dumps(("sfep-quality-bootstrap/v1", 0, (task,)))
+
+    with pytest.raises(RuntimeError, match="replicates"):
+        quality_intervals._decode_bootstrap_worker_input(payload)
 
 
 @pytest.mark.parametrize(
@@ -653,18 +718,18 @@ class _FakeWorkerProcess:
         self.killed = False
         self.waited = False
 
-    def poll(self):
+    def poll(self, _deadline):
         if self.returncode is None and self._complete_on_poll:
             self.returncode = self._configured_returncode
             self.waited = True
         return self.returncode
 
-    def terminate(self):
+    def terminate(self, _deadline):
         self.terminated = True
         if not self._resist_terminate:
             self.returncode = -signal.SIGTERM
 
-    def kill(self):
+    def kill(self, _deadline):
         self.killed = True
         self.returncode = -signal.SIGKILL
 
@@ -674,7 +739,7 @@ class _FakeWorkerProcess:
             raise TimeoutError("bootstrap-worker did not exit")
         return self.returncode
 
-    def reap(self):
+    def reap(self, _deadline):
         return self.wait()
 
 
@@ -902,7 +967,10 @@ def test_spawn_exec_bootstrap_is_warning_free_with_an_existing_background_thread
 
     def background():
         ready.set()
-        release.wait(timeout=30)
+        while not release.wait(timeout=0.001):
+            transient_read, transient_write = os.pipe()
+            os.close(transient_read)
+            os.close(transient_write)
 
     thread = threading.Thread(target=background)
     thread.start()
@@ -953,6 +1021,8 @@ def test_direct_posix_spawn_maps_worker_standard_streams_with_file_actions(
     monkeypatch, tmp_path
 ):
     observed = {}
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(write_fd, True)
 
     def fake_posix_spawn(executable, arguments, environment, **kwargs):
         observed.update(
@@ -964,24 +1034,351 @@ def test_direct_posix_spawn_maps_worker_standard_streams_with_file_actions(
         return 4242
 
     monkeypatch.setattr(os, "posix_spawn", fake_posix_spawn)
-    worker = quality_intervals._start_bootstrap_worker(
-        tmp_path / "input.pickle",
-        tmp_path / "response.pickle",
-        tmp_path / "stderr.txt",
-    )
+    try:
+        worker = quality_intervals._start_bootstrap_worker(
+            tmp_path / "input.pickle",
+            tmp_path / "response.pickle",
+            tmp_path / "stderr.txt",
+        )
+        assert os.get_inheritable(write_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
     assert worker.pid == 4242
     assert observed["arguments"][1:4] == (
         "-m",
-        "equipment_quality.quality_intervals",
+        "equipment_quality._bootstrap_worker",
         "--bootstrap-worker",
     )
     actions = observed["kwargs"]["file_actions"]
-    assert [(action[0], action[1]) for action in actions] == [
+    action_kinds_and_fds = [(action[0], action[1]) for action in actions]
+    assert action_kinds_and_fds == [
         (os.POSIX_SPAWN_OPEN, 0),
         (os.POSIX_SPAWN_OPEN, 1),
         (os.POSIX_SPAWN_OPEN, 2),
     ]
+
+
+def test_real_worker_does_not_retain_unrelated_inheritable_fd(
+    tmp_path,
+):
+    ready = threading.Event()
+    release = threading.Event()
+
+    def background():
+        ready.set()
+        release.wait(timeout=30)
+
+    thread = threading.Thread(target=background)
+    thread.start()
+    assert ready.wait(timeout=5)
+    read_fd, write_fd = os.pipe()
+    assert not os.get_inheritable(write_fd)
+    os.set_inheritable(write_fd, True)
+    long_task = (*_tiny_bootstrap_task()[:-1], 500_000)
+    input_path = quality_intervals._write_bootstrap_worker_inputs(
+        tmp_path,
+        ((long_task,),),
+    )[0]
+    worker = None
+    try:
+        worker = quality_intervals._start_bootstrap_worker(
+            input_path,
+            tmp_path / "response.pickle",
+            tmp_path / "stderr.txt",
+        )
+        assert os.get_inheritable(write_fd)
+        os.close(write_fd)
+        write_fd = -1
+
+        readable, _, _ = select.select((read_fd,), (), (), 2.0)
+        assert readable, "worker retained the unrelated inheritable pipe writer"
+        assert os.read(read_fd, 1) == b""
+        os.kill(worker.pid, 0)
+    finally:
+        if worker is not None:
+            quality_intervals._cleanup_bootstrap_workers((worker,))
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+def test_waitpid_repeated_eintr_obeys_absolute_deadline_without_spin(
+    monkeypatch,
+):
+    release = threading.Event()
+    calls = 0
+    errors = []
+
+    def interrupted_waitpid(pid, _options):
+        nonlocal calls
+        calls += 1
+        if not release.is_set():
+            raise InterruptedError(errno.EINTR, "interrupted")
+        return pid, 0
+
+    monkeypatch.setattr(os, "waitpid", interrupted_waitpid)
+    worker = quality_intervals._SpawnedBootstrapWorker(
+        4242,
+        Path("response"),
+        Path("stderr"),
+    )
+
+    def wait():
+        try:
+            quality_intervals._wait_for_bootstrap_workers(
+                (worker,), time.monotonic() + 0.01
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    thread.join(timeout=0.1)
+    try:
+        assert not thread.is_alive(), "EINTR retry ignored the absolute deadline"
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], TimeoutError)
+    assert calls < 100
+
+
+def test_reap_repeated_eintr_obeys_absolute_deadline_without_spin(monkeypatch):
+    calls = 0
+
+    def interrupted_waitpid(_pid, _options):
+        nonlocal calls
+        calls += 1
+        raise InterruptedError(errno.EINTR, "interrupted")
+
+    monkeypatch.setattr(os, "waitpid", interrupted_waitpid)
+    worker = quality_intervals._SpawnedBootstrapWorker(
+        4242,
+        Path("response"),
+        Path("stderr"),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match="reap"):
+        worker.reap(started + 0.01)
+
+    assert time.monotonic() - started < 0.1
+    assert calls < 100
+
+
+def test_signal_repeated_eintr_obeys_absolute_deadline_without_spin(monkeypatch):
+    calls = 0
+
+    def interrupted_kill(_pid, _signal):
+        nonlocal calls
+        calls += 1
+        raise InterruptedError(errno.EINTR, "interrupted")
+
+    monkeypatch.setattr(os, "kill", interrupted_kill)
+    worker = quality_intervals._SpawnedBootstrapWorker(
+        4242,
+        Path("response"),
+        Path("stderr"),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match="TERM"):
+        worker.terminate(started + 0.01)
+
+    assert time.monotonic() - started < 0.1
+    assert calls < 100
+
+
+def test_cleanup_failure_does_not_replace_parent_keyboard_interrupt(monkeypatch):
+    process = _FakeWorkerProcess(resist_terminate=True)
+
+    def failed_reap(_deadline):
+        raise TimeoutError("unreaped child")
+
+    process.reap = failed_reap
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", _fake_worker_start(process)
+    )
+    monkeypatch.setattr(
+        quality_intervals,
+        "_wait_for_bootstrap_workers",
+        lambda _workers, _deadline: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS", 0.0
+    )
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS", 0.0
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+    assert any("cleanup also failed" in note for note in captured.value.__notes__)
+
+
+def test_cleanup_reaps_other_children_when_one_pid_keeps_timing_out(monkeypatch):
+    first = _FakeWorkerProcess(resist_terminate=True)
+    second = _FakeWorkerProcess(resist_terminate=True)
+    first.pid = 4241
+    second.pid = 4242
+    second_reaped = False
+
+    def first_reap(deadline):
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        raise TimeoutError("injected EINTR deadline")
+
+    def second_reap(_deadline):
+        nonlocal second_reaped
+        second_reaped = True
+        return -signal.SIGKILL
+
+    first.reap = first_reap
+    second.reap = second_reap
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS", 0.0
+    )
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS", 0.01
+    )
+
+    with pytest.raises(RuntimeError, match="4241.*reap"):
+        quality_intervals._cleanup_bootstrap_workers((first, second))
+
+    assert first.killed and second.killed and second_reaped
+
+
+def test_cleanup_treats_esrch_then_echild_as_an_already_reaped_race(monkeypatch):
+    calls = 0
+
+    def raced_waitpid(_pid, _options):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 0, 0
+        raise ChildProcessError(errno.ECHILD, "no child")
+
+    monkeypatch.setattr(os, "waitpid", raced_waitpid)
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda _pid, _signal: (_ for _ in ()).throw(
+            ProcessLookupError(errno.ESRCH, "gone")
+        ),
+    )
+    worker = quality_intervals._SpawnedBootstrapWorker(
+        4242,
+        Path("response"),
+        Path("stderr"),
+    )
+
+    quality_intervals._cleanup_bootstrap_workers((worker,))
+
+    assert worker.returncode == 255
+
+
+def test_real_term_resistant_child_is_killed_and_reaped(monkeypatch, tmp_path):
+    ready_path = tmp_path / "ready"
+    program = (
+        "import pathlib,signal,sys,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "pathlib.Path(sys.argv[1]).write_text('ready');"
+        "time.sleep(30)"
+    )
+    pid = os.posix_spawn(
+        sys.executable,
+        (sys.executable, "-c", program, str(ready_path)),
+        dict(os.environ),
+    )
+    worker = quality_intervals._SpawnedBootstrapWorker(
+        pid,
+        tmp_path / "response",
+        tmp_path / "stderr",
+    )
+    deadline = time.monotonic() + 5
+    while not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert ready_path.exists()
+    monkeypatch.setattr(
+        quality_intervals, "_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS", 0.01
+    )
+
+    quality_intervals._cleanup_bootstrap_workers((worker,))
+
+    assert worker.returncode == -signal.SIGKILL
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+def test_actual_process_response_cannot_exceed_submitted_replicates(
+    monkeypatch,
+):
+    interval = _bootstrap_ci()
+    object.__setattr__(interval, "valid_replicates", 2001)
+    response_payload = pickle.dumps(
+        (
+            "sfep-quality-bootstrap/v1",
+            0,
+            ((0, _bootstrap_rule_id("1"), interval),),
+        )
+    )
+
+    def malformed_process(_input_path, output_path, error_path):
+        program = (
+            "import pathlib,sys;"
+            "pathlib.Path(sys.argv[1]).write_bytes(bytes.fromhex(sys.argv[3]));"
+            "pathlib.Path(sys.argv[2]).write_bytes(b'')"
+        )
+        pid = os.posix_spawn(
+            sys.executable,
+            (
+                sys.executable,
+                "-c",
+                program,
+                str(output_path),
+                str(error_path),
+                response_payload.hex(),
+            ),
+            dict(os.environ),
+        )
+        return quality_intervals._SpawnedBootstrapWorker(
+            pid,
+            output_path,
+            error_path,
+        )
+
+    monkeypatch.setattr(
+        quality_intervals, "_start_bootstrap_worker", malformed_process
+    )
+
+    with pytest.raises(RuntimeError, match="validReplicates"):
+        quality_intervals._parallel_bootstrap_tasks([_tiny_bootstrap_task()], 1)
+
+
+def test_concurrent_parent_calls_are_deterministic_and_do_not_leak_fds():
+    before = len(os.listdir("/dev/fd"))
+
+    def run(_ordinal):
+        return quality_intervals._parallel_bootstrap_tasks(
+            [_tiny_bootstrap_task()],
+            1,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(run, range(2)))
+
+    assert results[0] == results[1]
+    assert len(os.listdir("/dev/fd")) == before
 
 
 def test_expected_identity_duplicates_fail_before_any_worker_starts(monkeypatch):
