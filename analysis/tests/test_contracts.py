@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -1099,6 +1100,136 @@ def test_golden_sources_are_cp949_have_exact_headers_and_cover_edge_populations(
     hr_ids = [row["hr_coil_id"] for row in ap]
     assert len(hr_ids) != len(set(hr_ids))
     assert any(value.startswith("UNLINKED") for value in hr_ids)
+
+
+def test_golden_summary_censoring_and_counts_match_literal_source_audit():
+    fur_materials = [
+        ("CH1", "1", "H001", "2025-01-01"),
+        ("CH1", "2", "H002", "2025-01-01"),
+        ("CH2", "1", "H003", "2025-01-02"),
+        ("CH2", "2", "H004", "2025-01-02"),
+        ("CH3", "1", "H005", "2025-01-03"),
+        ("CH3", "2", "H006", "2025-01-03"),
+        ("CH4", "1", "H007", "2025-01-04"),
+        ("CH4", "2", "H008", "2025-01-04"),
+        ("CH5", "1", "H009", "2025-02-20"),
+        ("CH5", "2", "H010", "2025-02-20"),
+        ("CH6", "1", "H011", "2025-02-21"),
+        ("CH6", "2", "H012", "2025-02-21"),
+    ]
+    ap_records = [
+        ("H001", "A001", "2025-02-01", "양품"),
+        ("H002", "A002", "2025-02-02", "양품"),
+        ("H003", "A003", "2025-02-03", "불량"),
+        ("H004", "A004", "2025-02-04", "양품"),
+        ("H005", "A005", "2025-02-05", "양품"),
+        ("H006", "A006", "2025-02-06", "불량"),
+        ("H007", "A007", "2025-02-07", "양품"),
+        ("H008", "A008", "2025-02-08", "양품"),
+        ("H009", "A009", "2025-03-25", ""),
+        ("H010", "A010", "2025-03-26", "양품"),
+        ("H011", "A011", "2025-04-01", "불량"),
+        ("H012", "A012", "2025-04-02", "양품"),
+        ("H006", "A006-DUP", "2025-02-06", "양품"),
+        ("UNLINKED-H999", "A999", "2025-02-10", "양품"),
+    ]
+    expected_outcomes = {
+        "H001": ("DISCOVERY", "NON_DEFECT"),
+        "H002": ("DISCOVERY", "NON_DEFECT"),
+        "H003": ("DISCOVERY", "DEFECT"),
+        "H004": ("DISCOVERY", "NON_DEFECT"),
+        "H005": ("DISCOVERY", "NON_DEFECT"),
+        "H006": ("REFERENCE", "AP_UNLINKED"),
+        "H007": ("CONFIRMATION", "NON_DEFECT"),
+        "H008": ("CONFIRMATION", "NON_DEFECT"),
+        "H009": ("REFERENCE", "LABEL_NOT_YET_AVAILABLE"),
+        "H010": ("REFERENCE", "LABEL_NOT_YET_AVAILABLE"),
+        "H011": ("HOLDOUT", "DEFECT"),
+        "H012": ("HOLDOUT", "NON_DEFECT"),
+    }
+
+    source_root = CONTRACT / "golden-source"
+    actual_fur = [
+        (row["charge_id"], row["slab_no"], row["hr_coil_id"], row["hr_date"])
+        for row in csv.DictReader(io.StringIO(
+            (source_root / "sts_2fur_hr_2.csv").read_text(encoding="cp949")
+        ))
+    ]
+    actual_ap = [
+        (row["hr_coil_id"], row["ap_prod_id"], row["ap_date"], row["judge"])
+        for row in csv.DictReader(io.StringIO(
+            (source_root / "sts_3ap_3.csv").read_text(encoding="cp949")
+        ))
+    ]
+    assert actual_fur == fur_materials
+    assert actual_ap == ap_records
+
+    ap_by_coil: dict[str, list[tuple[str, str, str]]] = {}
+    for coil_id, product_id, ap_date, judge in ap_records:
+        ap_by_coil.setdefault(coil_id, []).append((product_id, ap_date, judge))
+    fur_coils = {coil_id for _, _, coil_id, _ in fur_materials}
+    assert {coil_id for coil_id, rows in ap_by_coil.items() if len(rows) > 1} == {"H006"}
+    assert set(ap_by_coil) - fur_coils == {"UNLINKED-H999"}
+
+    as_of = date(2025, 2, 20)
+    maturity_cutoff = as_of - timedelta(days=38)
+    inner_split = date(2025, 1, 3)
+    assert maturity_cutoff == date(2025, 1, 13)
+    audited_outcomes: dict[str, tuple[str, str]] = {}
+    for _, _, coil_id, hr_date_text in fur_materials:
+        hr_date = date.fromisoformat(hr_date_text)
+        ap_rows = ap_by_coil.get(coil_id, [])
+        if hr_date > as_of:
+            assert len(ap_rows) == 1
+            outcome = "DEFECT" if ap_rows[0][2] == "불량" else "NON_DEFECT"
+            audited_outcomes[coil_id] = ("HOLDOUT", outcome)
+        elif len(ap_rows) != 1:
+            audited_outcomes[coil_id] = ("REFERENCE", "AP_UNLINKED")
+        else:
+            _, ap_date_text, judge = ap_rows[0]
+            if hr_date > maturity_cutoff or date.fromisoformat(ap_date_text) > as_of:
+                audited_outcomes[coil_id] = ("REFERENCE", "LABEL_NOT_YET_AVAILABLE")
+            elif judge == "":
+                audited_outcomes[coil_id] = ("REFERENCE", "LABEL_MISSING")
+            else:
+                split = "DISCOVERY" if hr_date <= inner_split else "CONFIRMATION"
+                outcome = "DEFECT" if judge == "불량" else "NON_DEFECT"
+                audited_outcomes[coil_id] = (split, outcome)
+    assert audited_outcomes == expected_outcomes
+
+    expected_censoring = {"AP_UNLINKED": 1, "LABEL_NOT_YET_AVAILABLE": 2}
+    assert {
+        reason: sum(outcome == reason for _, outcome in audited_outcomes.values())
+        for reason in expected_censoring
+    } == expected_censoring
+
+    expectation_root = CONTRACT / "golden-expectation"
+    summary = json.loads((expectation_root / "analysis_summary.template.json").read_bytes())
+    assert summary["asOf"] == "2025-02-20"
+    assert summary["innerSplitDate"] == "2025-01-03"
+    assert summary["labelCensoringCounts"] == expected_censoring
+    assert summary["quarantineCounts"] == {"DUPLICATE_KEY": 1, "UNLINKED_AP": 1}
+    assert summary["splitCounts"] == {
+        "confirmation": {
+            "dateFrom": "2025-01-04", "dateTo": "2025-01-04", "defects": 0,
+            "nonDefects": 2, "total": 2, "unknownOrCensored": 0,
+        },
+        "discovery": {
+            "dateFrom": "2025-01-01", "dateTo": "2025-01-03", "defects": 1,
+            "nonDefects": 4, "total": 5, "unknownOrCensored": 0,
+        },
+        "holdout": {
+            "dateFrom": "2025-02-21", "dateTo": "2025-02-21", "defects": 1,
+            "nonDefects": 1, "total": 2, "unknownOrCensored": 0,
+        },
+        "reference": {
+            "dateFrom": "2025-01-01", "dateTo": "2025-02-20", "defects": 1,
+            "nonDefects": 6, "total": 10, "unknownOrCensored": 3,
+        },
+    }
+    expected_alerts = json.loads((expectation_root / "expected_alerts.json").read_bytes())
+    assert expected_alerts["expectedReplayEventCount"] == 8
+    assert expected_alerts["alerts"] == []
 
 
 def test_golden_expectations_use_only_allowed_provenance_tokens_and_validate():
