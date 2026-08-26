@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from equipment_quality.statistics import (
+    StandardizedRates,
     Stratum,
     benjamini_hochberg,
     charge_bootstrap_rr_ci,
@@ -37,6 +38,82 @@ def test_statistics_result_records_are_frozen():
         stratum.a = 2
     with pytest.raises(FrozenInstanceError):
         rates.candidate = 0.0
+
+
+def test_direct_standardized_rates_construction_snapshots_and_freezes_weights():
+    source = {"B": 0, "A": 1}
+    rates = StandardizedRates(0.25, 0.5, -0.25, source)
+    source["A"] = 99
+    source["new"] = 1
+
+    assert dict(rates.weights) == {"A": 1.0, "B": 0.0}
+    assert tuple(rates.weights) == ("A", "B")
+    with pytest.raises(TypeError):
+        rates.weights["A"] = 0.0
+
+
+def test_direct_standardized_rates_normalizes_real_scalars_to_builtin_floats():
+    rates = StandardizedRates(0, 1, -1, {"A": 1, "B": 0})
+    assert type(rates.candidate) is float
+    assert type(rates.comparator) is float
+    assert type(rates.risk_difference) is float
+    assert all(type(weight) is float for weight in rates.weights.values())
+
+
+def test_direct_standardized_rates_accepts_null_scalars_and_empty_weights():
+    rates = StandardizedRates(None, None, None, {})
+    assert rates.candidate is None
+    assert rates.comparator is None
+    assert rates.risk_difference is None
+    assert dict(rates.weights) == {}
+
+
+@pytest.mark.parametrize("field", ("candidate", "comparator", "risk_difference"))
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        (True, TypeError, "boolean"),
+        ("0.1", TypeError, "real number"),
+        (math.nan, ValueError, "finite"),
+        (math.inf, ValueError, "finite"),
+        (-math.inf, ValueError, "finite"),
+    ],
+)
+def test_direct_standardized_rates_rejects_invalid_scalars(field, value, error, message):
+    values = {"candidate": 0.25, "comparator": 0.5, "risk_difference": -0.25}
+    values[field] = value
+    with pytest.raises(error, match=message):
+        StandardizedRates(**values, weights={"A": 1.0})
+
+
+def test_direct_standardized_rates_requires_a_mapping():
+    with pytest.raises(TypeError, match="mapping"):
+        StandardizedRates(0.25, 0.5, -0.25, [("A", 1.0)])
+
+
+def test_direct_standardized_rates_requires_exact_string_weight_keys():
+    class StringSubclass(str):
+        pass
+
+    for key in (1, StringSubclass("A")):
+        with pytest.raises(TypeError, match="weight key"):
+            StandardizedRates(0.25, 0.5, -0.25, {key: 1.0})
+
+
+@pytest.mark.parametrize(
+    ("weight", "error", "message"),
+    [
+        (True, TypeError, "boolean"),
+        ("1", TypeError, "real number"),
+        (None, TypeError, "real number"),
+        (math.nan, ValueError, "finite"),
+        (math.inf, ValueError, "finite"),
+        (-0.1, ValueError, "non-negative"),
+    ],
+)
+def test_direct_standardized_rates_rejects_invalid_weights(weight, error, message):
+    with pytest.raises(error, match=message):
+        StandardizedRates(0.25, 0.5, -0.25, {"A": weight})
 
 
 @pytest.mark.parametrize("field", ("a", "b", "c", "d"))
@@ -181,6 +258,51 @@ def test_standardization_rejects_duplicate_surviving_keys():
             (Stratum(1, 9, 1, 9, "A"), Stratum(2, 8, 1, 9, "A")),
             {"A": 1.0},
         )
+
+
+def test_standardization_rejects_duplicate_key_split_across_candidate_and_comparator_only():
+    strata = iter(
+        (
+            Stratum(1, 0, 0, 0, "A"),
+            Stratum(0, 0, 1, 0, "A"),
+        )
+    )
+    with pytest.raises(ValueError, match="duplicate.*A"):
+        standardized_rates(strata, {"A": math.nan})
+
+
+def test_standardization_rejects_filtered_duplicate_of_a_surviving_key():
+    with pytest.raises(ValueError, match="duplicate.*A"):
+        standardized_rates(
+            iter((Stratum(1, 1, 1, 1, "A"), Stratum(1, 0, 0, 0, "A"))),
+            None,
+        )
+
+
+def test_standardization_rejects_duplicate_empty_strata():
+    with pytest.raises(ValueError, match="duplicate.*empty"):
+        standardized_rates(
+            iter((Stratum(0, 0, 0, 0, "empty"), Stratum(0, 0, 0, 0, "empty"))),
+            None,
+        )
+
+
+def test_standardization_consumes_a_one_shot_iterable_exactly_once():
+    class OneShotStrata:
+        def __init__(self):
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("strata iterable was consumed more than once")
+            return iter((Stratum(1, 9, 1, 9, "A"), Stratum(2, 8, 1, 9, "B")))
+
+    strata = OneShotStrata()
+    result = standardized_rates(strata, None)
+    assert result.candidate == pytest.approx(0.15)
+    assert result.comparator == pytest.approx(0.10)
+    assert strata.iterations == 1
 
 
 @pytest.mark.parametrize(

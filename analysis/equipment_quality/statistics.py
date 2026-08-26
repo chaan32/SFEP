@@ -78,6 +78,41 @@ class StandardizedRates:
     risk_difference: float | None
     weights: Mapping[str, float]
 
+    def __post_init__(self) -> None:
+        for field_name in ("candidate", "comparator", "risk_difference"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    float(_finite_real(value, f"StandardizedRates.{field_name}")),
+                )
+        if not isinstance(self.weights, Mapping):
+            raise TypeError("StandardizedRates.weights must be a mapping")
+        try:
+            entries = tuple(self.weights.items())
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "StandardizedRates.weights must contain key-value pairs"
+            ) from error
+        checked: dict[str, float] = {}
+        for key, raw_weight in entries:
+            if type(key) is not str:
+                raise TypeError("StandardizedRates weight key must be a built-in string")
+            if key in checked:
+                raise ValueError(f"duplicate StandardizedRates weight key: {key}")
+            weight = _finite_real(raw_weight, f"StandardizedRates weight for {key!r}")
+            if weight < 0.0:
+                raise ValueError("StandardizedRates weights must be non-negative")
+            checked[key] = float(weight)
+        object.__setattr__(
+            self,
+            "weights",
+            MappingProxyType(
+                dict(sorted(checked.items(), key=lambda entry: entry[0].encode("utf-8")))
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class BootstrapCi:
@@ -191,6 +226,11 @@ def standardized_rates(
     for validation, then ignored while surviving weights are renormalized.
     """
     snapshot = _strata_snapshot(strata)
+    all_keys: set[str] = set()
+    for stratum in snapshot:
+        if stratum.key in all_keys:
+            raise ValueError(f"duplicate stratum key: {stratum.key}")
+        all_keys.add(stratum.key)
     explicit = None if weights is None else _weights_snapshot(weights)
     surviving = tuple(
         stratum
@@ -200,11 +240,7 @@ def standardized_rates(
     if not surviving:
         return StandardizedRates(None, None, None, MappingProxyType({}))
 
-    seen_keys: set[str] = set()
-    for stratum in surviving:
-        if stratum.key in seen_keys:
-            raise ValueError(f"duplicate surviving stratum key: {stratum.key}")
-        seen_keys.add(stratum.key)
+    surviving_keys = {stratum.key for stratum in surviving}
 
     if explicit is None:
         totals = {stratum.key: stratum.a + stratum.b + stratum.c + stratum.d for stratum in surviving}
@@ -215,14 +251,15 @@ def standardized_rates(
         }
     else:
         missing = sorted(
-            (key for key in seen_keys if key not in explicit), key=lambda key: key.encode("utf-8")
+            (key for key in surviving_keys if key not in explicit),
+            key=lambda key: key.encode("utf-8"),
         )
         if missing:
             raise ValueError(f"explicit weights are missing surviving stratum keys: {', '.join(missing)}")
         surviving_total = math.fsum(explicit[stratum.key] for stratum in surviving)
         normalized = {
             key: float(explicit[key] / surviving_total)
-            for key in sorted(seen_keys, key=lambda item: item.encode("utf-8"))
+            for key in sorted(surviving_keys, key=lambda item: item.encode("utf-8"))
         }
 
     by_key = {stratum.key: stratum for stratum in surviving}
