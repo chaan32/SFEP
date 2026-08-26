@@ -40,6 +40,41 @@ SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
 MATERIAL_CH1_1 = "sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a"
 TOKEN_RE = re.compile(rb"(?:" + rb"|".join(re.escape(token) for token in sorted(EXACT_ALLOWED_TOKENS)) + rb")")
+LINEAGE_OUTPUT_PATTERNS = {
+    "equipment_operating_ranges": re.compile(
+        r"^(?:schemaVersion|criteriaId|asOf|ranges\[\]\.(?:ruleId|field|fieldRole|"
+        r"firstAvailableStage|equipmentType|equipmentId|contextLevel|context(?:\.[a-z][a-z0-9_]*)?|"
+        r"support|median|p01|p05|p95|p99|lowerTailEnabled|upperTailEnabled))$"
+    ),
+    "quality_risk_intervals": re.compile(
+        r"^(?:schemaVersion|criteriaId|asOf|rules\[\]\.(?:ruleId|analysisFamily|evidenceFamily|"
+        r"firstAvailableStage|equipmentType|applicationScope|equipmentId|fieldNames\[\]|"
+        r"predicate\.allOf\[\]\.(?:field|type|lower|lowerInclusive|upper|upperInclusive|values\[\])|"
+        r"applicationContext(?:\.[a-z][a-z0-9_]*)?|adjustmentLevel|adjustmentFieldsDropped\[\]|"
+        r"adjustmentKind|grade|earlyWarningEligible|(?:discovery|confirmation)\.(?:support|defects|"
+        r"crudeRate|crudeRateCiLower|crudeRateCiUpper|adjustedRate|comparatorAdjustedRate|"
+        r"riskDifference|relativeRisk|relativeRiskCiLower|relativeRiskCiUpper|pValue|qValue|reasonCode)|"
+        r"displayMergeRuleIds\[\]))$"
+    ),
+    "replay_events": re.compile(
+        r"^(?:schema_version|bundle_id|criteria_id|event_id|replay_date|replay_hour|batch_kind|batch_id|"
+        r"equipment_batch_id|batch_step|time_precision|material_key|equipment_type|equipment_id|"
+        r"charge_id|slab_no|hr_coil_id|ap_prod_id|values_json\.[a-z][a-z0-9_]*)$"
+    ),
+    "analysis_summary": re.compile(
+        r"^(?:schemaVersion|bundleId|criteriaId|asOf|innerSplitDate|evaluationMode|"
+        r"dateRange\.(?:from|to)|splitCounts\.(?:reference|discovery|confirmation|holdout)\."
+        r"(?:total|defects|nonDefects|unknownOrCensored|dateFrom|dateTo)|"
+        r"quarantineCounts\.[A-Z][A-Z0-9_]*|labelCensoringCounts\.[A-Z][A-Z0-9_]*|"
+        r"sourceColumnProfiles\[\]\.(?:sourceRole|column|dataType|total|missing|unique|"
+        r"numeric\.(?:p05|median|p95)|levels\[\]\.(?:value|count))|"
+        r"driftMetrics\[\]\.(?:field|dataType|(?:reference|holdout)\."
+        r"(?:support|missingRate|p05|median|p95|levels\[\]\.(?:value|count)))|"
+        r"holdoutMetrics\[\]\.(?:alertGrade|total|truePositive|falsePositive|trueNegative|falseNegative|"
+        r"alertRate|precision|recall|baseDefectRate|lift|falseAlertsPer100|validBootstrapReplicates|"
+        r"ci\.(?:alertRate|precision|recall|baseDefectRate|lift|falseAlertsPer100)|reasonCode))$"
+    ),
+}
 
 
 def _load_schema(name: str) -> dict:
@@ -75,6 +110,50 @@ def _replace_tokens(data: bytes) -> bytes:
 
 
 def _canonical_json_bytes(value: object) -> bytes:
+    def encode_finite_binary64(number: float) -> str:
+        if not math.isfinite(number):
+            raise ValueError("JSON numbers must be finite binary64 values")
+        if number == 0.0:
+            return "0"
+
+        negative = number < 0.0
+        shortest = repr(abs(number)).lower()
+        coefficient, separator, exponent_text = shortest.partition("e")
+        exponent = int(exponent_text) if separator else 0
+        integer, dot, fraction = coefficient.partition(".")
+        digits = (integer + fraction).lstrip("0")
+        decimal_exponent = exponent - (len(fraction) if dot else 0)
+        while digits.endswith("0"):
+            digits = digits[:-1]
+            decimal_exponent += 1
+
+        if decimal_exponent >= 0:
+            fixed = digits + ("0" * decimal_exponent)
+        else:
+            point = len(digits) + decimal_exponent
+            fixed = (
+                digits[:point] + "." + digits[point:]
+                if point > 0
+                else "0." + ("0" * -point) + digits
+            )
+
+        unsigned_candidates = {fixed}
+        for point in range(1, len(digits) + 1):
+            mantissa = digits if point == len(digits) else digits[:point] + "." + digits[point:]
+            scientific_exponent = decimal_exponent + len(digits) - point
+            unsigned_candidates.add(f"{mantissa}e{scientific_exponent}")
+
+        prefix = "-" if negative else ""
+        candidates = {
+            prefix + candidate
+            for candidate in unsigned_candidates
+            if math.isfinite(float(prefix + candidate)) and float(prefix + candidate) == number
+        }
+        return min(
+            candidates,
+            key=lambda candidate: (len(candidate.encode("utf-8")), candidate.encode("utf-8")),
+        )
+
     def encode(node: object) -> str:
         if node is None:
             return "null"
@@ -85,17 +164,7 @@ def _canonical_json_bytes(value: object) -> bytes:
         if isinstance(node, int):
             return str(node)
         if isinstance(node, float):
-            if not math.isfinite(node):
-                raise ValueError("JSON numbers must be finite binary64 values")
-            if node == 0.0:
-                return "0"
-            spelling = repr(node).lower()
-            if "e" in spelling:
-                mantissa, exponent = spelling.split("e", 1)
-                if mantissa.endswith(".0"):
-                    mantissa = mantissa[:-2]
-                return f"{mantissa}e{int(exponent)}"
-            return spelling[:-2] if spelling.endswith(".0") else spelling
+            return encode_finite_binary64(node)
         if isinstance(node, str):
             return json.dumps(node, ensure_ascii=False, separators=(",", ":"))
         if isinstance(node, list):
@@ -179,12 +248,17 @@ def _validate_summary_application_contract(summary: dict) -> None:
     dependency_graph: dict[str, list[str]] = {}
     for field in lineage["fields"]:
         node_id = f'{field["artifactRole"]}.{field["outputField"]}'
+        output_pattern = LINEAGE_OUTPUT_PATTERNS.get(field["artifactRole"])
+        if output_pattern is not None:
+            assert output_pattern.fullmatch(field["outputField"]), "invalid lineage output field"
         raw = field["sourceRole"] is not None
         if raw:
             assert field["sourceColumn"] is not None
             assert field["firstAvailableStage"] is not None
             assert field["sourceColumn"] in source_headers[field["sourceRole"]]
             definition = config_fields[(field["sourceRole"], field["sourceColumn"])]
+            assert field["artifactRole"] == "replay_events"
+            assert field["outputField"] == f'values_json.{definition["field"]}'
             assert field["firstAvailableStage"] == definition["firstAvailableStage"]
         else:
             assert field["sourceColumn"] is None
@@ -672,11 +746,19 @@ def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and
 def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
     vectors = json.loads((CONTRACT / "canonical-number-test-vectors.json").read_text(encoding="utf-8"))
     assert vectors == [
+        {"name": "one", "hex": "0x1.0000000000000p+0", "expected": "1"},
+        {"name": "hundred-fixed-scientific-tie", "hex": "0x1.9000000000000p+6", "expected": "100"},
+        {"name": "thousand-prefers-scientific", "hex": "0x1.f400000000000p+9", "expected": "1e3"},
+        {"name": "ten-billion", "hex": "0x1.2a05f20000000p+33", "expected": "1e10"},
+        {"name": "hundredth-fixed-scientific-tie", "hex": "0x1.47ae147ae147bp-7", "expected": "0.01"},
+        {"name": "thousandth-prefers-scientific", "hex": "0x1.0624dd2f1a9fcp-10", "expected": "1e-3"},
+        {"name": "decimal-placement-fixed-tie", "hex": "0x1.2c00000000000p+10", "expected": "1200"},
+        {"name": "decimal-placement-scientific", "hex": "0x1.7700000000000p+13", "expected": "12e3"},
         {"name": "integral-float", "hex": "0x1.1800000000000p+10", "expected": "1120"},
         {"name": "negative-zero", "hex": "-0x0.0p+0", "expected": "0"},
         {"name": "small-exponent", "hex": "0x1.ad7f29abcaf48p-24", "expected": "1e-7"},
         {"name": "positive-exponent", "hex": "0x1.5af1d78b58c40p+66", "expected": "1e20"},
-        {"name": "maximum-finite", "hex": "0x1.fffffffffffffp+1023", "expected": "1.7976931348623157e308"},
+        {"name": "maximum-finite", "hex": "0x1.fffffffffffffp+1023", "expected": "17976931348623157e292"},
     ]
     for vector in vectors:
         value = float.fromhex(vector["hex"])
@@ -685,6 +767,75 @@ def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
     for value in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError, match="finite"):
             _canonical_json_bytes({"value": value})
+
+
+def test_raw_lineage_output_field_is_bound_to_artifact_source_and_config_mapping():
+    for wrong_output in ("values_json.not_f_pre_temp", "values_json.f_heat_temp"):
+        forged = _summary()
+        forged["lineage"]["fields"][0]["outputField"] = wrong_output
+        with pytest.raises(ValidationError):
+            _validator("analysis_summary.schema.json").validate(forged)
+        with pytest.raises((AssertionError, KeyError)):
+            _validate_summary_application_contract(forged)
+
+    valid_artifact_shapes = [
+        ("equipment_operating_ranges", "ranges[].median"),
+        ("quality_risk_intervals", "rules[].grade"),
+        ("analysis_summary", "driftMetrics[].reference.median"),
+    ]
+    for artifact_role, output_field in valid_artifact_shapes:
+        valid = _summary()
+        valid["lineage"]["fields"][1].update(
+            artifactRole=artifact_role, outputField=output_field
+        )
+        _validator("analysis_summary.schema.json").validate(valid)
+        _validate_summary_application_contract(valid)
+
+    wrong_artifact_shapes = [
+        ("equipment_operating_ranges", "values_json.f_pre_temp"),
+        ("quality_risk_intervals", "ranges[].median"),
+        ("analysis_summary", "rules[].grade"),
+    ]
+    for artifact_role, output_field in wrong_artifact_shapes:
+        invalid = _summary()
+        invalid["lineage"]["fields"][1].update(
+            artifactRole=artifact_role, outputField=output_field
+        )
+        with pytest.raises(ValidationError):
+            _validator("analysis_summary.schema.json").validate(invalid)
+        with pytest.raises(AssertionError, match="invalid lineage output field"):
+            _validate_summary_application_contract(invalid)
+
+
+def test_derived_lineage_node_dependencies_are_schema_valid_resolved_and_acyclic():
+    valid = _summary()
+    valid["lineage"]["fields"].append({
+        "artifactRole": "analysis_summary",
+        "outputField": "driftMetrics[].holdout.median",
+        "sourceRole": None,
+        "sourceColumn": None,
+        "conversion": "COPY_DERIVED_METRIC",
+        "dependencies": ["analysis_summary.driftMetrics[].reference.median"],
+        "firstAvailableStage": None,
+    })
+    _validator("analysis_summary.schema.json").validate(valid)
+    _validate_summary_application_contract(valid)
+
+    dangling = copy.deepcopy(valid)
+    dangling["lineage"]["fields"][-1]["dependencies"] = [
+        "analysis_summary.driftMetrics[].missing.median"
+    ]
+    _validator("analysis_summary.schema.json").validate(dangling)
+    with pytest.raises(AssertionError):
+        _validate_summary_application_contract(dangling)
+
+    cyclic = copy.deepcopy(valid)
+    cyclic["lineage"]["fields"][1]["dependencies"] = [
+        "analysis_summary.driftMetrics[].holdout.median"
+    ]
+    _validator("analysis_summary.schema.json").validate(cyclic)
+    with pytest.raises(AssertionError, match="cycle"):
+        _validate_summary_application_contract(cyclic)
 
 
 def test_replay_values_reject_wrong_types_missing_keys_and_future_stage_fields():
