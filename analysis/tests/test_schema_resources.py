@@ -40,7 +40,7 @@ SCHEMA_NAMES = (
 )
 LITERAL_ROOT_SHA256 = {
     "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-    "analysis_summary.schema.json": "0ae8e07595e5c87b509f7601c294de835fb35ab5d7b6843acc0971489d5da075",
+    "analysis_summary.schema.json": "c33bdef27fcea94553f296b9d2aab1d070d4de5a8db9dd96f970d7c76e99ff8c",
     "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
     "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
     "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -341,6 +341,16 @@ def test_summary_application_validation_closes_refs_order_cycles_roles_and_inter
     )
     invalid_instances = []
 
+    def lineage_field(
+        instance: dict[str, object], artifact_role: str, output_field: str
+    ) -> dict[str, object]:
+        return next(
+            item
+            for item in instance["lineage"]["fields"]
+            if item["artifactRole"] == artifact_role
+            and item["outputField"] == output_field
+        )
+
     invalid_purge = copy.deepcopy(summary)
     invalid_purge["chargePurgeCounts"]["outer"] = {
         "chargeCount": 1,
@@ -387,41 +397,36 @@ def test_summary_application_validation_closes_refs_order_cycles_roles_and_inter
     invalid_instances.append(unsorted_fields)
 
     unsorted_dependencies = copy.deepcopy(summary)
-    unsorted_dependencies["lineage"]["fields"][1]["dependencies"] = [
-        "policy.LOCKED_RETROSPECTIVE_HOLDOUT",
-        "fur_hr.f_pre_temp",
-    ]
+    reference_median = lineage_field(
+        unsorted_dependencies,
+        "analysis_summary",
+        "driftMetrics[].reference.median",
+    )
+    reference_median["dependencies"] = list(reversed(reference_median["dependencies"]))
     invalid_instances.append(unsorted_dependencies)
 
     cycle = copy.deepcopy(summary)
-    reference = copy.deepcopy(cycle["lineage"]["fields"][1])
+    reference = lineage_field(
+        cycle, "analysis_summary", "driftMetrics[].reference.median"
+    )
     reference["dependencies"] = [
         "analysis_summary.driftMetrics[].holdout.median"
     ]
-    holdout = copy.deepcopy(reference)
-    holdout["outputField"] = "driftMetrics[].holdout.median"
+    holdout = lineage_field(
+        cycle, "analysis_summary", "driftMetrics[].holdout.median"
+    )
     holdout["dependencies"] = [
         "analysis_summary.driftMetrics[].reference.median"
-    ]
-    cycle["lineage"]["fields"] = [
-        cycle["lineage"]["fields"][0],
-        holdout,
-        reference,
     ]
     invalid_instances.append(cycle)
 
     wrong_role_terminal = copy.deepcopy(summary)
-    runtime_field = copy.deepcopy(wrong_role_terminal["lineage"]["fields"][1])
-    runtime_field.update(
-        artifactRole="producer_runtime",
-        outputField="producer.sourceSha256",
-        conversion="COPY_VERIFIED_RUNTIME",
-        dependencies=["fur_hr.f_pre_temp"],
+    runtime_field = lineage_field(
+        wrong_role_terminal,
+        "producer_runtime",
+        "producer.sourceSha256",
     )
-    wrong_role_terminal["lineage"]["fields"] = [
-        runtime_field,
-        wrong_role_terminal["lineage"]["fields"][0],
-    ]
+    runtime_field["dependencies"] = ["fur_hr.f_pre_temp"]
     invalid_instances.append(wrong_role_terminal)
 
     for invalid in invalid_instances:
@@ -1147,6 +1152,13 @@ def test_installed_wheel_validates_all_schemas_from_arbitrary_cwd_without_networ
     (cwd / "analysis_config.json").write_bytes(
         (ANALYSIS_ROOT / "analysis_config.json").read_bytes()
     )
+    summary_instance_path = cwd / "analysis_summary.json"
+    summary_instance_path.write_bytes(
+        (CONTRACT_ROOT / "golden-expectation/analysis_summary.template.json")
+        .read_bytes()
+        .replace(b"@BUNDLE_ID@", b"sha256:" + b"1" * 64)
+        .replace(b"@CRITERIA_ID@", b"sha256:" + b"2" * 64)
+    )
     assert not (tmp_path / "contracts").exists()
     assert not (cwd / "contracts").exists()
     environment = os.environ.copy()
@@ -1161,9 +1173,7 @@ def test_installed_wheel_validates_all_schemas_from_arbitrary_cwd_without_networ
     environment["SFEP_SCHEMA_DIGESTS"] = json.dumps(
         LITERAL_ROOT_SHA256, sort_keys=True, separators=(",", ":")
     )
-    environment["SFEP_SUMMARY_INSTANCE"] = json.dumps(
-        _transitional_summary(), ensure_ascii=False, separators=(",", ":")
-    )
+    environment["SFEP_SUMMARY_INSTANCE_PATH"] = str(summary_instance_path)
     environment["PIP_NO_INDEX"] = "1"
     probe = subprocess.run(
         [
@@ -1186,7 +1196,7 @@ def test_installed_wheel_validates_all_schemas_from_arbitrary_cwd_without_networ
                 "assert load_analysis_config(Path('analysis_config.json')).analysis_config_version == 'quality-analysis-v1'\n"
                 "row = json.loads(os.environ['SFEP_REPLAY_INSTANCE'])\n"
                 "validate_normative_instance('replay_event_row.schema.json', row)\n"
-                "summary = json.loads(os.environ['SFEP_SUMMARY_INSTANCE'])\n"
+                "summary = json.loads(Path(os.environ['SFEP_SUMMARY_INSTANCE_PATH']).read_bytes())\n"
                 "validate_normative_instance('analysis_summary.schema.json', summary)\n"
                 "invalid_summary = copy.deepcopy(summary)\n"
                 "invalid_summary['splitCounts']['reference']['total'] += 1\n"

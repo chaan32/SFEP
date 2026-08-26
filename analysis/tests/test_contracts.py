@@ -9,7 +9,10 @@ import inspect
 import json
 import math
 import re
+import shutil
 import struct
+from collections import Counter
+from collections.abc import Mapping
 from datetime import date, timedelta
 from fractions import Fraction
 from pathlib import Path
@@ -162,7 +165,12 @@ CONVERSIONS = {
     "DERIVE_FUEL_RATIO", "COPY_CANONICAL_CONFIG", "COPY_VERIFIED_RUNTIME",
     "COMPUTE_IDENTITY", "COMPUTE_SHA256", "TYPE1_QUANTILE", "COUNT_PARTITION",
     "PROFILE_SOURCE_COLUMN", "COMPARE_DISTRIBUTIONS", "COMPUTE_HOLDOUT_METRIC",
-    "LINEAGE_INDEX_V1",
+    "LINEAGE_INDEX_V1", "COPY_IDENTITY_VALUE", "COPY_DIGEST_VALUE", "COPY_SCHEMA_VERSION",
+    "COPY_BOUNDARY_DATE", "SELECT_TIME_BOUNDARY", "COPY_SOURCE_METADATA", "COPY_FIELD_METADATA",
+    "PROJECT_ARTIFACT_METADATA", "COMPUTE_BYTE_SIZE", "SELECT_STAGE_VALUE",
+    "CLASSIFY_REPLAY_SCHEDULE", "SELECT_STAGE_EQUIPMENT", "DERIVE_RULE_CANDIDATE",
+    "COMPUTE_QUALITY_METRIC", "APPLY_GRADE_POLICY", "DERIVE_STAGE_ELIGIBILITY",
+    "MERGE_DISPLAY_INTERVALS", "COPY_POLICY_VALUE", "COMPUTE_DATE_RANGE",
 }
 AGGREGATE_FILTERS = {
     "STAGE_AVAILABLE_AT_AS_OF", "FINITE_VALUE", "LABEL_AVAILABLE_AND_MATURE",
@@ -498,6 +506,63 @@ def _validate_summary_application_contract(summary: dict) -> None:
     source_dependencies = {
         f"{role}.{column}" for role, columns in source_headers.items() for column in columns
     }
+    external_dependencies = source_dependencies | {
+        f"config.{path}" for path in (
+            "analysisConfigVersion", "bootstrap.minimumValidReplicates", "bootstrap.replicates",
+            "evidenceFamilies[]", "fdrFamilies[]", "fields[].dataType", "fields[].dependencies[]",
+            "fields[].equipmentType", "fields[].evidenceFamily", "fields[].featureRole",
+            "fields[].field", "fields[].firstAvailableStage", "fields[].sourceColumn",
+            "fields[].sourceRole", "fixedInteractions[][]", "labelMaturityDays",
+            "operatingRanges.extremeLowerQuantile", "operatingRanges.extremeTailMinimumSupport",
+            "operatingRanges.extremeUpperQuantile", "operatingRanges.minimumSupport",
+            "operatingRanges.quantileMethod", "operatingRanges.typicalLowerQuantile",
+            "operatingRanges.typicalUpperQuantile", "qualityRisk.bhQ.caution",
+            "qualityRisk.bhQ.danger", "qualityRisk.confirmationRelativeRisk.cautionExclusive",
+            "qualityRisk.confirmationRelativeRisk.danger", "qualityRisk.interactionBins",
+            "qualityRisk.minimumCautionDefects", "qualityRisk.minimumConfirmationDefects",
+            "qualityRisk.minimumConfirmationSupport", "qualityRisk.minimumDangerDefects",
+            "qualityRisk.minimumDiscoverySupport", "qualityRisk.minimumInformativeStrata",
+            "qualityRisk.numericBins", "qualityRisk.relativeRisk.caution",
+            "qualityRisk.relativeRisk.danger", "qualityRisk.riskDifference.caution",
+            "qualityRisk.riskDifference.danger", "qualityRisk.zeroCellCorrection",
+            "rangeContextHierarchies[].equipmentType", "rangeContextHierarchies[].levels[][]",
+            "riskAdjustmentHierarchies[].equipmentType", "riskAdjustmentHierarchies[].levels[][]",
+            "schemaVersion", "splits.discoveryFraction", "splits.referenceFraction", "timezone",
+            "wilsonZ",
+        )
+    } | {
+        f"runtime.{path}" for path in (
+            "environmentPolicy.floatPolicy", "environmentPolicy.localeIndependentParsing",
+            "environmentPolicy.pythonHashSeed", "environmentPolicy.timezone", "locks.bootstrap",
+            "locks.buildRequirements", "locks.producer", "locks.pyproject", "locks.requirements",
+            "locks.wheelhouse", "packages[].direct", "packages[].installedCodeTreeSha256",
+            "packages[].name", "packages[].version", "packages[].wheelFilename",
+            "packages[].wheelSha256", "packages[].wheelTag", "pipVersion", "platform.machine",
+            "platform.macosProductVersion", "platform.sysconfigPlatform", "platform.system",
+            "producer.installedCodeTreeSha256", "producer.name", "producer.sourceSha256",
+            "producer.version", "producer.wheelFilename", "producer.wheelSha256", "python.build",
+            "python.cacheTag", "python.executableSha256", "python.implementation", "python.soabi",
+            "python.version", "schemaVersion",
+        )
+    } | {
+        f"schema.{role}{suffix}"
+        for role in (
+            "analysis_config", "analysis_summary", "bundle_manifest",
+            "equipment_operating_ranges", "producer_runtime", "quality_risk_intervals",
+            "replay_events",
+        )
+        for suffix in ("", ".sha256")
+    } | {
+        f"source.{role}.{field}"
+        for role in ("ap", "fur_hr", "sm_cc")
+        for field in ("name", "sha256", "size_bytes")
+    } | {
+        "identity.analysis_config_sha256", "identity.bundle_id", "identity.criteria_id",
+        "identity.criteria_projection_sha256", "identity.producer_runtime_sha256",
+        "population.REFERENCE", "population.DISCOVERY", "population.CONFIRMATION",
+        "population.HOLDOUT", "policy.LOCKED_RETROSPECTIVE_HOLDOUT",
+        "policy.HOLDOUT_ALERT_DANGER", "policy.HOLDOUT_ALERT_CAUTION_OR_DANGER",
+    }
 
     for count in summary["splitCounts"].values():
         assert count["total"] == count["defects"] + count["nonDefects"] + count["unknownOrCensored"]
@@ -614,7 +679,7 @@ def _validate_summary_application_contract(summary: dict) -> None:
             if field["artifactRole"] != "replay_events":
                 assert field["firstAvailableStage"] is None
         for dependency in field["dependencies"]:
-            assert dependency in source_dependencies or dependency in lineage_node_ids
+            assert dependency in external_dependencies or dependency in lineage_node_ids
         dependency_graph[node_id] = [
             dependency for dependency in field["dependencies"] if dependency in lineage_node_ids
         ]
@@ -1137,6 +1202,8 @@ def test_summary_populations_and_aggregate_population_contract_are_exact():
 
 def test_lineage_vocabularies_and_all_seven_output_grammars_are_closed():
     validator = _validator("analysis_summary.schema.json")
+    field_schema = _load_schema("analysis_summary.schema.json")["$defs"]["fieldLineage"]
+    assert set(field_schema["properties"]["conversion"]["enum"]) == CONVERSIONS
     valid_shapes = (
         ("bundle_manifest", "artifacts[].sha256", "COMPUTE_SHA256", "schema.analysis_summary"),
         ("analysis_config", "qualityRisk.bhQ.danger", "COPY_CANONICAL_CONFIG", "config.qualityRisk.bhQ.danger"),
@@ -1320,7 +1387,19 @@ def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and
     fur_rows = list(csv.DictReader(io.StringIO(
         (CONTRACT / "golden-source" / "sts_2fur_hr_2.csv").read_text(encoding="cp949")
     )))
-    rule = rules["rules"][0]
+    rule = next(
+        item
+        for item in rules["rules"]
+        if item["predicate"]["allOf"] == [{
+            "field": "f_pre_interval",
+            "lower": 38,
+            "lowerInclusive": True,
+            "type": "NUMERIC_INTERVAL",
+            "upper": 38,
+            "upperInclusive": True,
+            "values": None,
+        }]
+    )
     rule_identity = {
         key: rule[key] for key in (
             "analysisFamily", "fieldNames", "predicate", "firstAvailableStage", "equipmentType",
@@ -1342,7 +1421,10 @@ def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and
         return lower_ok and upper_ok
 
     candidate_keys = [key for key in population["materialKeys"] if selected(float(by_key[key][term["field"]]))]
-    aggregate = next(item for item in summary["lineage"]["aggregates"] if item["ruleId"] == rule["ruleId"])
+    aggregate = next(
+        item for item in summary["lineage"]["aggregates"]
+        if item["ruleId"] == rule["ruleId"] and item["split"] == "DISCOVERY"
+    )
     assert candidate_keys
     assert aggregate["inputMaterialKeys"] == candidate_keys
     assert rule["discovery"]["support"] == len(candidate_keys)
@@ -1528,7 +1610,7 @@ def test_spelling_only_repairs_preserve_expectation_rows_objects_counts_and_ids(
     for name, (legacy_token, canonical_token) in repairs.items():
         current = (root / name).read_text(encoding="utf-8")
         assert current.count(legacy_token) == 0
-        assert current.count(canonical_token) == 1
+        assert current.count(canonical_token) > 0
         legacy = current.replace(canonical_token, legacy_token)
         if name.endswith(".json"):
             current_value = json.loads(current)
@@ -1538,13 +1620,13 @@ def test_spelling_only_repairs_preserve_expectation_rows_objects_counts_and_ids(
         elif name.endswith(".jsonl"):
             current_rows = [json.loads(line) for line in current.splitlines()]
             legacy_rows = [json.loads(line) for line in legacy.splitlines()]
-            assert len(current_rows) == len(legacy_rows) == 2
+            assert len(current_rows) == len(legacy_rows)
             assert current_rows == legacy_rows
             assert surface(current_rows) == surface(legacy_rows)
         else:
             current_rows = list(csv.DictReader(io.StringIO(current), strict=True))
             legacy_rows = list(csv.DictReader(io.StringIO(legacy), strict=True))
-            assert len(current_rows) == len(legacy_rows) == 8
+            assert len(current_rows) == len(legacy_rows)
             for current_row, legacy_row in zip(
                 current_rows, legacy_rows, strict=True
             ):
@@ -1640,6 +1722,52 @@ def test_derived_lineage_node_dependencies_are_schema_valid_resolved_and_acyclic
     _validator("analysis_summary.schema.json").validate(cyclic)
     with pytest.raises(AssertionError, match="cycle"):
         _validate_summary_application_contract(cyclic)
+
+
+def test_output_node_dependencies_allow_consecutive_normalized_array_segments_only():
+    field_schema = _load_schema("analysis_summary.schema.json")["$defs"]["fieldLineage"]
+    validator = validator_for(field_schema)(field_schema)
+    valid = {
+        "artifactRole": "bundle_manifest",
+        "outputField": "artifacts[].sha256",
+        "sourceRole": None,
+        "sourceColumn": None,
+        "conversion": "COMPUTE_SHA256",
+        "dependencies": [
+            "analysis_config.fixedInteractions[][]",
+            "analysis_config.rangeContextHierarchies[].levels[][]",
+            "analysis_config.riskAdjustmentHierarchies[].levels[][]",
+        ],
+        "firstAvailableStage": None,
+    }
+    validator.validate(valid)
+
+    for policy_terminal in (
+        "policy.HOLDOUT_ALERT_DANGER",
+        "policy.HOLDOUT_ALERT_CAUTION_OR_DANGER",
+    ):
+        policy = copy.deepcopy(valid)
+        policy["artifactRole"] = "analysis_summary"
+        policy["outputField"] = "holdoutMetrics[].alertGrade"
+        policy["conversion"] = "COPY_POLICY_VALUE"
+        policy["dependencies"] = [policy_terminal]
+        validator.validate(policy)
+
+    for malformed in (
+        "analysis_config.fixedInteractions[",
+        "analysis_config.fixedInteractions[]]",
+        "analysis_config.fixedInteractions[0]",
+        "analysis_config.fixedInteractions[][][]x",
+    ):
+        invalid = copy.deepcopy(valid)
+        invalid["dependencies"] = [malformed]
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+    arbitrary_policy = copy.deepcopy(valid)
+    arbitrary_policy["dependencies"] = ["policy.HOLDOUT_ALERT_WARNING"]
+    with pytest.raises(ValidationError):
+        validator.validate(arbitrary_policy)
 
 
 def test_replay_values_reject_wrong_types_missing_keys_and_future_stage_fields():
@@ -1820,7 +1948,16 @@ def test_slab_grind_replay_and_semantic_golden_use_a_categorical_code():
             encoding="utf-8"
         )
     )))
-    cast_values = json.loads(replay_rows[0]["values_json"])
+    source_material_key = _digest_id(
+        "sfep-material-key/v1",
+        {"chargeId": source_row["charge_id"], "slabNo": source_row["slab_no"]},
+    )[1]
+    cast_row = next(
+        row for row in replay_rows
+        if row["material_key"] == source_material_key
+        and row["batch_step"] == "CAST_RECORDED"
+    )
+    cast_values = json.loads(cast_row["values_json"])
     projection = [
         json.loads(line)
         for line in (
@@ -1828,7 +1965,11 @@ def test_slab_grind_replay_and_semantic_golden_use_a_categorical_code():
         ).read_text(encoding="utf-8").splitlines()
     ]
     mature_features = next(
-        item["features"] for item in projection if item["kind"] == "MATURE_QUALITY_INPUT"
+        item["features"]
+        for item in projection
+        if item["kind"] == "MATURE_QUALITY_INPUT"
+        and item["chargeId"] == source_row["charge_id"]
+        and item["slabNo"] == source_row["slab_no"]
     )
     assert source_row["slab_grind"] == "HSHS"
     assert cast_values["slab_grind"] == "HSHS"
@@ -2009,17 +2150,41 @@ def test_golden_summary_censoring_and_counts_match_literal_source_audit():
     assert [item["alertGrade"] for item in summary["holdoutMetrics"]] == [
         "DANGER", "CAUTION_OR_DANGER",
     ]
-    # Repair 2 replaces this intentionally partial, schema-valid transition fixture.
-    assert len(summary["lineage"]["materials"]) == 1
-    assert len(summary["lineage"]["aggregates"]) == 1
+    material_key_by_coil = {
+        coil_id: _digest_id(
+            "sfep-material-key/v1", {"chargeId": charge_id, "slabNo": slab_no}
+        )[1]
+        for charge_id, slab_no, coil_id, _ in fur_materials
+    }
+    assert {
+        item["materialKey"] for item in summary["lineage"]["materials"]
+    } == set(material_key_by_coil.values())
+    assert len(summary["lineage"]["materials"]) == 12
+    assert len(summary["lineage"]["aggregates"]) == 330
     assert {
         item["populationRef"]: item["materialKeys"]
         for item in summary["lineage"]["populations"]
     } == {
-        "REFERENCE": [MATERIAL_CH1_1],
-        "DISCOVERY": [MATERIAL_CH1_1],
-        "CONFIRMATION": [],
-        "HOLDOUT": [],
+        "REFERENCE": sorted(
+            material_key_by_coil[coil]
+            for coil, (split, _) in expected_outcomes.items()
+            if split != "HOLDOUT"
+        ),
+        "DISCOVERY": sorted(
+            material_key_by_coil[coil]
+            for coil, (split, _) in expected_outcomes.items()
+            if split == "DISCOVERY"
+        ),
+        "CONFIRMATION": sorted(
+            material_key_by_coil[coil]
+            for coil, (split, _) in expected_outcomes.items()
+            if split == "CONFIRMATION"
+        ),
+        "HOLDOUT": sorted(
+            material_key_by_coil[coil]
+            for coil, (split, _) in expected_outcomes.items()
+            if split == "HOLDOUT"
+        ),
     }
     assert summary["splitCounts"] == {
         "confirmation": {
@@ -2040,7 +2205,7 @@ def test_golden_summary_censoring_and_counts_match_literal_source_audit():
         },
     }
     expected_alerts = json.loads((expectation_root / "expected_alerts.json").read_bytes())
-    assert expected_alerts["expectedReplayEventCount"] == 8
+    assert expected_alerts["expectedReplayEventCount"] == 95
     assert expected_alerts["alerts"] == []
 
 
@@ -2079,10 +2244,19 @@ def test_golden_expectations_use_only_allowed_provenance_tokens_and_validate():
     )
     rows = list(csv.DictReader(io.StringIO(replay_text)))
     assert rows
-    assert [row["batch_step"] for row in rows] == [
+    core_steps = [
         "CAST_RECORDED", "FURNACE_CHARGED", "PREHEAT_COMPLETE", "HEAT_COMPLETE",
-        "SOAK_COMPLETE", "FURNACE_EXTRACTED", "RM4_RECORDED", "AP_RECORDED_WITH_RESULT",
+        "SOAK_COMPLETE", "FURNACE_EXTRACTED", "RM4_RECORDED",
     ]
+    steps_by_material: dict[str, list[str]] = {}
+    for row in rows:
+        steps_by_material.setdefault(row["material_key"], []).append(row["batch_step"])
+    assert len(steps_by_material) == 12
+    assert sum(steps == core_steps for steps in steps_by_material.values()) == 1
+    assert sum(
+        steps == [*core_steps, "AP_RECORDED_WITH_RESULT"]
+        for steps in steps_by_material.values()
+    ) == 11
     assert len({row["event_id"] for row in rows}) == len(rows)
     for row in rows:
         instance = {key: (None if value == "" else value) for key, value in row.items()}
@@ -2107,3 +2281,585 @@ def test_golden_expectations_use_only_allowed_provenance_tokens_and_validate():
     assert alerts["schemaVersion"] == "sfep-expected-alerts/v1"
     assert alerts["expectedReplayEventCount"] == len(rows)
     assert alerts["alerts"] == []
+
+
+def _isolated_golden_oracle_root(tmp_path: Path) -> Path:
+    root = tmp_path / "oracle-root"
+    source_root = root / "golden-source"
+    source_root.mkdir(parents=True)
+    shutil.copyfile(Path("analysis/analysis_config.json"), root / "analysis_config.json")
+    for name in ("sts_1sm_cc_1.csv", "sts_2fur_hr_2.csv", "sts_3ap_3.csv"):
+        shutil.copyfile(CONTRACT / "golden-source" / name, source_root / name)
+    assert sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+    ) == [
+        "analysis_config.json",
+        "golden-source/sts_1sm_cc_1.csv",
+        "golden-source/sts_2fur_hr_2.csv",
+        "golden-source/sts_3ap_3.csv",
+    ]
+    return root
+
+
+def test_independent_golden_oracle_has_one_read_only_stdlib_surface():
+    oracle_path = Path("analysis/tests/oracles/golden_semantics.py")
+    assert oracle_path.is_file()
+    source_bytes = oracle_path.read_bytes()
+    assert len(source_bytes) == 94_171
+    assert hashlib.sha256(source_bytes).hexdigest() == (
+        "377a65607ba437d3a9217afcca5c0d83a440d192e680e384e6988b59cf466dfa"
+    )
+    source = source_bytes.decode("utf-8")
+    tree = ast.parse(source)
+
+    forbidden_import_roots = {
+        "equipment_quality", "numpy", "pandas", "scipy", "jsonschema",
+        "analysis.tests.factories", "analysis.tests.test_contracts",
+    }
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not {
+        name
+        for name in imported
+        if any(name == root or name.startswith(root + ".") for root in forbidden_import_roots)
+    }
+
+    forbidden_calls = {
+        "eval", "exec", "compile", "__import__", "import_module",
+        "ArgumentParser", "parse_args", "parse_known_args",
+        "write_bytes", "write_text", "mkdir", "makedirs", "touch", "unlink",
+        "rmdir", "remove", "rename", "replace", "copy", "copyfile", "move",
+    }
+    calls = {
+        node.func.id
+        if isinstance(node.func, ast.Name)
+        else node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, (ast.Name, ast.Attribute))
+    }
+    assert not calls.intersection(forbidden_calls)
+    assert "repr" not in calls
+    assert "format" not in calls
+
+    public_functions = [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    ]
+    assert public_functions == ["build_golden_semantics"]
+    assert "golden-expectation" not in source
+
+
+def test_independent_golden_oracle_derives_complete_immutable_bytes(tmp_path):
+    from analysis.tests.oracles.golden_semantics import build_golden_semantics
+
+    root = _isolated_golden_oracle_root(tmp_path)
+    before = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    result = build_golden_semantics(root)
+    assert isinstance(result, Mapping)
+    assert set(result) == {
+        "analysis_summary.template.json",
+        "criteria_projection.jsonl",
+        "equipment_operating_ranges.template.json",
+        "expected_alerts.json",
+        "quality_risk_intervals.template.json",
+        "replay_events.template.csv",
+    }
+    assert all(type(value) is bytes for value in result.values())
+    expected_outputs = {
+        "analysis_summary.template.json": (
+            455_832, "72a1ecf6ef81a3626aea4f0f78414d0bc7ff711fc39c8d42fbbb8b7067fb8b2d",
+        ),
+        "criteria_projection.jsonl": (
+            79_246, "6842fabd1cc79ca801e34bb0708498f4bea16317d4449e6d773e28e40c94ff5c",
+        ),
+        "equipment_operating_ranges.template.json": (
+            106, "77fa2a0665d6d5bf0cbd754b56a86c38b159cfa26abee6685fc910cf7e546581",
+        ),
+        "expected_alerts.json": (
+            1_244, "2c3bb6bc8e29fe077e71fd8f1b54efaa272ca31ae2676e87be8bcf549bc550ed",
+        ),
+        "quality_risk_intervals.template.json": (
+            260_272, "d47e7d8c230f31f56719056fc3a79505847863a51e686b1aac1aee9505143996",
+        ),
+        "replay_events.template.csv": (
+            47_904, "c516b9f8cebc2642b9c9b75a3bc12f1608df651522ccb2a65c2eb5c1424ce17c",
+        ),
+    }
+    for name, (size, digest) in expected_outputs.items():
+        assert len(result[name]) == size
+        assert hashlib.sha256(result[name]).hexdigest() == digest
+        assert (CONTRACT / "golden-expectation" / name).read_bytes() == result[name]
+    with pytest.raises(TypeError):
+        result["criteria_projection.jsonl"] = b"forbidden"  # type: ignore[index]
+    after = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+    assert hashlib.sha256((root / "analysis_config.json").read_bytes()).hexdigest() == (
+        "bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b"
+    )
+    assert {
+        name: hashlib.sha256((root / "golden-source" / name).read_bytes()).hexdigest()
+        for name in ("sts_1sm_cc_1.csv", "sts_2fur_hr_2.csv", "sts_3ap_3.csv")
+    } == {
+        "sts_1sm_cc_1.csv": "c3bba5c7235166b6693ff657a25797933ea9d83c6392437af9b5141f4e56a68c",
+        "sts_2fur_hr_2.csv": "973e864ed996ca48c44a00943efc0ea51a878b94b8aac7452c7254a572fe7e67",
+        "sts_3ap_3.csv": "efaef9f283a28e63dff54b26bc3dd42c6a72e20f0b75d2fa13a6ab47f41405c9",
+    }
+
+    projection = result["criteria_projection.jsonl"]
+    projection_rows = [json.loads(line) for line in projection.splitlines()]
+    assert len(projection_rows) == 268
+    assert len(projection) == 79_246
+    assert sum(row["kind"] == "OPERATING_RANGE_INPUT" for row in projection_rows) == 261
+    assert sum(row["kind"] == "MATURE_QUALITY_INPUT" for row in projection_rows) == 7
+    assert hashlib.sha256(projection).hexdigest() == (
+        "6842fabd1cc79ca801e34bb0708498f4bea16317d4449e6d773e28e40c94ff5c"
+    )
+
+    ranges = json.loads(result["equipment_operating_ranges.template.json"])
+    assert ranges["asOf"] == "2025-02-20"
+    assert ranges["ranges"] == []
+
+    rules = json.loads(result["quality_risk_intervals.template.json"])
+    assert len(result["quality_risk_intervals.template.json"]) == 260_272
+    assert hashlib.sha256(result["quality_risk_intervals.template.json"]).hexdigest() == (
+        "d47e7d8c230f31f56719056fc3a79505847863a51e686b1aac1aee9505143996"
+    )
+    assert len(rules["rules"]) == 165
+    assert {rule["grade"] for rule in rules["rules"]} == {"INSUFFICIENT_EVIDENCE"}
+    assert {
+        family: sum(rule["analysisFamily"] == family for rule in rules["rules"])
+        for family in ("NUMERIC", "CATEGORICAL", "INTERACTION")
+    } == {"NUMERIC": 113, "CATEGORICAL": 25, "INTERACTION": 27}
+    rule_ids = b"".join((rule["ruleId"] + "\n").encode("ascii") for rule in rules["rules"])
+    assert hashlib.sha256(rule_ids).hexdigest() == (
+        "32873af746cdaf4e300f3efd136074cf98f6ed601f0d2d6c7c856d98144deee2"
+    )
+    assert sum(bool(rule["displayMergeRuleIds"]) for rule in rules["rules"]) == 113
+    assert Counter(len(rule["displayMergeRuleIds"]) for rule in rules["rules"]) == {
+        0: 52, 3: 27, 4: 16, 5: 70,
+    }
+    assert Counter(rule["discovery"]["reasonCode"] for rule in rules["rules"]) == {
+        "LOW_SUPPORT": 165,
+    }
+    assert Counter(rule["discovery"]["support"] for rule in rules["rules"]) == {
+        1: 129, 2: 27, 3: 4, 4: 5,
+    }
+    assert Counter(rule["discovery"]["defects"] for rule in rules["rules"]) == {0: 122, 1: 43}
+    assert Counter(rule["confirmation"]["reasonCode"] for rule in rules["rules"]) == {
+        "NO_INFORMATIVE_STRATA": 155, "LOW_SUPPORT": 10,
+    }
+    assert Counter(rule["confirmation"]["support"] for rule in rules["rules"]) == {0: 155, 1: 10}
+    assert {rule["confirmation"]["defects"] for rule in rules["rules"]} == {0}
+    by_rule_id = {rule["ruleId"]: rule for rule in rules["rules"]}
+    assert by_rule_id[
+        "sha256:3c3447df2f9c16c0d2bbe54e88126eef9194e511306aac71b72fe19b8a909715"
+    ]["adjustmentFieldsDropped"] == [
+        "delta_ferrite", "delta_ferrite_band", "mlac_ratio", "tundish_temp",
+    ]
+    assert by_rule_id[
+        "sha256:5130184417af466f31384f1a92a78c14e41807e73b040e99a853bfaaaa08db7b"
+    ]["adjustmentFieldsDropped"] == [
+        "f_heat_interval", "f_heat_interval_band", "f_heat_temp", "f_heat_temp_band",
+    ]
+    assert by_rule_id[
+        "sha256:ebb6ab4f687f6a5152812f2080e7a8f2c5accfe8c4211c3b0c271312bdceca28"
+    ]["adjustmentFieldsDropped"] == [
+        "ap_line_speed", "ap_line_speed_band", "ap_thick_band", "ap_width_band",
+    ]
+
+    replay_text = result["replay_events.template.csv"].decode("utf-8")
+    replay_rows = list(csv.DictReader(io.StringIO(replay_text)))
+    assert len(replay_rows) == 95
+    event_ids = b"".join((row["event_id"] + "\n").encode("ascii") for row in replay_rows)
+    assert hashlib.sha256(event_ids).hexdigest() == (
+        "efbc5963a584dd79b84e2455044645d7d51b1f4c5d6721b0b2b38f9ccf2142ab"
+    )
+    assert len(result["replay_events.template.csv"]) == 47_904
+    assert hashlib.sha256(result["replay_events.template.csv"]).hexdigest() == (
+        "c516b9f8cebc2642b9c9b75a3bc12f1608df651522ccb2a65c2eb5c1424ce17c"
+    )
+    h001 = [row for row in replay_rows if row["charge_id"] == "CH1" and row["slab_no"] == "1"]
+    h006 = [row for row in replay_rows if row["charge_id"] == "CH3" and row["slab_no"] == "2"]
+    assert len(h001) == 8
+    assert len(h006) == 7
+    assert all(row["batch_step"] != "AP_RECORDED_WITH_RESULT" for row in h006)
+    extracted = next(row for row in h001 if row["batch_step"] == "FURNACE_EXTRACTED")
+    assert json.loads(extracted["values_json"])["f_ext_time"] == 7
+
+    summary = json.loads(result["analysis_summary.template.json"])
+    assert len(result["analysis_summary.template.json"]) == 455_832
+    assert hashlib.sha256(result["analysis_summary.template.json"]).hexdigest() == (
+        "72a1ecf6ef81a3626aea4f0f78414d0bc7ff711fc39c8d42fbbb8b7067fb8b2d"
+    )
+    resolved_summary = json.loads(
+        result["analysis_summary.template.json"]
+        .replace(b"@BUNDLE_ID@", b"sha256:" + b"1" * 64)
+        .replace(b"@CRITERIA_ID@", b"sha256:" + b"2" * 64)
+    )
+    from analysis.equipment_quality.schema import validate_normative_instance
+
+    validate_normative_instance("analysis_summary.schema.json", resolved_summary)
+    assert summary["asOf"] == "2025-02-20"
+    assert summary["innerSplitDate"] == "2025-01-03"
+    assert summary["quarantineCounts"] == {"DUPLICATE_AP_KEY": 2, "UNLINKED_AP": 1}
+    assert summary["labelCensoringCounts"] == {
+        "AP_UNLINKED": 1, "LABEL_NOT_YET_AVAILABLE": 2,
+    }
+    assert [
+        summary["splitCounts"][name]["total"]
+        for name in ("reference", "discovery", "confirmation", "holdout")
+    ] == [10, 5, 2, 2]
+    assert len(summary["sourceColumnProfiles"]) == 50
+    assert len(summary["driftMetrics"]) == 37
+    assert len(summary["holdoutMetrics"]) == 2
+    assert len(summary["lineage"]["materials"]) == 12
+    assert len(summary["lineage"]["populations"]) == 4
+    assert len(summary["lineage"]["aggregates"]) == 330
+    assert summary["dateRange"] == {"from": "2025-01-01", "to": "2025-04-02"}
+    assert summary["splitCounts"] == {
+        "confirmation": {"dateFrom": "2025-01-04", "dateTo": "2025-01-04", "defects": 0, "nonDefects": 2, "total": 2, "unknownOrCensored": 0},
+        "discovery": {"dateFrom": "2025-01-01", "dateTo": "2025-01-03", "defects": 1, "nonDefects": 4, "total": 5, "unknownOrCensored": 0},
+        "holdout": {"dateFrom": "2025-02-21", "dateTo": "2025-02-21", "defects": 1, "nonDefects": 1, "total": 2, "unknownOrCensored": 0},
+        "reference": {"dateFrom": "2025-01-01", "dateTo": "2025-02-20", "defects": 1, "nonDefects": 6, "total": 10, "unknownOrCensored": 3},
+    }
+    component_expectations = {
+        "sourceColumnProfiles": (10_514, "09f60fe477b885f64f4eac1b3bacdda8f828de70d54ba5a2515a1e44cff3f910"),
+        "driftMetrics": (9_486, "454f30e7be94d7b6da1bee37391b53d625e0c6c9327977fb351cbdecd1bd15f9"),
+        "holdoutMetrics": (1_455, "8a472f5c4966bb68494c6d39b5ea14b18456c0ed66e38113af15eeb75fcd3ead"),
+    }
+    for name, (size, digest) in component_expectations.items():
+        payload = _canonical_json_bytes(summary[name])
+        assert len(payload) == size
+        assert hashlib.sha256(payload).hexdigest() == digest
+    lineage_component_expectations = {
+        "materials": (3_944, "0c4a97f9df86f07e46742baeace60e5839ee7de1fcaa9106e90c0d7d83cb7d90"),
+        "populations": (1_678, "bcc35e7c3e0128d534271676d7b86f90087a864c290ae7fc347525e77eb59102"),
+        "aggregates": (158_617, "cd0bd97dcf1d5f0ca3e4ab2a9092c7d2a51a21100f4c9051684cabf631f37dfb"),
+    }
+    for name, (size, digest) in lineage_component_expectations.items():
+        payload = _canonical_json_bytes(summary["lineage"][name])
+        assert len(payload) == size
+        assert hashlib.sha256(payload).hexdigest() == digest
+    summary_core = _canonical_json_bytes({key: value for key, value in summary.items() if key != "lineage"})
+    assert len(summary_core) == 22_480
+    assert hashlib.sha256(summary_core).hexdigest() == (
+        "d01ad5261a7cda263df560413ca2fd047454df0f824181e9416111ca487cb655"
+    )
+    expected_profile_order = []
+    for source_role, source_name in (
+        ("sm_cc", "sts_1sm_cc_1.csv"),
+        ("fur_hr", "sts_2fur_hr_2.csv"),
+        ("ap", "sts_3ap_3.csv"),
+    ):
+        header = next(csv.reader(io.StringIO(
+            (root / "golden-source" / source_name).read_text(encoding="cp949")
+        )))
+        expected_profile_order.extend((source_role, column) for column in header)
+    assert [(item["sourceRole"], item["column"]) for item in summary["sourceColumnProfiles"]] == expected_profile_order
+    config = json.loads((root / "analysis_config.json").read_bytes())
+    stage_rank = {
+        "CAST_RECORDED": 0, "FURNACE_CHARGED": 10, "PREHEAT_COMPLETE": 11,
+        "HEAT_COMPLETE": 12, "SOAK_COMPLETE": 13, "FURNACE_EXTRACTED": 14,
+        "RM4_RECORDED": 15, "AP_RECORDED_WITH_RESULT": 20,
+    }
+    quality_fields = {
+        item["field"]: item for item in config["fields"]
+        if item["featureRole"] in {"DIRECT_OPERATION", "PRODUCT_STATE_REFERENCE", "CONTEXT", "EQUIPMENT_IDENTIFIER"}
+    }
+    assert [item["field"] for item in summary["driftMetrics"]] == sorted(
+        quality_fields,
+        key=lambda field: (stage_rank[quality_fields[field]["firstAvailableStage"]], field.encode("utf-8")),
+    )
+    for field in ("ap_line_speed", "ap_plant", "ap_shift", "ap_thick", "ap_width"):
+        drift = next(item for item in summary["driftMetrics"] if item["field"] == field)
+        assert drift["reference"]["support"] == 7
+        assert drift["reference"]["missingRate"] == 0.3
+        assert drift["holdout"]["support"] == 2
+        assert drift["holdout"]["missingRate"] == 0.0
+    materials_by_coil = {item["hrCoilId"]: item for item in summary["lineage"]["materials"]}
+    assert [(item["role"], item["recordNumber"]) for item in materials_by_coil["H001"]["sourceRecords"]] == [("sm_cc", 2), ("fur_hr", 2), ("ap", 2)]
+    assert [(item["role"], item["recordNumber"]) for item in materials_by_coil["H006"]["sourceRecords"]] == [("sm_cc", 7), ("fur_hr", 7)]
+    assert [(item["role"], item["recordNumber"]) for item in materials_by_coil["H009"]["sourceRecords"]] == [("sm_cc", 10), ("fur_hr", 10), ("ap", 10)]
+    assert [(item["role"], item["recordNumber"]) for item in materials_by_coil["H011"]["sourceRecords"]] == [("sm_cc", 12), ("fur_hr", 12), ("ap", 12)]
+    aggregates = summary["lineage"]["aggregates"]
+    assert [(item["ruleId"], item["split"]) for item in aggregates] == sorted(
+        ((item["ruleId"], item["split"]) for item in aggregates),
+        key=lambda item: (item[0].encode("utf-8"), 0 if item[1] == "CONFIRMATION" else 1),
+    )
+    reduced_aggregates = _canonical_json_bytes([{
+        "inputMaterialKeys": item["inputMaterialKeys"], "ruleId": item["ruleId"], "split": item["split"],
+    } for item in aggregates])
+    assert len(reduced_aggregates) == 59_212
+    assert hashlib.sha256(reduced_aggregates).hexdigest() == (
+        "c6e2f6404b5943859676ccd29fe20e62382dcae7f21ed6a21dd6d337f54c7056"
+    )
+    assert sum(not item["inputMaterialKeys"] for item in aggregates if item["split"] == "CONFIRMATION") == 155
+    assert all(item["inputMaterialKeys"] for item in aggregates if item["split"] == "DISCOVERY")
+    role_order = (
+        "bundle_manifest", "analysis_config", "producer_runtime", "equipment_operating_ranges",
+        "quality_risk_intervals", "replay_events", "analysis_summary",
+    )
+    field_counts = Counter(item["artifactRole"] for item in summary["lineage"]["fields"])
+    assert field_counts == {
+        "bundle_manifest": 37, "analysis_config": 49, "producer_runtime": 35,
+        "equipment_operating_ranges": 3, "quality_risk_intervals": 53,
+        "replay_events": 61, "analysis_summary": 107,
+    }
+    normalized_paths = b"".join(
+        (role + "\t" + item["outputField"] + "\n").encode("utf-8")
+        for role in role_order
+        for item in sorted(
+            (field for field in summary["lineage"]["fields"] if field["artifactRole"] == role),
+            key=lambda field: field["outputField"].encode("utf-8"),
+        )
+    )
+    assert hashlib.sha256(normalized_paths).hexdigest() == (
+        "30e7754507d5fda136ce7bf8dff8517182b7b0276988ac2903acc47050e47200"
+    )
+    assert not any(item["outputField"] == "values_json" for item in summary["lineage"]["fields"])
+    field_lineage = summary["lineage"]["fields"]
+    field_lineage_bytes = _canonical_json_bytes(field_lineage)
+    assert len(field_lineage_bytes) == 269_053
+    assert hashlib.sha256(field_lineage_bytes).hexdigest() == (
+        "d15bf75a994e991e647ebc5e228994d98cddf62af5c59288faeb6b1126170140"
+    )
+    assert sum(len(item["dependencies"]) for item in field_lineage) == 5_173
+    field_by_node = {
+        (item["artifactRole"], item["outputField"]): item for item in field_lineage
+    }
+    assert Counter(item["conversion"] for item in field_lineage) == {
+        "APPLY_GRADE_POLICY": 1,
+        "CLASSIFY_REPLAY_SCHEDULE": 3,
+        "COMPARE_DISTRIBUTIONS": 14,
+        "COMPUTE_BYTE_SIZE": 1,
+        "COMPUTE_DATE_RANGE": 2,
+        "COMPUTE_HOLDOUT_METRIC": 30,
+        "COMPUTE_IDENTITY": 7,
+        "COMPUTE_QUALITY_METRIC": 28,
+        "COMPUTE_SHA256": 1,
+        "COPY_BOUNDARY_DATE": 2,
+        "COPY_CANONICAL_CONFIG": 51,
+        "COPY_DIGEST_VALUE": 16,
+        "COPY_FIELD_METADATA": 4,
+        "COPY_IDENTITY_VALUE": 7,
+        "COPY_POLICY_VALUE": 2,
+        "COPY_SCHEMA_VERSION": 6,
+        "COPY_SOURCE_METADATA": 9,
+        "COPY_SOURCE_SCALAR": 15,
+        "COPY_VERIFIED_RUNTIME": 35,
+        "COUNT_PARTITION": 37,
+        "DERIVE_FUEL_RATIO": 3,
+        "DERIVE_RULE_CANDIDATE": 18,
+        "DERIVE_STAGE_ELIGIBILITY": 1,
+        "MERGE_DISPLAY_INTERVALS": 1,
+        "PARSE_DATE": 4,
+        "PARSE_FINITE_BINARY64": 24,
+        "PARSE_HOUR_BUCKET": 1,
+        "PROFILE_SOURCE_COLUMN": 13,
+        "PROJECT_ARTIFACT_METADATA": 1,
+        "SELECT_STAGE_EQUIPMENT": 2,
+        "SELECT_STAGE_VALUE": 2,
+        "SELECT_TIME_BOUNDARY": 4,
+    }
+    assert max(len(item["dependencies"]) for item in field_lineage) == 308
+    assert all(
+        f'{item["artifactRole"]}.{item["outputField"]}' not in item["dependencies"]
+        and all(".lineage" not in dependency for dependency in item["dependencies"])
+        for item in field_lineage
+    )
+    non_manifest_nodes = sorted(
+        f'{item["artifactRole"]}.{item["outputField"]}'
+        for item in field_lineage
+        if item["artifactRole"] != "bundle_manifest"
+    )
+    for output_field, conversion in (
+        ("artifacts[].sha256", "COMPUTE_SHA256"),
+        ("artifacts[].sizeBytes", "COMPUTE_BYTE_SIZE"),
+    ):
+        attestation = field_by_node[("bundle_manifest", output_field)]
+        assert attestation["conversion"] == conversion
+        assert attestation["dependencies"] == non_manifest_nodes
+    assert field_by_node[("bundle_manifest", "identity.source.sm_cc.sha256")][
+        "dependencies"
+    ] == ["source.sm_cc.sha256"]
+    assert field_by_node[("bundle_manifest", "identity.schema.analysis_config.sha256")] == {
+        "artifactRole": "bundle_manifest",
+        "conversion": "COPY_DIGEST_VALUE",
+        "dependencies": ["schema.analysis_config.sha256"],
+        "firstAvailableStage": None,
+        "outputField": "identity.schema.analysis_config.sha256",
+        "sourceColumn": None,
+        "sourceRole": None,
+    }
+    assert field_by_node[("analysis_config", "fixedInteractions[][]")]["dependencies"] == [
+        "config.fixedInteractions[][]",
+    ]
+    assert field_by_node[("producer_runtime", "packages[].wheelSha256")]["dependencies"] == [
+        "runtime.packages[].wheelSha256",
+    ]
+    assert field_by_node[("replay_events", "charge_id")]["dependencies"] == []
+    assert field_by_node[("replay_events", "charge_id")]["sourceRole"] == "sm_cc"
+    assert field_by_node[("replay_events", "slab_no")]["sourceRole"] == "fur_hr"
+    assert field_by_node[("replay_events", "values_json.f_bfg_ratio")]["dependencies"] == [
+        "fur_hr.f_bfg", "fur_hr.f_cog", "fur_hr.f_ldg",
+    ]
+    assert field_by_node[("replay_events", "batch_step")]["dependencies"] == [
+        "ap.ap_prod_id", "ap.hr_coil_id", "fur_hr.hr_coil_id",
+        "replay_events.material_key",
+    ]
+    assert field_by_node[("replay_events", "replay_date")]["dependencies"] == [
+        "ap.ap_date", "fur_hr.f_ext_date", "replay_events.batch_step", "sm_cc.cast_date",
+    ]
+    assert field_by_node[("replay_events", "event_id")]["dependencies"] == [
+        "replay_events.batch_id", "replay_events.batch_step",
+        "replay_events.equipment_batch_id", "replay_events.equipment_id",
+        "replay_events.equipment_type", "replay_events.material_key",
+    ]
+    assert len(field_by_node[(
+        "analysis_summary", "sourceColumnProfiles[].numeric.p05",
+    )]["dependencies"]) == 28
+    assert len(field_by_node[(
+        "analysis_summary", "driftMetrics[].reference.median",
+    )]["dependencies"]) == 31
+    for leaf in (
+        "support", "missingRate", "p05", "median", "p95", "levels[].value", "levels[].count",
+    ):
+        assert "analysis_summary.asOf" in field_by_node[(
+            "analysis_summary", f"driftMetrics[].reference.{leaf}",
+        )]["dependencies"]
+    assert "analysis_summary.asOf" not in field_by_node[(
+        "analysis_summary", "driftMetrics[].reference.levels",
+    )]["dependencies"]
+    assert all(
+        "analysis_summary.asOf" not in field_by_node[(
+            "analysis_summary", f"driftMetrics[].holdout.{leaf}",
+        )]["dependencies"]
+        for leaf in (
+            "support", "missingRate", "p05", "median", "p95",
+            "levels", "levels[].value", "levels[].count",
+        )
+    )
+    precision_dependencies = [
+        "analysis_summary.holdoutMetrics[].falsePositive",
+        "analysis_summary.holdoutMetrics[].truePositive",
+    ]
+    for leaf in ("pointEstimate", "lower", "upper", "validReplicates", "reasonCode"):
+        assert field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].precision.{leaf}",
+        )]["dependencies"] == precision_dependencies
+    assert field_by_node[(
+        "analysis_summary", "holdoutMetrics[].baseDefectRate.pointEstimate",
+    )]["dependencies"] == [
+        "population.HOLDOUT", "replay_events.values_json.judge",
+    ]
+    for leaf in ("lower", "upper", "reasonCode"):
+        assert field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].baseDefectRate.{leaf}",
+        )]["dependencies"] == [
+            "config.bootstrap.minimumValidReplicates", "config.bootstrap.replicates",
+            "identity.criteria_id", "population.HOLDOUT", "replay_events.charge_id",
+            "replay_events.values_json.judge",
+        ]
+    assert field_by_node[(
+        "analysis_summary", "holdoutMetrics[].baseDefectRate.validReplicates",
+    )]["dependencies"] == [
+        "config.bootstrap.replicates", "identity.criteria_id", "population.HOLDOUT",
+        "replay_events.charge_id", "replay_events.values_json.judge",
+    ]
+    for metric_name in ("alertRate", "recall", "falseAlertsPer100"):
+        valid_dependencies = field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].{metric_name}.validReplicates",
+        )]["dependencies"]
+        assert "config.bootstrap.replicates" in valid_dependencies
+        assert "config.bootstrap.minimumValidReplicates" not in valid_dependencies
+        for leaf in ("lower", "upper", "reasonCode"):
+            assert "config.bootstrap.minimumValidReplicates" in field_by_node[(
+                "analysis_summary", f"holdoutMetrics[].{metric_name}.{leaf}",
+            )]["dependencies"]
+        for leaf in ("lower", "upper", "reasonCode", "validReplicates"):
+            assert "analysis_summary.holdoutMetrics[].alertGrade" in field_by_node[(
+                "analysis_summary", f"holdoutMetrics[].{metric_name}.{leaf}",
+            )]["dependencies"]
+            assert "replay_events.values_json.judge" in field_by_node[(
+                "analysis_summary", f"holdoutMetrics[].{metric_name}.{leaf}",
+            )]["dependencies"]
+    for leaf in ("truePositive", "falsePositive", "trueNegative", "falseNegative"):
+        assert "analysis_summary.holdoutMetrics[].alertGrade" in field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].{leaf}",
+        )]["dependencies"]
+    assert all(
+        "analysis_summary.holdoutMetrics[].alertGrade" not in field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].baseDefectRate.{leaf}",
+        )]["dependencies"]
+        for leaf in ("pointEstimate", "lower", "upper", "reasonCode", "validReplicates")
+    )
+    alert_grade_consumers = {
+        output_field
+        for (artifact_role, output_field), item in field_by_node.items()
+        if artifact_role == "analysis_summary"
+        and "analysis_summary.holdoutMetrics[].alertGrade" in item["dependencies"]
+    }
+    assert alert_grade_consumers == {
+        *(f"holdoutMetrics[].{leaf}" for leaf in (
+            "truePositive", "falsePositive", "trueNegative", "falseNegative",
+        )),
+        *(f"holdoutMetrics[].{metric}.{leaf}"
+          for metric in ("alertRate", "recall", "falseAlertsPer100")
+          for leaf in ("lower", "upper", "reasonCode", "validReplicates")),
+    }
+    ap_stage_feature_nodes = {
+        "replay_events.values_json.ap_line_speed",
+        "replay_events.values_json.ap_plant",
+        "replay_events.values_json.ap_shift",
+        "replay_events.values_json.ap_thick",
+        "replay_events.values_json.ap_width",
+    }
+    for output_field in alert_grade_consumers:
+        dependencies = field_by_node[("analysis_summary", output_field)]["dependencies"]
+        assert ap_stage_feature_nodes.isdisjoint(dependencies)
+        assert "analysis_summary.asOf" in dependencies
+        assert "replay_events.replay_date" in dependencies
+    for metric_name in ("alertRate", "precision", "recall", "baseDefectRate", "lift", "falseAlertsPer100"):
+        assert "analysis_summary.asOf" not in field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].{metric_name}.pointEstimate",
+        )]["dependencies"]
+        assert "replay_events.replay_date" not in field_by_node[(
+            "analysis_summary", f"holdoutMetrics[].{metric_name}.pointEstimate",
+        )]["dependencies"]
+    assert field_by_node[("analysis_summary", "holdoutMetrics[].total")]["dependencies"] == [
+        "population.HOLDOUT", "replay_events.values_json.judge",
+    ]
+    assert field_by_node[(
+        "analysis_summary", "splitCounts.reference.defects",
+    )]["dependencies"] == [
+        "analysis_summary.asOf", "config.labelMaturityDays", "population.REFERENCE",
+        "replay_events.values_json.ap_date", "replay_events.values_json.hr_date",
+        "replay_events.values_json.judge",
+    ]
+
+    alerts = json.loads(result["expected_alerts.json"])
+    assert alerts["alerts"] == []
+    assert alerts["bundleId"] == "@BUNDLE_ID@"
+    assert alerts["criteriaId"] == "@CRITERIA_ID@"
+    assert alerts["expectedReplayEventCount"] == 95
+    assert set(re.findall(r"@[A-Z0-9_]+@", json.dumps(alerts))) == {
+        token.decode("ascii") for token in EXACT_ALLOWED_TOKENS
+    }

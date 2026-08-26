@@ -627,19 +627,6 @@ def test_pandas_nan_source_missingness_becomes_json_null():
     assert preheat.values_json["f_pre_temp"] is None
 
 
-def test_csv_matches_hand_authored_one_chain_golden():
-    events = build_replay_events(
-        one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
-    )
-    expected = (
-        REPOSITORY_ROOT
-        / "contracts/equipment-monitor/v1/golden-expectation/replay_events.template.csv"
-    ).read_bytes()
-    expected = expected.replace(b"@BUNDLE_ID@", BUNDLE_ID.encode("ascii"))
-    expected = expected.replace(b"@CRITERIA_ID@", CRITERIA_ID.encode("ascii"))
-    assert serialize_replay_events(events) == expected
-
-
 def test_csv_uses_exact_header_lf_empty_nulls_and_canonical_values_json():
     payload = serialize_replay_events(
         build_replay_events(

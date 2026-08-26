@@ -100,7 +100,7 @@ _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
     {
         "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-        "analysis_summary.schema.json": "0ae8e07595e5c87b509f7601c294de835fb35ab5d7b6843acc0971489d5da075",
+        "analysis_summary.schema.json": "c33bdef27fcea94553f296b9d2aab1d070d4de5a8db9dd96f970d7c76e99ff8c",
         "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
         "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
         "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -148,6 +148,25 @@ _LINEAGE_CONVERSIONS = frozenset(
         "COMPARE_DISTRIBUTIONS",
         "COMPUTE_HOLDOUT_METRIC",
         "LINEAGE_INDEX_V1",
+        "COPY_IDENTITY_VALUE",
+        "COPY_DIGEST_VALUE",
+        "COPY_SCHEMA_VERSION",
+        "COPY_BOUNDARY_DATE",
+        "SELECT_TIME_BOUNDARY",
+        "COPY_SOURCE_METADATA",
+        "COPY_FIELD_METADATA",
+        "PROJECT_ARTIFACT_METADATA",
+        "COMPUTE_BYTE_SIZE",
+        "SELECT_STAGE_VALUE",
+        "CLASSIFY_REPLAY_SCHEDULE",
+        "SELECT_STAGE_EQUIPMENT",
+        "DERIVE_RULE_CANDIDATE",
+        "COMPUTE_QUALITY_METRIC",
+        "APPLY_GRADE_POLICY",
+        "DERIVE_STAGE_ELIGIBILITY",
+        "MERGE_DISPLAY_INTERVALS",
+        "COPY_POLICY_VALUE",
+        "COMPUTE_DATE_RANGE",
     }
 )
 _LINEAGE_FILTERS = frozenset(
@@ -247,6 +266,7 @@ _LINEAGE_SOURCE_TERMINAL_ROLES = frozenset(
 _LINEAGE_NODE_DEPENDENCY_ROLES = {
     "bundle_manifest": frozenset(
         {
+            "bundle_manifest",
             "analysis_config",
             "producer_runtime",
             "equipment_operating_ranges",
@@ -259,10 +279,15 @@ _LINEAGE_NODE_DEPENDENCY_ROLES = {
     "producer_runtime": frozenset(),
     "equipment_operating_ranges": frozenset({"analysis_config"}),
     "quality_risk_intervals": frozenset(
-        {"analysis_config", "equipment_operating_ranges"}
+        {
+            "analysis_config",
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+            "replay_events",
+        }
     ),
     "replay_events": frozenset(
-        {"equipment_operating_ranges", "quality_risk_intervals"}
+        {"equipment_operating_ranges", "quality_risk_intervals", "replay_events"}
     ),
     "analysis_summary": frozenset(_LINEAGE_ARTIFACT_ORDER),
 }
