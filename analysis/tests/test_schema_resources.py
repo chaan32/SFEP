@@ -1,0 +1,437 @@
+"""Installed, immutable, fail-closed access to the seven normative schemas."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import copy
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+
+import pytest
+from jsonschema import ValidationError
+
+import equipment_quality.schema as schema_module
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
+CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v1"
+PACKAGED_CONTRACT_ROOT = ANALYSIS_ROOT / "equipment_quality/contracts/v1"
+SCHEMA_NAMES = (
+    "bundle_manifest.schema.json",
+    "analysis_config.schema.json",
+    "producer_runtime.schema.json",
+    "equipment_operating_ranges.schema.json",
+    "quality_risk_intervals.schema.json",
+    "analysis_summary.schema.json",
+    "replay_event_row.schema.json",
+)
+LITERAL_ROOT_SHA256 = {
+    "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
+    "analysis_summary.schema.json": "22dd374f5cd5ac7e04624f7d4ce63b69895931239ac443ea36a44f7509af8efd",
+    "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
+    "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
+    "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
+    "quality_risk_intervals.schema.json": "2c8775fec18671030cf58ea0e94a3c99f8dac075fa9d5fe8dce724c2462f42ad",
+    "replay_event_row.schema.json": "309749f73cf2a5a522617f975128ac005298f2fd71412903d76263702c1b6bd6",
+}
+SHA_A = "sha256:" + "a" * 64
+SHA_B = "sha256:" + "b" * 64
+
+
+def _valid_replay_row() -> dict[str, object]:
+    return {
+        "schema_version": "sfep-replay-events/v1",
+        "bundle_id": SHA_A,
+        "criteria_id": SHA_B,
+        "event_id": SHA_A,
+        "replay_date": "2025-01-01",
+        "replay_hour": None,
+        "batch_kind": "CAST_DAY",
+        "batch_id": SHA_A,
+        "equipment_batch_id": None,
+        "batch_step": "CAST_RECORDED",
+        "time_precision": "DAY",
+        "material_key": SHA_B,
+        "equipment_type": "SM_CC",
+        "equipment_id": "SM1",
+        "charge_id": "CH1",
+        "slab_no": "1",
+        "hr_coil_id": None,
+        "ap_prod_id": None,
+        "values_json": {
+            "sm_plant": "SM1",
+            "steel_grade": "STS304",
+            "steel_usage": "A",
+            "cc_gubun": "CC1",
+            "slab_gubun": "NORMAL",
+            "tundish_temp": 1540.0,
+            "mlac_ratio": 0.92,
+            "delta_ferrite": 7.1,
+            "ingre_cr": 18.2,
+            "ingre_ni": 8.1,
+            "ingre_s": 0.005,
+            "slab_grind": "HSHS",
+            "cast_date": "2025-01-01",
+        },
+    }
+
+
+def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schemas():
+    assert not (ANALYSIS_ROOT / "equipment_quality/analysis_config.schema.json").exists()
+    assert sorted(path.name for path in PACKAGED_CONTRACT_ROOT.glob("*.schema.json")) == sorted(
+        SCHEMA_NAMES
+    )
+    for name in SCHEMA_NAMES:
+        normative = (CONTRACT_ROOT / name).read_bytes()
+        packaged = (PACKAGED_CONTRACT_ROOT / name).read_bytes()
+        assert hashlib.sha256(normative).hexdigest() == LITERAL_ROOT_SHA256[name]
+        assert packaged == normative
+        assert schema_module.normative_schema_bytes(name) == normative
+
+
+@pytest.mark.parametrize("value", [None, b"analysis_config.schema.json", Path("x"), True])
+def test_normative_schema_name_requires_exact_builtin_string(value):
+    with pytest.raises(TypeError) as error:
+        schema_module.normative_schema_bytes(value)  # type: ignore[arg-type]
+    assert str(error.value) == "normative schema name must be a built-in str"
+
+
+def test_normative_schema_name_rejects_string_subclasses_before_resource_access():
+    class SchemaName(str):
+        pass
+
+    with pytest.raises(TypeError) as error:
+        schema_module.normative_schema_bytes(SchemaName("analysis_config.schema.json"))
+    assert str(error.value) == "normative schema name must be a built-in str"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "unknown.schema.json",
+        "../analysis_config.schema.json",
+        "contracts/v1/analysis_config.schema.json",
+        "/analysis_config.schema.json",
+        "analysis_config.schema.json/..",
+        "analysis_config.schema.json\x00",
+    ],
+)
+def test_unknown_and_path_shaped_schema_names_are_rejected_deterministically(name):
+    with pytest.raises(ValueError) as error:
+        schema_module.normative_schema_bytes(name)
+    assert str(error.value) == f"unknown normative schema name: {name!r}"
+
+
+def test_returned_bytes_are_immutable_and_cannot_corrupt_cached_validator_state():
+    original = schema_module.normative_schema_bytes("replay_event_row.schema.json")
+    assert type(original) is bytes
+    with pytest.raises(TypeError):
+        original[0] = 0  # type: ignore[index]
+
+    caller_copy = bytearray(original)
+    caller_copy[0] ^= 0x01
+    schema_module.validate_normative_instance(
+        "replay_event_row.schema.json", _valid_replay_row()
+    )
+    assert schema_module.normative_schema_bytes("replay_event_row.schema.json") == original
+
+
+def test_validator_accepts_valid_instance_and_rejects_schema_and_date_violations():
+    valid = _valid_replay_row()
+    assert (
+        schema_module.validate_normative_instance(
+            "replay_event_row.schema.json", valid
+        )
+        is None
+    )
+
+    invalid_enum = copy.deepcopy(valid)
+    invalid_enum["batch_kind"] = "UNKNOWN_DAY"
+    with pytest.raises(ValidationError):
+        schema_module.validate_normative_instance(
+            "replay_event_row.schema.json", invalid_enum
+        )
+
+    invalid_date = copy.deepcopy(valid)
+    invalid_date["replay_date"] = "2025-02-30"
+    with pytest.raises(ValidationError):
+        schema_module.validate_normative_instance(
+            "replay_event_row.schema.json", invalid_date
+        )
+
+
+def test_validation_error_cannot_expose_mutable_cached_schema_state():
+    module = importlib.reload(schema_module)
+    try:
+        with pytest.raises(ValidationError) as caught:
+            module.validate_normative_instance("replay_event_row.schema.json", {})
+
+        with pytest.raises(TypeError):
+            caught.value.schema["required"] = ()
+
+        module.validate_normative_instance(
+            "replay_event_row.schema.json", _valid_replay_row()
+        )
+    finally:
+        importlib.reload(module)
+
+
+def test_concurrent_first_use_compiles_once_and_keeps_cache_isolated(monkeypatch):
+    module = importlib.reload(schema_module)
+    original_checker = module.FormatChecker
+    calls = 0
+    calls_lock = threading.Lock()
+    start = threading.Barrier(24)
+
+    def counted_checker():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.01)
+        return original_checker()
+
+    monkeypatch.setattr(module, "FormatChecker", counted_checker)
+
+    def validate(_: int) -> bytes:
+        start.wait()
+        module.validate_normative_instance(
+            "replay_event_row.schema.json", _valid_replay_row()
+        )
+        return module.normative_schema_bytes("replay_event_row.schema.json")
+
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        results = list(executor.map(validate, range(24)))
+
+    assert calls == 1
+    assert all(type(result) is bytes for result in results)
+    assert len(set(results)) == 1
+
+
+def _isolated_resource_failure(tmp_path: Path, payload: bytes | None) -> str:
+    isolated = tmp_path / "isolated"
+    package_root = isolated / "equipment_quality"
+    shutil.copytree(
+        ANALYSIS_ROOT / "equipment_quality",
+        package_root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    resource = package_root / "contracts/v1/replay_event_row.schema.json"
+    if payload is None:
+        resource.unlink()
+    else:
+        resource.write_bytes(payload)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(isolated)
+    environment["PYTHONNOUSERSITE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from equipment_quality.schema import normative_schema_bytes\n"
+                "try:\n"
+                "    normative_schema_bytes('replay_event_row.schema.json')\n"
+                "except Exception as error:\n"
+                "    print(type(error).__name__ + ':' + str(error))\n"
+                "else:\n"
+                "    raise SystemExit('resource unexpectedly accepted')\n"
+            ),
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            None,
+            "RuntimeError:normative schema resource unavailable: replay_event_row.schema.json",
+        ),
+        (
+            b"\xff",
+            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+        ),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema",',
+            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+        ),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","type":"array"}',
+            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+        ),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":NaN}',
+            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+        ),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":1e999}',
+            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+        ),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":17}',
+            "RuntimeError:normative schema is invalid: replay_event_row.schema.json",
+        ),
+    ],
+    ids=[
+        "missing",
+        "invalid-utf8",
+        "truncated-json",
+        "duplicate-member",
+        "nonfinite-constant",
+        "nonfinite-overflow",
+        "invalid-draft-schema",
+    ],
+)
+def test_missing_malformed_and_invalid_schema_resources_fail_closed(
+    tmp_path, payload, expected
+):
+    assert _isolated_resource_failure(tmp_path, payload) == expected
+
+
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory) -> Path:
+    root = tmp_path_factory.mktemp("schema-wheel")
+    source = root / "source"
+    source.mkdir()
+    shutil.copy2(ANALYSIS_ROOT / "pyproject.toml", source / "pyproject.toml")
+    shutil.copytree(
+        ANALYSIS_ROOT / "equipment_quality",
+        source / "equipment_quality",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    wheel_dir = root / "wheel"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(wheel_dir),
+            str(source),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+    return wheels[0]
+
+
+def test_wheel_contains_exactly_one_nested_copy_of_each_schema_and_no_legacy_copy(
+    built_wheel,
+):
+    expected = {
+        f"equipment_quality/contracts/v1/{name}" for name in SCHEMA_NAMES
+    }
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = archive.namelist()
+        schema_members = {name for name in names if name.endswith(".schema.json")}
+        assert schema_members == expected
+        for name in expected:
+            assert names.count(name) == 1
+        assert "equipment_quality/analysis_config.schema.json" not in names
+
+
+def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_root_contracts(
+    tmp_path, built_wheel
+):
+    installed = tmp_path / "installed"
+    install = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed),
+            str(built_wheel),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+
+    cwd = tmp_path / "arbitrary-cwd"
+    cwd.mkdir()
+    (cwd / "analysis_config.json").write_bytes(
+        (ANALYSIS_ROOT / "analysis_config.json").read_bytes()
+    )
+    assert not (tmp_path / "contracts").exists()
+    assert not (cwd / "contracts").exists()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(installed)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["SFEP_INSTALLED_ROOT"] = str(installed)
+    environment["SFEP_REPLAY_INSTANCE"] = json.dumps(
+        _valid_replay_row(), ensure_ascii=False, separators=(",", ":")
+    )
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import copy, json, os\n"
+                "from pathlib import Path\n"
+                "from jsonschema import ValidationError\n"
+                "import equipment_quality\n"
+                "from equipment_quality.schema import load_analysis_config, normative_schema_bytes, validate_normative_instance\n"
+                "installed = Path(os.environ['SFEP_INSTALLED_ROOT']).resolve()\n"
+                "assert Path(equipment_quality.__file__).resolve().is_relative_to(installed)\n"
+                "assert not (Path.cwd() / 'contracts').exists()\n"
+                "assert type(normative_schema_bytes('analysis_config.schema.json')) is bytes\n"
+                "assert load_analysis_config(Path('analysis_config.json')).analysis_config_version == 'quality-analysis-v1'\n"
+                "row = json.loads(os.environ['SFEP_REPLAY_INSTANCE'])\n"
+                "validate_normative_instance('replay_event_row.schema.json', row)\n"
+                "invalid = copy.deepcopy(row)\n"
+                "invalid['replay_date'] = '2025-02-30'\n"
+                "try:\n"
+                "    validate_normative_instance('replay_event_row.schema.json', invalid)\n"
+                "except ValidationError:\n"
+                "    pass\n"
+                "else:\n"
+                "    raise AssertionError('invalid date accepted')\n"
+                "for name in ('../analysis_config.schema.json', 'unknown.schema.json'):\n"
+                "    try:\n"
+                "        normative_schema_bytes(name)\n"
+                "    except ValueError as error:\n"
+                "        assert str(error) == f'unknown normative schema name: {name!r}'\n"
+                "    else:\n"
+                "        raise AssertionError('unknown schema accepted')\n"
+                "print('installed-schema-boundary-ok')\n"
+            ),
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == "installed-schema-boundary-ok"

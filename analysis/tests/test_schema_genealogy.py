@@ -3,12 +3,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import importlib.resources
 import json
 import os
-import shutil
-import subprocess
-import sys
 from dataclasses import FrozenInstanceError
 from datetime import date
 from pathlib import Path
@@ -72,12 +68,6 @@ HEADERS = {
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
-NORMATIVE_CONFIG_SCHEMA = (
-    REPOSITORY_ROOT
-    / "contracts/equipment-monitor/v1/analysis_config.schema.json"
-)
-
-
 def _csv_bytes(header: list[str], rows: list[list[str]]) -> bytes:
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, lineterminator="\n")
@@ -315,110 +305,6 @@ def test_load_analysis_config_is_complete_validated_and_deeply_immutable():
         derived["field"] = "changed"
     with pytest.raises(FrozenInstanceError):
         config.label_maturity_days = 1
-
-
-def test_packaged_analysis_config_schema_bytes_match_normative_contract():
-    packaged_schema = importlib.resources.files("equipment_quality").joinpath(
-        "analysis_config.schema.json"
-    )
-
-    assert packaged_schema.is_file()
-    assert packaged_schema.read_bytes() == NORMATIVE_CONFIG_SCHEMA.read_bytes()
-
-
-def test_installed_wheel_loads_config_outside_checkout_without_contracts(tmp_path):
-    wheel_source = tmp_path / "wheel-source"
-    wheel_source.mkdir()
-    shutil.copy2(ANALYSIS_ROOT / "pyproject.toml", wheel_source / "pyproject.toml")
-    shutil.copytree(
-        ANALYSIS_ROOT / "equipment_quality",
-        wheel_source / "equipment_quality",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    wheel_dir = tmp_path / "wheel"
-    build = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "build",
-            "--wheel",
-            "--no-isolation",
-            "--outdir",
-            str(wheel_dir),
-            str(wheel_source),
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert build.returncode == 0, build.stdout + build.stderr
-    wheels = list(wheel_dir.glob("*.whl"))
-    assert len(wheels) == 1
-
-    installed_root = tmp_path / "installed"
-    install = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--target",
-            str(installed_root),
-            str(wheels[0]),
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert install.returncode == 0, install.stdout + install.stderr
-
-    outside_checkout = tmp_path / "outside-checkout"
-    outside_checkout.mkdir()
-    config_path = outside_checkout / "analysis_config.json"
-    config_path.write_bytes((ANALYSIS_ROOT / "analysis_config.json").read_bytes())
-    assert not (tmp_path / "contracts").exists()
-    assert not (outside_checkout / "contracts").exists()
-
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(installed_root)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["SFEP_INSTALLED_ROOT"] = str(installed_root)
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os\n"
-                "import hashlib\n"
-                "import importlib.resources\n"
-                "from pathlib import Path\n"
-                "import equipment_quality\n"
-                "from equipment_quality.schema import load_analysis_config\n"
-                "root = Path(os.environ['SFEP_INSTALLED_ROOT']).resolve()\n"
-                "module = Path(equipment_quality.__file__).resolve()\n"
-                "assert module.is_relative_to(root), module\n"
-                "assert not (Path.cwd() / 'contracts').exists()\n"
-                "schema = importlib.resources.files('equipment_quality').joinpath('analysis_config.schema.json').read_bytes()\n"
-                "print(hashlib.sha256(schema).hexdigest())\n"
-                "config = load_analysis_config(Path('analysis_config.json'))\n"
-                "print(config.analysis_config_version)\n"
-            ),
-        ],
-        cwd=outside_checkout,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert probe.returncode == 0, probe.stdout + probe.stderr
-    assert probe.stdout.splitlines() == [
-        hashlib.sha256(NORMATIVE_CONFIG_SCHEMA.read_bytes()).hexdigest(),
-        "quality-analysis-v1",
-    ]
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unknown", "nested_unknown"])

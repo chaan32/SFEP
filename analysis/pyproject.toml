@@ -20,7 +20,7 @@ packages = ["equipment_quality"]
 include-package-data = false
 
 [tool.setuptools.package-data]
-equipment_quality = ["analysis_config.schema.json", "sfep_producer_provenance.json"]
+equipment_quality = ["contracts/v1/*.schema.json", "sfep_producer_provenance.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

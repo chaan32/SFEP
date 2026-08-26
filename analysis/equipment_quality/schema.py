@@ -10,10 +10,12 @@ import math
 import re
 from datetime import date
 from pathlib import Path
+from threading import RLock
+from types import MappingProxyType
 
 import pandas as pd
-from jsonschema import FormatChecker
-from jsonschema.validators import validator_for
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import SchemaError
 
 from equipment_quality.deterministic import sha256_uri
 from equipment_quality.models import AnalysisConfig, InputTables, SourceFile
@@ -76,6 +78,134 @@ _NUMERIC_COLUMNS = {
 }
 _DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _EQUIPMENT_TYPES = ("SM_CC", "FURNACE", "RM4", "AP")
+_NORMATIVE_SCHEMA_NAMES = frozenset(
+    {
+        "bundle_manifest.schema.json",
+        "analysis_config.schema.json",
+        "producer_runtime.schema.json",
+        "equipment_operating_ranges.schema.json",
+        "quality_risk_intervals.schema.json",
+        "analysis_summary.schema.json",
+        "replay_event_row.schema.json",
+    }
+)
+_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+_NORMATIVE_SCHEMA_CACHE: dict[
+    str, tuple[bytes, Draft202012Validator]
+] = {}
+_NORMATIVE_SCHEMA_CACHE_LOCK = RLock()
+
+
+class _MalformedSchemaResource(ValueError):
+    pass
+
+
+def _require_normative_schema_name(name: str) -> None:
+    if type(name) is not str:
+        raise TypeError("normative schema name must be a built-in str")
+    if name not in _NORMATIVE_SCHEMA_NAMES:
+        raise ValueError(f"unknown normative schema name: {name!r}")
+
+
+def _reject_schema_json_constant(value: str) -> None:
+    raise _MalformedSchemaResource(value)
+
+
+def _reject_duplicate_schema_members(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise _MalformedSchemaResource(name)
+        result[name] = value
+    return result
+
+
+def _reject_non_finite_schema_numbers(value: object) -> None:
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise _MalformedSchemaResource("non-finite number")
+        return
+    if type(value) is list:
+        for item in value:
+            _reject_non_finite_schema_numbers(item)
+        return
+    if type(value) is dict:
+        for item in value.values():
+            _reject_non_finite_schema_numbers(item)
+
+
+def _freeze_schema(value: object) -> object:
+    if type(value) is dict:
+        return MappingProxyType(
+            {name: _freeze_schema(item) for name, item in value.items()}
+        )
+    if type(value) is list:
+        return tuple(_freeze_schema(item) for item in value)
+    return value
+
+
+def _load_normative_schema(
+    name: str,
+) -> tuple[bytes, Draft202012Validator]:
+    try:
+        resource = importlib.resources.files("equipment_quality").joinpath(
+            "contracts", "v1", name
+        )
+        schema_bytes = bytes(resource.read_bytes())
+    except OSError as error:
+        raise RuntimeError(
+            f"normative schema resource unavailable: {name}"
+        ) from error
+
+    try:
+        schema = json.loads(
+            schema_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_schema_members,
+            parse_constant=_reject_schema_json_constant,
+        )
+        if type(schema) is not dict:
+            raise _MalformedSchemaResource("top-level schema must be an object")
+        _reject_non_finite_schema_numbers(schema)
+    except (UnicodeError, ValueError, TypeError, OverflowError, RecursionError) as error:
+        raise RuntimeError(
+            f"normative schema resource is malformed: {name}"
+        ) from error
+
+    try:
+        if schema.get("$schema") != _DRAFT_2020_12:
+            raise SchemaError("schema must declare Draft 2020-12")
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(
+            _freeze_schema(schema),
+            format_checker=FormatChecker(),
+        )
+    except SchemaError as error:
+        raise RuntimeError(f"normative schema is invalid: {name}") from error
+    return schema_bytes, validator
+
+
+def _normative_schema(
+    name: str,
+) -> tuple[bytes, Draft202012Validator]:
+    _require_normative_schema_name(name)
+    with _NORMATIVE_SCHEMA_CACHE_LOCK:
+        cached = _NORMATIVE_SCHEMA_CACHE.get(name)
+        if cached is None:
+            cached = _load_normative_schema(name)
+            _NORMATIVE_SCHEMA_CACHE[name] = cached
+        return cached
+
+
+def normative_schema_bytes(name: str) -> bytes:
+    """Return checked immutable bytes for one exact normative schema name."""
+    return _normative_schema(name)[0]
+
+
+def validate_normative_instance(name: str, instance: object) -> None:
+    """Validate an instance with the cached checked Draft 2020-12 schema."""
+    _normative_schema(name)[1].validate(instance)
 
 
 def _parse_date(raw: str, *, role: str, column: str, record_number: int) -> date:
@@ -283,13 +413,7 @@ def load_analysis_config(path: Path) -> AnalysisConfig:
         payload = _load_strict_json(path.read_text(encoding="utf-8"))
     except UnicodeDecodeError as error:
         raise ValueError("analysis config must be UTF-8") from error
-    schema_bytes = importlib.resources.files("equipment_quality").joinpath(
-        "analysis_config.schema.json"
-    ).read_bytes()
-    schema = json.loads(schema_bytes.decode("utf-8"))
-    validator_class = validator_for(schema)
-    validator_class.check_schema(schema)
-    validator_class(schema, format_checker=FormatChecker()).validate(payload)
+    validate_normative_instance("analysis_config.schema.json", payload)
 
     field_names = [field["field"] for field in payload["fields"]]
     if len(set(field_names)) != len(field_names):
