@@ -50,3 +50,11 @@ kafka-data/
 **/__pycache__/
 *.py[cod]
 training/**/.shadow.lock
+
+# Local subagent execution ledger and review packages.
+.superpowers/
+
+# Local equipment-quality Python environments and generated bundles.
+analysis/.venv/
+analysis/.wheelhouse/
+var/equipment-quality/
