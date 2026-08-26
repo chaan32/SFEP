@@ -216,6 +216,55 @@ def test_required_quality_ap_facts_fail_before_any_digest_is_computed(
     assert digest_calls == []
 
 
+@pytest.mark.parametrize("invalid_coil", [None, ""])
+def test_quality_hr_coil_id_is_required_before_any_digest_is_computed(
+    monkeypatch, invalid_coil
+):
+    genealogy = one_material_chain()
+    quality_rows = genealogy.quality_rows.copy(deep=True)
+    quality_rows.at[quality_rows.index[0], "hr_coil_id"] = invalid_coil
+    invalid = replace(genealogy, quality_rows=quality_rows)
+    original_digest = event_builder.digest_json_id
+    digest_calls = []
+
+    def recording_digest(namespace, payload):
+        digest_calls.append((namespace, payload))
+        return original_digest(namespace, payload)
+
+    monkeypatch.setattr(event_builder, "digest_json_id", recording_digest)
+
+    with pytest.raises((TypeError, ValueError), match="quality hr_coil_id"):
+        build_replay_events(invalid, BUNDLE_ID, CRITERIA_ID, analysis_config())
+    assert digest_calls == []
+
+
+@pytest.mark.parametrize("foreign_coil", ["OTHER", "H002"])
+def test_quality_hr_coil_id_must_match_its_replay_material_before_any_digest(
+    monkeypatch, foreign_coil
+):
+    genealogy = (
+        two_distinct_materials()
+        if foreign_coil == "H002"
+        else one_material_chain()
+    )
+    quality_rows = genealogy.quality_rows.copy(deep=True)
+    first_material = quality_rows.index[0]
+    quality_rows.at[first_material, "hr_coil_id"] = foreign_coil
+    invalid = replace(genealogy, quality_rows=quality_rows)
+    original_digest = event_builder.digest_json_id
+    digest_calls = []
+
+    def recording_digest(namespace, payload):
+        digest_calls.append((namespace, payload))
+        return original_digest(namespace, payload)
+
+    monkeypatch.setattr(event_builder, "digest_json_id", recording_digest)
+
+    with pytest.raises(ValueError, match="quality hr_coil_id must match replay"):
+        build_replay_events(invalid, BUNDLE_ID, CRITERIA_ID, analysis_config())
+    assert digest_calls == []
+
+
 def test_builder_uses_preflight_snapshots_if_source_frames_mutate_during_hashing(
     monkeypatch,
 ):
@@ -428,6 +477,58 @@ def test_replay_event_hash_is_stable_after_caller_mapping_mutation():
 
     assert copied == cast
     assert hash(copied) == before == hash(cast)
+
+
+def test_replay_event_equality_and_hash_use_the_same_canonical_number_encoding():
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    integral_values = dict(cast.values_json, tundish_temp=1540)
+    float_values = dict(cast.values_json, tundish_temp=1540.0)
+    canonical_equal_int = replace(cast, values_json=integral_values)
+    canonical_equal_float = replace(cast, values_json=float_values)
+    large_int = replace(
+        cast, values_json=dict(cast.values_json, tundish_temp=10**20)
+    )
+    large_float = replace(
+        cast, values_json=dict(cast.values_json, tundish_temp=1e20)
+    )
+
+    assert canonical_equal_int == canonical_equal_float
+    assert hash(canonical_equal_int) == hash(canonical_equal_float)
+    assert len({canonical_equal_int, canonical_equal_float}) == 1
+    assert {canonical_equal_int: "int", canonical_equal_float: "float"} == {
+        canonical_equal_int: "float"
+    }
+    assert large_int != large_float
+    assert hash(large_int) != hash(large_float)
+    assert len({large_int, large_float}) == 2
+    assert len({large_int: "int", large_float: "float"}) == 2
+
+
+def test_replay_event_canonical_equality_is_order_independent_and_symmetric():
+    cast = next(
+        event
+        for event in build_replay_events(
+            one_material_chain(), BUNDLE_ID, CRITERIA_ID, analysis_config()
+        )
+        if event.batch_step == "CAST_RECORDED"
+    )
+    reordered = replace(
+        cast, values_json=dict(reversed(tuple(cast.values_json.items())))
+    )
+    foreign = object()
+
+    assert cast == reordered
+    assert reordered == cast
+    assert hash(cast) == hash(reordered)
+    assert cast.__eq__(foreign) is NotImplemented
+    assert (cast == foreign) is False
+    assert (foreign == cast) is False
 
 
 @pytest.mark.parametrize(

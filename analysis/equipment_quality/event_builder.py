@@ -157,30 +157,36 @@ class ReplayEvent:
             raise ValueError("event_id does not match event semantics")
         object.__setattr__(self, "values_json", _immutable_values(self.values_json))
 
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self.schema_version,
-                self.bundle_id,
-                self.criteria_id,
-                self.event_id,
-                self.replay_date,
-                self.replay_hour,
-                self.batch_kind,
-                self.batch_id,
-                self.equipment_batch_id,
-                self.batch_step,
-                self.time_precision,
-                self.material_key,
-                self.equipment_type,
-                self.equipment_id,
-                self.charge_id,
-                self.slab_no,
-                self.hr_coil_id,
-                self.ap_prod_id,
-                canonical_json_bytes(self.values_json),
-            )
+    def _canonical_identity(self) -> tuple[object, ...]:
+        return (
+            self.schema_version,
+            self.bundle_id,
+            self.criteria_id,
+            self.event_id,
+            self.replay_date,
+            self.replay_hour,
+            self.batch_kind,
+            self.batch_id,
+            self.equipment_batch_id,
+            self.batch_step,
+            self.time_precision,
+            self.material_key,
+            self.equipment_type,
+            self.equipment_id,
+            self.charge_id,
+            self.slab_no,
+            self.hr_coil_id,
+            self.ap_prod_id,
+            canonical_json_bytes(self.values_json),
         )
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not ReplayEvent:
+            return NotImplemented
+        return self._canonical_identity() == other._canonical_identity()
+
+    def __hash__(self) -> int:
+        return hash(self._canonical_identity())
 
 
 def _non_empty_string(value: object, label: str) -> str:
@@ -510,6 +516,7 @@ class _ReplayRowSnapshot:
 class _QualityRowSnapshot:
     row: Mapping[str, object]
     material_identity: tuple[str, str]
+    hr_coil_id: str
     ap_date: date
     ap_plant: str
     ap_prod_id: str
@@ -555,6 +562,9 @@ def _snapshot_quality_row(row: Mapping[str, object]) -> _QualityRowSnapshot:
     return _QualityRowSnapshot(
         row=copied,
         material_identity=(charge, slab),
+        hr_coil_id=_non_empty_string(
+            copied.get("hr_coil_id"), "quality hr_coil_id"
+        ),
         ap_date=_required_date(copied, "ap_date"),
         ap_plant=_non_empty_string(copied.get("ap_plant"), "ap_plant"),
         ap_prod_id=_non_empty_string(copied.get("ap_prod_id"), "ap_prod_id"),
@@ -656,6 +666,14 @@ def build_replay_events(
     quality_keys = set(quality_by_key)
     if not quality_keys.issubset(replay_keys):
         raise ValueError("quality rows must be a subset of replay rows")
+    replay_coils_by_key: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        replay_coils_by_key.setdefault(row.material_identity, set()).add(
+            row.hr_coil_id
+        )
+    for row in quality_rows:
+        if replay_coils_by_key[row.material_identity] != {row.hr_coil_id}:
+            raise ValueError("quality hr_coil_id must match replay material")
     registry = _DigestRegistry(preimages={})
     events: list[ReplayEvent] = []
     for snapshot in rows:
