@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import importlib.resources
 import json
@@ -12,10 +13,12 @@ from datetime import date
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
+from urllib.parse import unquote_to_bytes
 
 import pandas as pd
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
+from referencing.exceptions import Unresolvable
 
 from equipment_quality.deterministic import sha256_uri
 from equipment_quality.models import AnalysisConfig, InputTables, SourceFile
@@ -90,13 +93,30 @@ _NORMATIVE_SCHEMA_NAMES = frozenset(
     }
 )
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
-_NORMATIVE_SCHEMA_CACHE: dict[
-    str, tuple[bytes, Draft202012Validator]
-] = {}
+# These pins authenticate the packaged copies against the normative v1 resources.
+# Any intentional root-contract byte change must update its packaged copy and this
+# independent literal in the same broader contract change.
+_NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
+    {
+        "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
+        "analysis_summary.schema.json": "22dd374f5cd5ac7e04624f7d4ce63b69895931239ac443ea36a44f7509af8efd",
+        "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
+        "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
+        "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
+        "quality_risk_intervals.schema.json": "2c8775fec18671030cf58ea0e94a3c99f8dac075fa9d5fe8dce724c2462f42ad",
+        "replay_event_row.schema.json": "309749f73cf2a5a522617f975128ac005298f2fd71412903d76263702c1b6bd6",
+    }
+)
+_NORMATIVE_SCHEMA_BYTES_CACHE: dict[str, bytes] = {}
+_NORMATIVE_VALIDATOR_CACHE: dict[str, Draft202012Validator] = {}
 _NORMATIVE_SCHEMA_CACHE_LOCK = RLock()
 
 
 class _MalformedSchemaResource(ValueError):
+    pass
+
+
+class _InvalidLocalSchemaReference(ValueError):
     pass
 
 
@@ -146,9 +166,77 @@ def _freeze_schema(value: object) -> object:
     return value
 
 
-def _load_normative_schema(
-    name: str,
-) -> tuple[bytes, Draft202012Validator]:
+def _decode_json_pointer_token(token: str) -> str:
+    decoded: list[str] = []
+    index = 0
+    while index < len(token):
+        character = token[index]
+        if character != "~":
+            decoded.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(token) or token[index + 1] not in {"0", "1"}:
+            raise _InvalidLocalSchemaReference("invalid JSON Pointer escape")
+        decoded.append("~" if token[index + 1] == "0" else "/")
+        index += 2
+    return "".join(decoded)
+
+
+def _decode_local_json_pointer(reference: object) -> tuple[str, ...]:
+    if type(reference) is not str or reference == "" or not reference.startswith("#"):
+        raise _InvalidLocalSchemaReference("reference is not a local fragment")
+    fragment = reference[1:]
+    for index, character in enumerate(fragment):
+        if character == "%" and (
+            index + 2 >= len(fragment)
+            or any(item not in "0123456789abcdefABCDEF" for item in fragment[index + 1:index + 3])
+        ):
+            raise _InvalidLocalSchemaReference("invalid URI escape")
+    try:
+        pointer = unquote_to_bytes(fragment).decode("utf-8")
+    except UnicodeError as error:
+        raise _InvalidLocalSchemaReference("invalid URI encoding") from error
+    if pointer == "":
+        return ()
+    if not pointer.startswith("/"):
+        raise _InvalidLocalSchemaReference("fragment is not a JSON Pointer")
+    return tuple(
+        _decode_json_pointer_token(token) for token in pointer[1:].split("/")
+    )
+
+
+def _resolve_local_json_pointer(schema: dict[str, object], reference: object) -> object:
+    target: object = schema
+    for token in _decode_local_json_pointer(reference):
+        if type(target) is dict:
+            if token not in target:
+                raise _InvalidLocalSchemaReference("object member does not exist")
+            target = target[token]
+        elif type(target) is list:
+            if not re.fullmatch(r"0|[1-9][0-9]*", token):
+                raise _InvalidLocalSchemaReference("invalid array index")
+            index = int(token)
+            if index >= len(target):
+                raise _InvalidLocalSchemaReference("array index does not exist")
+            target = target[index]
+        else:
+            raise _InvalidLocalSchemaReference("pointer traverses a scalar")
+    return target
+
+
+def _assert_local_schema_references(schema: dict[str, object]) -> None:
+    pending: list[object] = [schema]
+    while pending:
+        value = pending.pop()
+        if type(value) is dict:
+            if "$ref" in value:
+                _resolve_local_json_pointer(schema, value["$ref"])
+            pending.extend(value.values())
+        elif type(value) is list:
+            pending.extend(value)
+
+
+def _read_authenticated_normative_schema(name: str) -> bytes:
     try:
         resource = importlib.resources.files("equipment_quality").joinpath(
             "contracts", "v1", name
@@ -158,7 +246,12 @@ def _load_normative_schema(
         raise RuntimeError(
             f"normative schema resource unavailable: {name}"
         ) from error
+    if hashlib.sha256(schema_bytes).hexdigest() != _NORMATIVE_SCHEMA_SHA256[name]:
+        raise RuntimeError(f"normative schema resource digest mismatch: {name}")
+    return schema_bytes
 
+
+def _parse_normative_schema(name: str, schema_bytes: bytes) -> dict[str, object]:
     try:
         schema = json.loads(
             schema_bytes.decode("utf-8"),
@@ -172,40 +265,67 @@ def _load_normative_schema(
         raise RuntimeError(
             f"normative schema resource is malformed: {name}"
         ) from error
+    return schema
 
+
+def _compile_normative_validator(
+    name: str, schema_bytes: bytes
+) -> Draft202012Validator:
+    schema = _parse_normative_schema(name, schema_bytes)
     try:
         if schema.get("$schema") != _DRAFT_2020_12:
             raise SchemaError("schema must declare Draft 2020-12")
+        _assert_local_schema_references(schema)
         Draft202012Validator.check_schema(schema)
         validator = Draft202012Validator(
             _freeze_schema(schema),
             format_checker=FormatChecker(),
         )
+    except _InvalidLocalSchemaReference as error:
+        raise RuntimeError(
+            f"normative schema has invalid local reference: {name}"
+        ) from error
     except SchemaError as error:
         raise RuntimeError(f"normative schema is invalid: {name}") from error
-    return schema_bytes, validator
+    return validator
 
 
-def _normative_schema(
-    name: str,
-) -> tuple[bytes, Draft202012Validator]:
+def _normative_schema_bytes(name: str) -> bytes:
     _require_normative_schema_name(name)
     with _NORMATIVE_SCHEMA_CACHE_LOCK:
-        cached = _NORMATIVE_SCHEMA_CACHE.get(name)
+        cached = _NORMATIVE_SCHEMA_BYTES_CACHE.get(name)
         if cached is None:
-            cached = _load_normative_schema(name)
-            _NORMATIVE_SCHEMA_CACHE[name] = cached
+            cached = _read_authenticated_normative_schema(name)
+            _NORMATIVE_SCHEMA_BYTES_CACHE[name] = cached
+        return cached
+
+
+def _normative_validator(name: str) -> Draft202012Validator:
+    _require_normative_schema_name(name)
+    with _NORMATIVE_SCHEMA_CACHE_LOCK:
+        cached = _NORMATIVE_VALIDATOR_CACHE.get(name)
+        if cached is None:
+            cached = _compile_normative_validator(
+                name, _normative_schema_bytes(name)
+            )
+            _NORMATIVE_VALIDATOR_CACHE[name] = cached
         return cached
 
 
 def normative_schema_bytes(name: str) -> bytes:
-    """Return checked immutable bytes for one exact normative schema name."""
-    return _normative_schema(name)[0]
+    """Return digest-authenticated immutable bytes for one normative schema."""
+    return _normative_schema_bytes(name)
 
 
 def validate_normative_instance(name: str, instance: object) -> None:
     """Validate an instance with the cached checked Draft 2020-12 schema."""
-    _normative_schema(name)[1].validate(instance)
+    _require_normative_schema_name(name)
+    try:
+        _normative_validator(name).validate(instance)
+    except Unresolvable as error:
+        raise RuntimeError(
+            f"normative schema reference resolution failed: {name}"
+        ) from error
 
 
 def _parse_date(raw: str, *, role: str, column: str, record_number: int) -> date:

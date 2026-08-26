@@ -18,6 +18,7 @@ import zipfile
 
 import pytest
 from jsonschema import ValidationError
+from referencing.exceptions import Unresolvable
 
 import equipment_quality.schema as schema_module
 
@@ -97,6 +98,12 @@ def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schema
         assert hashlib.sha256(normative).hexdigest() == LITERAL_ROOT_SHA256[name]
         assert packaged == normative
         assert schema_module.normative_schema_bytes(name) == normative
+
+
+def test_production_digest_pins_are_exact_complete_and_immutable():
+    assert schema_module._NORMATIVE_SCHEMA_SHA256 == LITERAL_ROOT_SHA256
+    with pytest.raises(TypeError):
+        schema_module._NORMATIVE_SCHEMA_SHA256["replay_event_row.schema.json"] = "0" * 64
 
 
 @pytest.mark.parametrize("value", [None, b"analysis_config.schema.json", Path("x"), True])
@@ -217,6 +224,25 @@ def test_concurrent_first_use_compiles_once_and_keeps_cache_isolated(monkeypatch
     assert len(set(results)) == 1
 
 
+def test_cold_byte_access_authenticates_without_compiling_a_validator(monkeypatch):
+    module = importlib.reload(schema_module)
+    calls = 0
+    original_checker = module.FormatChecker
+
+    def counted_original_checker():
+        nonlocal calls
+        calls += 1
+        return original_checker()
+
+    monkeypatch.setattr(module, "FormatChecker", counted_original_checker)
+    module.normative_schema_bytes("replay_event_row.schema.json")
+    assert calls == 0
+    module.validate_normative_instance(
+        "replay_event_row.schema.json", _valid_replay_row()
+    )
+    assert calls == 1
+
+
 def _isolated_resource_failure(tmp_path: Path, payload: bytes | None) -> str:
     isolated = tmp_path / "isolated"
     package_root = isolated / "equipment_quality"
@@ -259,6 +285,55 @@ def _isolated_resource_failure(tmp_path: Path, payload: bytes | None) -> str:
     return result.stdout.strip()
 
 
+def _isolated_tamper_then_restore(tmp_path: Path, payload: bytes) -> str:
+    isolated = tmp_path / "isolated"
+    package_root = isolated / "equipment_quality"
+    shutil.copytree(
+        ANALYSIS_ROOT / "equipment_quality",
+        package_root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    resource = package_root / "contracts/v1/replay_event_row.schema.json"
+    original = tmp_path / "original.schema.json"
+    original.write_bytes(resource.read_bytes())
+    resource.write_bytes(payload)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(isolated)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["SFEP_SCHEMA_RESOURCE"] = str(resource)
+    environment["SFEP_SCHEMA_ORIGINAL"] = str(original)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os\n"
+                "from pathlib import Path\n"
+                "from equipment_quality.schema import normative_schema_bytes, validate_normative_instance\n"
+                "try:\n"
+                "    normative_schema_bytes('replay_event_row.schema.json')\n"
+                "except RuntimeError as error:\n"
+                "    assert str(error) == 'normative schema resource digest mismatch: replay_event_row.schema.json'\n"
+                "else:\n"
+                "    raise AssertionError('tampered resource accepted')\n"
+                "Path(os.environ['SFEP_SCHEMA_RESOURCE']).write_bytes(Path(os.environ['SFEP_SCHEMA_ORIGINAL']).read_bytes())\n"
+                "restored = normative_schema_bytes('replay_event_row.schema.json')\n"
+                "assert restored == Path(os.environ['SFEP_SCHEMA_ORIGINAL']).read_bytes()\n"
+                "print('tamper-rejected-restore-accepted')\n"
+            ),
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -268,27 +343,27 @@ def _isolated_resource_failure(tmp_path: Path, payload: bytes | None) -> str:
         ),
         (
             b"\xff",
-            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
         (
             b'{"$schema":"https://json-schema.org/draft/2020-12/schema",',
-            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
         (
             b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","type":"array"}',
-            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
         (
             b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":NaN}',
-            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
         (
             b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":1e999}',
-            "RuntimeError:normative schema resource is malformed: replay_event_row.schema.json",
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
         (
-            b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":17}',
-            "RuntimeError:normative schema is invalid: replay_event_row.schema.json",
+            b'{"$schema":"https://json-schema.org/draft/2019-09/schema","type":"object"}',
+            "RuntimeError:normative schema resource digest mismatch: replay_event_row.schema.json",
         ),
     ],
     ids=[
@@ -298,13 +373,141 @@ def _isolated_resource_failure(tmp_path: Path, payload: bytes | None) -> str:
         "duplicate-member",
         "nonfinite-constant",
         "nonfinite-overflow",
-        "invalid-draft-schema",
+        "wrong-draft-schema",
     ],
 )
 def test_missing_malformed_and_invalid_schema_resources_fail_closed(
     tmp_path, payload, expected
 ):
     assert _isolated_resource_failure(tmp_path, payload) == expected
+
+
+def test_valid_permissive_one_byte_and_swapped_schema_tampering_fail_without_poisoning(
+    tmp_path,
+):
+    original = (CONTRACT_ROOT / "replay_event_row.schema.json").read_bytes()
+    tampered_payloads = (
+        b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}',
+        original + b" ",
+        (CONTRACT_ROOT / "analysis_config.schema.json").read_bytes(),
+    )
+    for index, payload in enumerate(tampered_payloads):
+        case_root = tmp_path / str(index)
+        case_root.mkdir()
+        assert (
+            _isolated_tamper_then_restore(case_root, payload)
+            == "tamper-rejected-restore-accepted"
+        )
+
+
+def test_schema_compiler_distinguishes_wrong_draft_from_malformed_json():
+    name = "replay_event_row.schema.json"
+    with pytest.raises(RuntimeError) as wrong_draft:
+        schema_module._compile_normative_validator(
+            name,
+            b'{"$schema":"https://json-schema.org/draft/2019-09/schema","type":"object"}',
+        )
+    assert str(wrong_draft.value) == f"normative schema is invalid: {name}"
+
+    with pytest.raises(RuntimeError) as malformed:
+        schema_module._compile_normative_validator(name, b'{"$schema":')
+    assert str(malformed.value) == f"normative schema resource is malformed: {name}"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff",
+        b'{"$schema":"https://json-schema.org/draft/2020-12/schema",',
+        b'{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","type":"array"}',
+        b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":NaN}',
+        b'{"$schema":"https://json-schema.org/draft/2020-12/schema","minimum":1e999}',
+    ],
+    ids=[
+        "invalid-utf8",
+        "truncated-json",
+        "duplicate-member",
+        "nonfinite-constant",
+        "nonfinite-overflow",
+    ],
+)
+def test_schema_compiler_strictly_rejects_malformed_resource_json(payload):
+    name = "replay_event_row.schema.json"
+    with pytest.raises(RuntimeError) as malformed:
+        schema_module._compile_normative_validator(name, payload)
+    assert str(malformed.value) == f"normative schema resource is malformed: {name}"
+
+
+def test_local_reference_preflight_resolves_escaped_members_and_list_indexes():
+    schema_module._assert_local_schema_references(
+        {
+            "$defs": {
+                "a/b": {
+                    "items": [
+                        {"properties": {"~name": {"type": "string"}}}
+                    ]
+                }
+            },
+            "$ref": "#/$defs/a~1b/items/0/properties/~0name",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "",
+        "other.schema.json#/$defs/value",
+        "https://example.invalid/schema.json",
+        "#not-a-json-pointer",
+        "#/$defs/missing",
+        "#/$defs/items/01",
+        "#/$defs/~2bad",
+        "#/%ZZ",
+    ],
+)
+def test_invalid_external_and_unresolved_references_fail_preflight_deterministically(
+    reference,
+):
+    payload = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"items": [{"type": "string"}]},
+            "$ref": reference,
+        },
+        separators=(",", ":"),
+    ).encode()
+    with pytest.raises(RuntimeError) as error:
+        schema_module._compile_normative_validator(
+            "replay_event_row.schema.json", payload
+        )
+    assert str(error.value) == (
+        "normative schema has invalid local reference: replay_event_row.schema.json"
+    )
+
+
+def test_all_current_root_schemas_pass_local_reference_preflight():
+    for name in SCHEMA_NAMES:
+        schema_module._compile_normative_validator(
+            name, (CONTRACT_ROOT / name).read_bytes()
+        )
+
+
+def test_validation_time_reference_failure_is_normalized(monkeypatch):
+    class BrokenValidator:
+        def validate(self, instance):
+            raise Unresolvable("#/$defs/missing")
+
+    monkeypatch.setattr(
+        schema_module, "_normative_validator", lambda name: BrokenValidator()
+    )
+    with pytest.raises(RuntimeError) as error:
+        schema_module.validate_normative_instance(
+            "replay_event_row.schema.json", _valid_replay_row()
+        )
+    assert str(error.value) == (
+        "normative schema reference resolution failed: replay_event_row.schema.json"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -351,9 +554,58 @@ def test_wheel_contains_exactly_one_nested_copy_of_each_schema_and_no_legacy_cop
         names = archive.namelist()
         schema_members = {name for name in names if name.endswith(".schema.json")}
         assert schema_members == expected
-        for name in expected:
-            assert names.count(name) == 1
+        for member in expected:
+            assert names.count(member) == 1
+            name = Path(member).name
+            archived = archive.read(member)
+            normative = (CONTRACT_ROOT / name).read_bytes()
+            assert archived == normative
+            assert hashlib.sha256(archived).hexdigest() == LITERAL_ROOT_SHA256[name]
         assert "equipment_quality/analysis_config.schema.json" not in names
+
+
+def test_tampered_wheel_schema_member_is_rejected_by_digest_boundary(
+    tmp_path, built_wheel
+):
+    tampered_wheel = tmp_path / built_wheel.name
+    target = "equipment_quality/contracts/v1/replay_event_row.schema.json"
+    with zipfile.ZipFile(built_wheel) as source, zipfile.ZipFile(
+        tampered_wheel, "w"
+    ) as destination:
+        for info in source.infolist():
+            payload = source.read(info.filename)
+            if info.filename == target:
+                payload += b" "
+            destination.writestr(info, payload)
+
+    cwd = tmp_path / "tampered-wheel-cwd"
+    cwd.mkdir()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(tampered_wheel)
+    environment["PYTHONNOUSERSITE"] = "1"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from equipment_quality.schema import normative_schema_bytes\n"
+                "try:\n"
+                "    normative_schema_bytes('replay_event_row.schema.json')\n"
+                "except RuntimeError as error:\n"
+                "    assert str(error) == 'normative schema resource digest mismatch: replay_event_row.schema.json'\n"
+                "else:\n"
+                "    raise AssertionError('tampered wheel member accepted')\n"
+                "print('tampered-wheel-member-rejected')\n"
+            ),
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == "tampered-wheel-member-rejected"
 
 
 def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_root_contracts(
@@ -392,12 +644,15 @@ def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_
     environment["SFEP_REPLAY_INSTANCE"] = json.dumps(
         _valid_replay_row(), ensure_ascii=False, separators=(",", ":")
     )
+    environment["SFEP_SCHEMA_DIGESTS"] = json.dumps(
+        LITERAL_ROOT_SHA256, sort_keys=True, separators=(",", ":")
+    )
     probe = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import copy, json, os\n"
+                "import copy, hashlib, json, os\n"
                 "from pathlib import Path\n"
                 "from jsonschema import ValidationError\n"
                 "import equipment_quality\n"
@@ -405,7 +660,11 @@ def test_installed_wheel_validates_config_and_replay_from_arbitrary_cwd_without_
                 "installed = Path(os.environ['SFEP_INSTALLED_ROOT']).resolve()\n"
                 "assert Path(equipment_quality.__file__).resolve().is_relative_to(installed)\n"
                 "assert not (Path.cwd() / 'contracts').exists()\n"
-                "assert type(normative_schema_bytes('analysis_config.schema.json')) is bytes\n"
+                "expected_digests = json.loads(os.environ['SFEP_SCHEMA_DIGESTS'])\n"
+                "for name, expected_digest in expected_digests.items():\n"
+                "    schema_bytes = normative_schema_bytes(name)\n"
+                "    assert type(schema_bytes) is bytes\n"
+                "    assert hashlib.sha256(schema_bytes).hexdigest() == expected_digest\n"
                 "assert load_analysis_config(Path('analysis_config.json')).analysis_config_version == 'quality-analysis-v1'\n"
                 "row = json.loads(os.environ['SFEP_REPLAY_INSTANCE'])\n"
                 "validate_normative_instance('replay_event_row.schema.json', row)\n"
