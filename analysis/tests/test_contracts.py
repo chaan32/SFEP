@@ -45,6 +45,21 @@ SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
 MATERIAL_CH1_1 = "sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a"
 TOKEN_RE = re.compile(rb"(?:" + rb"|".join(re.escape(token) for token in sorted(EXACT_ALLOWED_TOKENS)) + rb")")
+RANGE_CONTEXT_KEYS = frozenset({
+    "ap_plant", "ap_shift", "ap_thick_band", "ap_width_band",
+    "f_jangip_gubun", "furnace_no", "hr_thick_band", "hr_width_band",
+    "slab_width_band", "sm_plant", "steel_grade", "steel_usage",
+})
+RISK_CONTEXT_KEYS = frozenset({
+    "ap_plant", "ap_shift", "ap_thick_band", "ap_width_band",
+    "f_jangip_gubun", "furnace_no", "hr_thick_band", "hr_width_band",
+    "slab_width_band", "sm_plant", "steel_grade", "steel_usage",
+})
+CONTEXT_KEY_PATTERN = (
+    r"ap_plant|ap_shift|ap_thick_band|ap_width_band|f_jangip_gubun|"
+    r"furnace_no|hr_thick_band|hr_width_band|slab_width_band|sm_plant|"
+    r"steel_grade|steel_usage"
+)
 LINEAGE_OUTPUT_PATTERNS = {
     "bundle_manifest": re.compile(
         r"^(?:schemaVersion|bundleId|criteriaId|asOf|timezone|labelMaturityDays|"
@@ -83,14 +98,17 @@ LINEAGE_OUTPUT_PATTERNS = {
     ),
     "equipment_operating_ranges": re.compile(
         r"^(?:schemaVersion|criteriaId|asOf|ranges\[\]\.(?:ruleId|field|fieldRole|"
-        r"firstAvailableStage|equipmentType|equipmentId|contextLevel|context(?:\.[a-z][a-z0-9_]*)?|"
-        r"support|median|p01|p05|p95|p99|lowerTailEnabled|upperTailEnabled))$"
+        r"firstAvailableStage|equipmentType|equipmentId|contextLevel|context(?:\."
+        + CONTEXT_KEY_PATTERN
+        + r")?|support|median|p01|p05|p95|p99|lowerTailEnabled|upperTailEnabled))$"
     ),
     "quality_risk_intervals": re.compile(
         r"^(?:schemaVersion|criteriaId|asOf|rules\[\]\.(?:ruleId|analysisFamily|evidenceFamily|"
         r"firstAvailableStage|equipmentType|applicationScope|equipmentId|fieldNames\[\]|"
         r"predicate\.allOf\[\]\.(?:field|type|lower|lowerInclusive|upper|upperInclusive|values(?:\[\])?)|"
-        r"applicationContext(?:\.[a-z][a-z0-9_]*)?|adjustmentLevel|adjustmentFieldsDropped\[\]|"
+        r"applicationContext(?:\."
+        + CONTEXT_KEY_PATTERN
+        + r")?|adjustmentLevel|adjustmentFieldsDropped\[\]|"
         r"adjustmentKind|grade|earlyWarningEligible|(?:discovery|confirmation)\.(?:support|defects|"
         r"crudeRate|crudeRateCiLower|crudeRateCiUpper|adjustedRate|comparatorAdjustedRate|"
         r"riskDifference|relativeRisk|relativeRiskCiLower|relativeRiskCiUpper|pValue|qValue|reasonCode)|"
@@ -156,6 +174,24 @@ AGGREGATE_TRANSFORMATIONS = {
     "CHARGE_BLOCK_BOOTSTRAP_PERCENTILE_CI", "CONFIRMATION_WEIGHT_RENORMALIZATION",
     "GRADE_POLICY_V1", "DISPLAY_MERGE_V1",
 }
+LITERAL_SOURCE_DEPENDENCY_TERMINALS = frozenset({
+    "sm_cc.sm_plant", "sm_cc.charge_id", "sm_cc.steel_grade",
+    "sm_cc.steel_usage", "sm_cc.delta_ferrite", "sm_cc.ingre_cr",
+    "sm_cc.ingre_ni", "sm_cc.ingre_s", "sm_cc.cast_date", "sm_cc.cc_gubun",
+    "sm_cc.tundish_temp", "sm_cc.mlac_ratio", "sm_cc.slab_no",
+    "sm_cc.slab_gubun", "sm_cc.slab_grind",
+    "fur_hr.charge_id", "fur_hr.slab_no", "fur_hr.furnace_no",
+    "fur_hr.f_jangip_gubun", "fur_hr.f_jangip_temp", "fur_hr.f_bfg",
+    "fur_hr.f_cog", "fur_hr.f_ldg", "fur_hr.f_bfg_per", "fur_hr.f_cog_per",
+    "fur_hr.f_ldg_per", "fur_hr.f_pre_temp", "fur_hr.f_heat_temp",
+    "fur_hr.f_sock_temp", "fur_hr.f_pre_interval", "fur_hr.f_heat_interval",
+    "fur_hr.f_sock_interval", "fur_hr.f_ext_date", "fur_hr.f_ext_time",
+    "fur_hr.hr_coil_id", "fur_hr.hr_date", "fur_hr.hr_thick",
+    "fur_hr.hr_width", "fur_hr.rm4_temp", "fur_hr.rm_pitch",
+    "fur_hr.slab_width", "ap.judge", "ap.hr_coil_id", "ap.ap_plant",
+    "ap.ap_prod_id", "ap.ap_date", "ap.ap_shift", "ap.ap_thick",
+    "ap.ap_width", "ap.ap_line_speed",
+})
 
 
 def _load_schema(name: str) -> dict:
@@ -1147,6 +1183,70 @@ def test_lineage_vocabularies_and_all_seven_output_grammars_are_closed():
     for invalid in (invalid_filter, invalid_transformation):
         with pytest.raises(ValidationError):
             validator.validate(invalid)
+
+
+def test_lineage_source_dependency_enum_is_the_exact_50_source_terminals():
+    field_schema = _load_schema("analysis_summary.schema.json")["$defs"][
+        "fieldLineage"
+    ]
+    enum = field_schema["properties"]["dependencies"]["items"]["oneOf"][0][
+        "enum"
+    ]
+    actual = frozenset(enum)
+    assert len(enum) == len(actual) == len(LITERAL_SOURCE_DEPENDENCY_TERMINALS) == 50
+    assert actual == LITERAL_SOURCE_DEPENDENCY_TERMINALS
+    assert "sm_cc.slab_no" in actual
+
+
+def test_range_and_risk_context_output_paths_use_exact_configured_keys():
+    config = json.loads(
+        Path("analysis/analysis_config.json").read_text(encoding="utf-8")
+    )
+    configured_range_keys = {
+        key
+        for hierarchy in config["rangeContextHierarchies"]
+        for level in hierarchy["levels"]
+        for key in level
+    }
+    configured_risk_keys = {
+        key
+        for hierarchy in config["riskAdjustmentHierarchies"]
+        for level in hierarchy["levels"]
+        for key in level
+    }
+    assert configured_range_keys == RANGE_CONTEXT_KEYS
+    assert configured_risk_keys == RISK_CONTEXT_KEYS
+
+    validator = _validator("analysis_summary.schema.json")
+    for artifact_role, container, keys in (
+        ("equipment_operating_ranges", "ranges[].context", RANGE_CONTEXT_KEYS),
+        ("quality_risk_intervals", "rules[].applicationContext", RISK_CONTEXT_KEYS),
+    ):
+        for output_field in (container, *(f"{container}.{key}" for key in keys)):
+            valid = _summary()
+            valid["lineage"]["fields"] = [{
+                "artifactRole": artifact_role,
+                "outputField": output_field,
+                "sourceRole": None,
+                "sourceColumn": None,
+                "conversion": "COPY_CANONICAL_CONFIG",
+                "dependencies": ["fur_hr.f_pre_temp"],
+                "firstAvailableStage": None,
+            }]
+            validator.validate(valid)
+
+        forged = _summary()
+        forged["lineage"]["fields"] = [{
+            "artifactRole": artifact_role,
+            "outputField": f"{container}.not_a_contract_key",
+            "sourceRole": None,
+            "sourceColumn": None,
+            "conversion": "COPY_CANONICAL_CONFIG",
+            "dependencies": ["fur_hr.f_pre_temp"],
+            "firstAvailableStage": None,
+        }]
+        with pytest.raises(ValidationError):
+            validator.validate(forged)
 
 
 def test_replay_identifier_raw_lineage_uses_top_level_paths_and_gas_ratio_sources_exist():

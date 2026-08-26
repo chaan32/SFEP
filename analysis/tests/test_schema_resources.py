@@ -40,7 +40,7 @@ SCHEMA_NAMES = (
 )
 LITERAL_ROOT_SHA256 = {
     "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-    "analysis_summary.schema.json": "38e61d5d81f15ffb30bd3164c6f34b469b20f06a90e9e393dee1f2a54818bf0f",
+    "analysis_summary.schema.json": "0ae8e07595e5c87b509f7601c294de835fb35ab5d7b6843acc0971489d5da075",
     "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
     "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
     "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -96,6 +96,24 @@ def _transitional_summary() -> dict[str, object]:
     payload = payload.replace(b"@BUNDLE_ID@", SHA_A.encode("ascii"))
     payload = payload.replace(b"@CRITERIA_ID@", SHA_B.encode("ascii"))
     return json.loads(payload)
+
+
+def _summary_with_derived_lineage_field(
+    artifact_role: str,
+    output_field: str,
+    dependency: str,
+) -> dict[str, object]:
+    summary = _transitional_summary()
+    summary["lineage"]["fields"] = [{
+        "artifactRole": artifact_role,
+        "outputField": output_field,
+        "sourceRole": None,
+        "sourceColumn": None,
+        "conversion": "COMPUTE_IDENTITY",
+        "dependencies": [dependency],
+        "firstAvailableStage": None,
+    }]
+    return summary
 
 
 def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schemas():
@@ -197,6 +215,122 @@ def test_summary_resource_runs_closed_application_validation_after_json_schema()
     with pytest.raises(ValidationError, match="count"):
         schema_module.validate_normative_instance(
             "analysis_summary.schema.json", invalid
+        )
+
+
+def test_public_validation_rejects_forged_range_and_rule_context_output_keys():
+    for artifact_role, output_field in (
+        (
+            "equipment_operating_ranges",
+            "ranges[].context.not_a_contract_key",
+        ),
+        (
+            "quality_risk_intervals",
+            "rules[].applicationContext.not_a_contract_key",
+        ),
+    ):
+        forged = _summary_with_derived_lineage_field(
+            artifact_role,
+            output_field,
+            "fur_hr.f_pre_temp",
+        )
+        with pytest.raises(ValidationError):
+            schema_module.validate_normative_instance(
+                "analysis_summary.schema.json", forged
+            )
+        with pytest.raises(ValidationError, match="context output field"):
+            schema_module._validate_analysis_summary_application_contract(
+                forged
+            )
+
+
+@pytest.mark.parametrize(
+    ("artifact_role", "output_field", "dependency"),
+    [
+        (
+            "equipment_operating_ranges",
+            "schemaVersion",
+            "schema.equipment_operating_ranges",
+        ),
+        (
+            "equipment_operating_ranges",
+            "criteriaId",
+            "identity.criteria_id",
+        ),
+        (
+            "quality_risk_intervals",
+            "schemaVersion",
+            "schema.quality_risk_intervals",
+        ),
+        (
+            "quality_risk_intervals",
+            "criteriaId",
+            "identity.criteria_id",
+        ),
+        ("replay_events", "schema_version", "schema.replay_events"),
+        ("replay_events", "bundle_id", "identity.bundle_id"),
+        ("replay_events", "criteria_id", "identity.criteria_id"),
+    ],
+)
+def test_role_scoped_schema_and_identity_terminals_accept_truthful_leaf_mappings(
+    artifact_role,
+    output_field,
+    dependency,
+):
+    schema_module.validate_normative_instance(
+        "analysis_summary.schema.json",
+        _summary_with_derived_lineage_field(
+            artifact_role,
+            output_field,
+            dependency,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_role", "output_field", "dependency"),
+    [
+        (
+            "equipment_operating_ranges",
+            "schemaVersion",
+            "schema.quality_risk_intervals",
+        ),
+        (
+            "equipment_operating_ranges",
+            "criteriaId",
+            "identity.bundle_id",
+        ),
+        (
+            "quality_risk_intervals",
+            "schemaVersion",
+            "schema.equipment_operating_ranges",
+        ),
+        (
+            "quality_risk_intervals",
+            "criteriaId",
+            "identity.criteria_projection_sha256",
+        ),
+        ("replay_events", "schema_version", "schema.analysis_summary"),
+        (
+            "replay_events",
+            "bundle_id",
+            "identity.analysis_config_sha256",
+        ),
+    ],
+)
+def test_role_scoped_schema_and_identity_terminals_reject_cross_role_forgery(
+    artifact_role,
+    output_field,
+    dependency,
+):
+    with pytest.raises(ValidationError, match="terminal"):
+        schema_module.validate_normative_instance(
+            "analysis_summary.schema.json",
+            _summary_with_derived_lineage_field(
+                artifact_role,
+                output_field,
+                dependency,
+            ),
         )
 
 

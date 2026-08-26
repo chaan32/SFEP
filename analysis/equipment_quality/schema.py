@@ -100,7 +100,7 @@ _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
     {
         "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-        "analysis_summary.schema.json": "38e61d5d81f15ffb30bd3164c6f34b469b20f06a90e9e393dee1f2a54818bf0f",
+        "analysis_summary.schema.json": "0ae8e07595e5c87b509f7601c294de835fb35ab5d7b6843acc0971489d5da075",
         "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
         "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
         "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -184,7 +184,7 @@ _LINEAGE_ROOT_PREFIXES = {
         "population.DISCOVERY",
         "population.CONFIRMATION",
     ),
-    "replay_events": ("config.", "identity."),
+    "replay_events": ("config.",),
     "analysis_summary": (
         "config.",
         "identity.",
@@ -194,6 +194,47 @@ _LINEAGE_ROOT_PREFIXES = {
         "schema.",
         "source.",
     ),
+}
+_LINEAGE_ROLE_ROOT_TERMINALS = {
+    "equipment_operating_ranges": frozenset(
+        {
+            "identity.criteria_id",
+            "schema.equipment_operating_ranges",
+        }
+    ),
+    "quality_risk_intervals": frozenset(
+        {
+            "identity.criteria_id",
+            "schema.quality_risk_intervals",
+        }
+    ),
+    "replay_events": frozenset(
+        {
+            "identity.bundle_id",
+            "identity.criteria_id",
+            "schema.replay_events",
+        }
+    ),
+}
+_LINEAGE_CONTEXT_KEYS = frozenset(
+    {
+        "ap_plant",
+        "ap_shift",
+        "ap_thick_band",
+        "ap_width_band",
+        "f_jangip_gubun",
+        "furnace_no",
+        "hr_thick_band",
+        "hr_width_band",
+        "slab_width_band",
+        "sm_plant",
+        "steel_grade",
+        "steel_usage",
+    }
+)
+_LINEAGE_CONTEXT_ROOTS = {
+    "equipment_operating_ranges": "ranges[].context",
+    "quality_risk_intervals": "rules[].applicationContext",
 }
 _LINEAGE_SOURCE_TERMINAL_ROLES = frozenset(
     {
@@ -688,6 +729,16 @@ def _validate_analysis_summary_application_contract(
     for field, node_id in zip(fields, node_ids, strict=True):
         if field["conversion"] not in _LINEAGE_CONVERSIONS:
             _summary_validation_error("lineage conversion vocabulary is invalid")
+        context_root = _LINEAGE_CONTEXT_ROOTS.get(field["artifactRole"])
+        if (
+            context_root is not None
+            and field["outputField"].startswith(context_root + ".")
+            and field["outputField"][len(context_root) + 1 :]
+            not in _LINEAGE_CONTEXT_KEYS
+        ):
+            _summary_validation_error(
+                f"lineage context output field is invalid for {field['artifactRole']}"
+            )
         dependencies = field["dependencies"]
         if not _utf8_sorted(dependencies):
             _summary_validation_error(
@@ -742,6 +793,8 @@ def _validate_analysis_summary_application_contract(
             if (
                 dependency in _LINEAGE_SOURCE_TERMINALS
                 and field["artifactRole"] in _LINEAGE_SOURCE_TERMINAL_ROLES
+            ) or dependency in _LINEAGE_ROLE_ROOT_TERMINALS.get(
+                field["artifactRole"], ()
             ) or any(
                 dependency.startswith(prefix)
                 for prefix in _LINEAGE_ROOT_PREFIXES[field["artifactRole"]]
