@@ -40,7 +40,7 @@ SCHEMA_NAMES = (
 )
 LITERAL_ROOT_SHA256 = {
     "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-    "analysis_summary.schema.json": "c33bdef27fcea94553f296b9d2aab1d070d4de5a8db9dd96f970d7c76e99ff8c",
+    "analysis_summary.schema.json": "6cb6077cc7093b90e464cc794604ca6b7682002a138ebed051801aee29f9d374",
     "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
     "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
     "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -102,6 +102,7 @@ def _summary_with_derived_lineage_field(
     artifact_role: str,
     output_field: str,
     dependency: str,
+    conversion: str = "COMPUTE_IDENTITY",
 ) -> dict[str, object]:
     summary = _transitional_summary()
     summary["lineage"]["fields"] = [{
@@ -109,11 +110,24 @@ def _summary_with_derived_lineage_field(
         "outputField": output_field,
         "sourceRole": None,
         "sourceColumn": None,
-        "conversion": "COMPUTE_IDENTITY",
+        "conversion": conversion,
         "dependencies": [dependency],
         "firstAvailableStage": None,
     }]
     return summary
+
+
+def _lineage_field(
+    summary: dict[str, object],
+    artifact_role: str,
+    output_field: str,
+) -> dict[str, object]:
+    return next(
+        field
+        for field in summary["lineage"]["fields"]
+        if field["artifactRole"] == artifact_role
+        and field["outputField"] == output_field
+    )
 
 
 def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schemas():
@@ -218,6 +232,120 @@ def test_summary_resource_runs_closed_application_validation_after_json_schema()
         )
 
 
+def test_application_contract_binds_each_golden_leaf_to_one_exact_conversion():
+    summary = _transitional_summary()
+    fields = summary["lineage"]["fields"]
+    assert len(fields) == 345
+    schema_module.validate_normative_instance("analysis_summary.schema.json", summary)
+
+    for index, field in enumerate(fields):
+        forged = copy.deepcopy(summary)
+        forged_field = forged["lineage"]["fields"][index]
+        forged_field["conversion"] = (
+            "TYPE1_QUANTILE"
+            if field["conversion"] == "LINEAGE_INDEX_V1"
+            else "LINEAGE_INDEX_V1"
+        )
+        with pytest.raises(ValidationError, match="conversion"):
+            schema_module._validate_analysis_summary_application_contract(forged)
+
+
+_RANGE_CONTEXT_KEYS = (
+    "ap_plant",
+    "ap_shift",
+    "ap_thick_band",
+    "ap_width_band",
+    "f_jangip_gubun",
+    "furnace_no",
+    "hr_thick_band",
+    "hr_width_band",
+    "slab_width_band",
+    "sm_plant",
+    "steel_grade",
+    "steel_usage",
+)
+
+
+@pytest.mark.parametrize(
+    ("output_field", "conversion", "dependency"),
+    [
+        ("ranges[].ruleId", "COMPUTE_IDENTITY", "config.fields[].field"),
+        ("ranges[].field", "COPY_FIELD_METADATA", "config.fields[].field"),
+        ("ranges[].fieldRole", "COPY_FIELD_METADATA", "config.fields[].featureRole"),
+        (
+            "ranges[].firstAvailableStage",
+            "COPY_FIELD_METADATA",
+            "config.fields[].firstAvailableStage",
+        ),
+        (
+            "ranges[].equipmentType",
+            "COPY_FIELD_METADATA",
+            "config.fields[].equipmentType",
+        ),
+        (
+            "ranges[].equipmentId",
+            "DERIVE_RANGE_GROUP",
+            "population.REFERENCE",
+        ),
+        (
+            "ranges[].contextLevel",
+            "DERIVE_RANGE_GROUP",
+            "config.rangeContextHierarchies[].levels[][]",
+        ),
+        (
+            "ranges[].context",
+            "DERIVE_RANGE_GROUP",
+            "config.rangeContextHierarchies[].levels[][]",
+        ),
+        ("ranges[].support", "COUNT_RANGE_SUPPORT", "population.REFERENCE"),
+        ("ranges[].median", "TYPE1_QUANTILE", "population.REFERENCE"),
+        (
+            "ranges[].lowerTailEnabled",
+            "APPLY_RANGE_TAIL_POLICY",
+            "config.operatingRanges.extremeTailMinimumSupport",
+        ),
+        (
+            "ranges[].upperTailEnabled",
+            "APPLY_RANGE_TAIL_POLICY",
+            "config.operatingRanges.extremeTailMinimumSupport",
+        ),
+    ]
+    + [
+        (
+            f"ranges[].context.{key}",
+            "DERIVE_RANGE_GROUP",
+            "config.rangeContextHierarchies[].levels[][]",
+        )
+        for key in _RANGE_CONTEXT_KEYS
+    ]
+    + [
+        (f"ranges[].{quantile}", "TYPE1_QUANTILE", "population.REFERENCE")
+        for quantile in ("p01", "p05", "p95", "p99")
+    ],
+)
+def test_nonempty_operating_range_lineage_uses_exact_operation_families(
+    output_field,
+    conversion,
+    dependency,
+):
+    summary = _summary_with_derived_lineage_field(
+        "equipment_operating_ranges",
+        output_field,
+        dependency,
+        conversion,
+    )
+    schema_module.validate_normative_instance("analysis_summary.schema.json", summary)
+
+    forged = copy.deepcopy(summary)
+    forged["lineage"]["fields"][0]["conversion"] = (
+        "TYPE1_QUANTILE"
+        if conversion != "TYPE1_QUANTILE"
+        else "DERIVE_RANGE_GROUP"
+    )
+    with pytest.raises(ValidationError, match="conversion"):
+        schema_module._validate_analysis_summary_application_contract(forged)
+
+
 def test_public_validation_rejects_forged_range_and_rule_context_output_keys():
     for artifact_role, output_field in (
         (
@@ -245,37 +373,57 @@ def test_public_validation_rejects_forged_range_and_rule_context_output_keys():
 
 
 @pytest.mark.parametrize(
-    ("artifact_role", "output_field", "dependency"),
+    ("artifact_role", "output_field", "dependency", "conversion"),
     [
         (
             "equipment_operating_ranges",
             "schemaVersion",
             "schema.equipment_operating_ranges",
+            "COPY_SCHEMA_VERSION",
         ),
         (
             "equipment_operating_ranges",
             "criteriaId",
             "identity.criteria_id",
+            "COPY_IDENTITY_VALUE",
         ),
         (
             "quality_risk_intervals",
             "schemaVersion",
             "schema.quality_risk_intervals",
+            "COPY_SCHEMA_VERSION",
         ),
         (
             "quality_risk_intervals",
             "criteriaId",
             "identity.criteria_id",
+            "COPY_IDENTITY_VALUE",
         ),
-        ("replay_events", "schema_version", "schema.replay_events"),
-        ("replay_events", "bundle_id", "identity.bundle_id"),
-        ("replay_events", "criteria_id", "identity.criteria_id"),
+        (
+            "replay_events",
+            "schema_version",
+            "schema.replay_events",
+            "COPY_SCHEMA_VERSION",
+        ),
+        (
+            "replay_events",
+            "bundle_id",
+            "identity.bundle_id",
+            "COPY_IDENTITY_VALUE",
+        ),
+        (
+            "replay_events",
+            "criteria_id",
+            "identity.criteria_id",
+            "COPY_IDENTITY_VALUE",
+        ),
     ],
 )
 def test_role_scoped_schema_and_identity_terminals_accept_truthful_leaf_mappings(
     artifact_role,
     output_field,
     dependency,
+    conversion,
 ):
     schema_module.validate_normative_instance(
         "analysis_summary.schema.json",
@@ -283,38 +431,49 @@ def test_role_scoped_schema_and_identity_terminals_accept_truthful_leaf_mappings
             artifact_role,
             output_field,
             dependency,
+            conversion,
         ),
     )
 
 
 @pytest.mark.parametrize(
-    ("artifact_role", "output_field", "dependency"),
+    ("artifact_role", "output_field", "dependency", "conversion"),
     [
         (
             "equipment_operating_ranges",
             "schemaVersion",
             "schema.quality_risk_intervals",
+            "COPY_SCHEMA_VERSION",
         ),
         (
             "equipment_operating_ranges",
             "criteriaId",
             "identity.bundle_id",
+            "COPY_IDENTITY_VALUE",
         ),
         (
             "quality_risk_intervals",
             "schemaVersion",
             "schema.equipment_operating_ranges",
+            "COPY_SCHEMA_VERSION",
         ),
         (
             "quality_risk_intervals",
             "criteriaId",
             "identity.criteria_projection_sha256",
+            "COPY_IDENTITY_VALUE",
         ),
-        ("replay_events", "schema_version", "schema.analysis_summary"),
+        (
+            "replay_events",
+            "schema_version",
+            "schema.analysis_summary",
+            "COPY_SCHEMA_VERSION",
+        ),
         (
             "replay_events",
             "bundle_id",
             "identity.analysis_config_sha256",
+            "COPY_IDENTITY_VALUE",
         ),
     ],
 )
@@ -322,6 +481,7 @@ def test_role_scoped_schema_and_identity_terminals_reject_cross_role_forgery(
     artifact_role,
     output_field,
     dependency,
+    conversion,
 ):
     with pytest.raises(ValidationError, match="terminal"):
         schema_module.validate_normative_instance(
@@ -330,8 +490,50 @@ def test_role_scoped_schema_and_identity_terminals_reject_cross_role_forgery(
                 artifact_role,
                 output_field,
                 dependency,
+                conversion,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("artifact_role", "output_field", "plausible_but_wrong_conversion"),
+    [
+        ("analysis_config", "labelMaturityDays", "COMPUTE_IDENTITY"),
+        ("bundle_manifest", "schemaVersion", "COPY_CANONICAL_CONFIG"),
+        ("bundle_manifest", "bundleId", "COPY_IDENTITY_VALUE"),
+        ("bundle_manifest", "artifacts[].sha256", "COMPUTE_BYTE_SIZE"),
+        ("bundle_manifest", "artifacts[].sizeBytes", "COMPUTE_SHA256"),
+        ("bundle_manifest", "asOf", "SELECT_TIME_BOUNDARY"),
+        ("replay_events", "values_json.sm_plant", "PARSE_FINITE_BINARY64"),
+        ("replay_events", "values_json.f_pre_temp", "COPY_SOURCE_SCALAR"),
+        ("replay_events", "values_json.cast_date", "PARSE_HOUR_BUCKET"),
+        ("replay_events", "values_json.f_ext_time", "PARSE_DATE"),
+        ("replay_events", "replay_date", "CLASSIFY_REPLAY_SCHEDULE"),
+        ("replay_events", "batch_step", "SELECT_STAGE_VALUE"),
+        ("replay_events", "equipment_id", "CLASSIFY_REPLAY_SCHEDULE"),
+        ("quality_risk_intervals", "rules[].analysisFamily", "COMPUTE_QUALITY_METRIC"),
+        ("quality_risk_intervals", "rules[].discovery.support", "DERIVE_RULE_CANDIDATE"),
+        ("quality_risk_intervals", "rules[].grade", "DERIVE_STAGE_ELIGIBILITY"),
+        ("quality_risk_intervals", "rules[].earlyWarningEligible", "APPLY_GRADE_POLICY"),
+        ("quality_risk_intervals", "rules[].displayMergeRuleIds[]", "DERIVE_RULE_CANDIDATE"),
+        ("analysis_summary", "asOf", "COPY_BOUNDARY_DATE"),
+        ("analysis_summary", "dateRange.from", "COPY_BOUNDARY_DATE"),
+        ("analysis_summary", "sourceColumnProfiles[].total", "COUNT_PARTITION"),
+        ("analysis_summary", "driftMetrics[].reference.median", "TYPE1_QUANTILE"),
+        ("analysis_summary", "holdoutMetrics[].alertRate.pointEstimate", "COUNT_PARTITION"),
+    ],
+)
+def test_application_conversion_binding_rejects_plausible_cross_family_swaps(
+    artifact_role,
+    output_field,
+    plausible_but_wrong_conversion,
+):
+    summary = _transitional_summary()
+    field = _lineage_field(summary, artifact_role, output_field)
+    assert field["conversion"] != plausible_but_wrong_conversion
+    field["conversion"] = plausible_but_wrong_conversion
+    with pytest.raises(ValidationError, match="conversion"):
+        schema_module._validate_analysis_summary_application_contract(summary)
 
 
 def test_summary_application_validation_closes_refs_order_cycles_roles_and_intervals():

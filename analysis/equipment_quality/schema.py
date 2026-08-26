@@ -100,7 +100,7 @@ _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
     {
         "analysis_config.schema.json": "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
-        "analysis_summary.schema.json": "c33bdef27fcea94553f296b9d2aab1d070d4de5a8db9dd96f970d7c76e99ff8c",
+        "analysis_summary.schema.json": "6cb6077cc7093b90e464cc794604ca6b7682002a138ebed051801aee29f9d374",
         "bundle_manifest.schema.json": "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
         "equipment_operating_ranges.schema.json": "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
         "producer_runtime.schema.json": "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
@@ -167,6 +167,9 @@ _LINEAGE_CONVERSIONS = frozenset(
         "MERGE_DISPLAY_INTERVALS",
         "COPY_POLICY_VALUE",
         "COMPUTE_DATE_RANGE",
+        "DERIVE_RANGE_GROUP",
+        "COUNT_RANGE_SUPPORT",
+        "APPLY_RANGE_TAIL_POLICY",
     }
 )
 _LINEAGE_FILTERS = frozenset(
@@ -546,6 +549,176 @@ def _utf8_sorted(values: list[str]) -> bool:
     return values == sorted(values, key=lambda value: value.encode("utf-8"))
 
 
+def _expected_lineage_conversion(field: Mapping[str, object]) -> str | None:
+    role = field["artifactRole"]
+    path = field["outputField"]
+    source_role = field["sourceRole"]
+    source_column = field["sourceColumn"]
+    assert isinstance(role, str)
+    assert isinstance(path, str)
+
+    if source_role is not None:
+        assert isinstance(source_role, str)
+        assert isinstance(source_column, str)
+        if source_column in _NUMERIC_COLUMNS[source_role]:
+            return "PARSE_FINITE_BINARY64"
+        if source_column in _DATE_COLUMNS[source_role]:
+            return "PARSE_DATE"
+        if source_role == "fur_hr" and source_column == "f_ext_time":
+            return "PARSE_HOUR_BUCKET"
+        return "COPY_SOURCE_SCALAR"
+
+    if role == "analysis_config":
+        return "COPY_CANONICAL_CONFIG"
+    if role == "producer_runtime":
+        return "COPY_VERIFIED_RUNTIME"
+
+    if role == "bundle_manifest":
+        if path == "schemaVersion" or (
+            path.startswith("artifacts[].") and path.endswith("schemaVersion")
+        ):
+            return "COPY_SCHEMA_VERSION"
+        if path in {"bundleId", "criteriaId"}:
+            return "COMPUTE_IDENTITY"
+        if path in {"asOf", "criteriaIdentity.as_of"}:
+            return "COPY_BOUNDARY_DATE"
+        if path in {"timezone", "labelMaturityDays"}:
+            return "COPY_CANONICAL_CONFIG"
+        if path == "identity.criteria_id":
+            return "COPY_IDENTITY_VALUE"
+        if path == "artifacts[].role":
+            return "PROJECT_ARTIFACT_METADATA"
+        if path == "artifacts[].sizeBytes":
+            return "COMPUTE_BYTE_SIZE"
+        if path == "artifacts[].sha256":
+            return "COMPUTE_SHA256"
+        if path.startswith("identity.source."):
+            return "COPY_SOURCE_METADATA"
+        if (
+            path.endswith("_sha256")
+            or path.endswith(".sha256")
+        ) and path.startswith(("identity.", "criteriaIdentity.")):
+            return "COPY_DIGEST_VALUE"
+        return None
+
+    if role == "equipment_operating_ranges":
+        headers = {
+            "schemaVersion": "COPY_SCHEMA_VERSION",
+            "criteriaId": "COPY_IDENTITY_VALUE",
+            "asOf": "SELECT_TIME_BOUNDARY",
+            "ranges[].ruleId": "COMPUTE_IDENTITY",
+            "ranges[].field": "COPY_FIELD_METADATA",
+            "ranges[].fieldRole": "COPY_FIELD_METADATA",
+            "ranges[].firstAvailableStage": "COPY_FIELD_METADATA",
+            "ranges[].equipmentType": "COPY_FIELD_METADATA",
+            "ranges[].support": "COUNT_RANGE_SUPPORT",
+            "ranges[].median": "TYPE1_QUANTILE",
+            "ranges[].p01": "TYPE1_QUANTILE",
+            "ranges[].p05": "TYPE1_QUANTILE",
+            "ranges[].p95": "TYPE1_QUANTILE",
+            "ranges[].p99": "TYPE1_QUANTILE",
+            "ranges[].lowerTailEnabled": "APPLY_RANGE_TAIL_POLICY",
+            "ranges[].upperTailEnabled": "APPLY_RANGE_TAIL_POLICY",
+        }
+        if path in headers:
+            return headers[path]
+        if path in {
+            "ranges[].equipmentId",
+            "ranges[].contextLevel",
+            "ranges[].context",
+        } or path.startswith("ranges[].context."):
+            return "DERIVE_RANGE_GROUP"
+        return None
+
+    if role == "quality_risk_intervals":
+        headers = {
+            "schemaVersion": "COPY_SCHEMA_VERSION",
+            "criteriaId": "COPY_IDENTITY_VALUE",
+            "asOf": "SELECT_TIME_BOUNDARY",
+            "rules[].ruleId": "COMPUTE_IDENTITY",
+            "rules[].grade": "APPLY_GRADE_POLICY",
+            "rules[].earlyWarningEligible": "DERIVE_STAGE_ELIGIBILITY",
+            "rules[].displayMergeRuleIds[]": "MERGE_DISPLAY_INTERVALS",
+        }
+        if path in headers:
+            return headers[path]
+        if path.startswith(("rules[].discovery.", "rules[].confirmation.")):
+            return "COMPUTE_QUALITY_METRIC"
+        if path.startswith("rules[]."):
+            return "DERIVE_RULE_CANDIDATE"
+        return None
+
+    if role == "replay_events":
+        replay_conversions = {
+            "schema_version": "COPY_SCHEMA_VERSION",
+            "bundle_id": "COPY_IDENTITY_VALUE",
+            "criteria_id": "COPY_IDENTITY_VALUE",
+            "event_id": "COMPUTE_IDENTITY",
+            "material_key": "COMPUTE_IDENTITY",
+            "batch_id": "COMPUTE_IDENTITY",
+            "equipment_batch_id": "COMPUTE_IDENTITY",
+            "replay_date": "SELECT_STAGE_VALUE",
+            "replay_hour": "SELECT_STAGE_VALUE",
+            "batch_kind": "CLASSIFY_REPLAY_SCHEDULE",
+            "batch_step": "CLASSIFY_REPLAY_SCHEDULE",
+            "time_precision": "CLASSIFY_REPLAY_SCHEDULE",
+            "equipment_type": "SELECT_STAGE_EQUIPMENT",
+            "equipment_id": "SELECT_STAGE_EQUIPMENT",
+            "values_json.f_bfg_ratio": "DERIVE_FUEL_RATIO",
+            "values_json.f_cog_ratio": "DERIVE_FUEL_RATIO",
+            "values_json.f_ldg_ratio": "DERIVE_FUEL_RATIO",
+        }
+        return replay_conversions.get(path)
+
+    if role == "analysis_summary":
+        headers = {
+            "schemaVersion": "COPY_SCHEMA_VERSION",
+            "bundleId": "COPY_IDENTITY_VALUE",
+            "criteriaId": "COPY_IDENTITY_VALUE",
+            "asOf": "SELECT_TIME_BOUNDARY",
+            "innerSplitDate": "SELECT_TIME_BOUNDARY",
+            "evaluationMode": "COPY_POLICY_VALUE",
+            "dateRange.from": "COMPUTE_DATE_RANGE",
+            "dateRange.to": "COMPUTE_DATE_RANGE",
+        }
+        if path in headers:
+            return headers[path]
+        if path.startswith("sourceColumnProfiles[]."):
+            return "PROFILE_SOURCE_COLUMN"
+        if path in {
+            "driftMetrics[].field",
+            "driftMetrics[].dataType",
+            "driftMetrics[].reference.levels",
+            "driftMetrics[].holdout.levels",
+        }:
+            return "COPY_FIELD_METADATA"
+        if path.startswith("driftMetrics[]."):
+            return "COMPARE_DISTRIBUTIONS"
+        if path == "holdoutMetrics[].alertGrade":
+            return "COPY_POLICY_VALUE"
+        if path.startswith("holdoutMetrics[]."):
+            confusion_suffixes = {
+                "total",
+                "truePositive",
+                "falsePositive",
+                "trueNegative",
+                "falseNegative",
+            }
+            if path.rsplit(".", 1)[-1] in confusion_suffixes:
+                return "COUNT_PARTITION"
+            return "COMPUTE_HOLDOUT_METRIC"
+        if path.startswith((
+            "splitCounts.",
+            "quarantineCounts.",
+            "labelCensoringCounts.",
+            "chargePurgeCounts.",
+        )):
+            return "COUNT_PARTITION"
+        return None
+
+    return None
+
+
 def _validate_analysis_summary_application_contract(
     summary: Mapping[str, object],
 ) -> None:
@@ -801,6 +974,13 @@ def _validate_analysis_summary_application_contract(
             )
         ):
             _summary_validation_error("derived lineage mapping is invalid")
+
+        expected_conversion = _expected_lineage_conversion(field)
+        if field["conversion"] != expected_conversion:
+            _summary_validation_error(
+                "lineage conversion is invalid for "
+                f"{field['artifactRole']}.{field['outputField']}"
+            )
 
         graph_dependencies: list[str] = []
         for dependency in dependencies:

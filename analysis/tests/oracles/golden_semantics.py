@@ -36,8 +36,6 @@ _STAGE_RANK = {
 }
 _QUALITY_ROLES = {"DIRECT_OPERATION", "PRODUCT_STATE_REFERENCE", "CONTEXT", "EQUIPMENT_IDENTIFIER"}
 _RANGE_ROLES = {"DIRECT_OPERATION", "PRODUCT_STATE_REFERENCE"}
-_AS_OF = date(2025, 2, 20)
-_INNER_SPLIT = date(2025, 1, 3)
 _CRITERIA_TOKEN = "@CRITERIA_ID@"
 _BUNDLE_TOKEN = "@BUNDLE_ID@"
 
@@ -563,20 +561,18 @@ def _type1(values: list[int | float], probability: Fraction) -> int | float:
 
 
 def _quartile_cuts(values: list[int | float]) -> tuple[int | float, ...]:
-    proposed = (
+    return (
         _type1(values, Fraction(1, 4)),
         _type1(values, Fraction(1, 2)),
         _type1(values, Fraction(3, 4)),
-        max(values),
     )
-    return tuple(dict.fromkeys(proposed))
 
 
 def _band(value: int | float, cuts: tuple[int | float, ...]) -> str:
     for index, boundary in enumerate(cuts, start=1):
         if value <= boundary:
             return "Q" + str(index)
-    raise AssertionError("band cut does not include maximum")
+    return "Q4"
 
 
 def _load_inputs(root: Path) -> tuple[dict[str, object], dict[str, list[dict[str, str]]]]:
@@ -664,35 +660,171 @@ def _derive_materials(
     return materials, quarantine
 
 
-def _split_materials(materials: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
-    reference = [item for item in materials if date.fromisoformat(str(item["values"]["hr_date"])) <= _AS_OF]  # type: ignore[index]
-    holdout = [item for item in materials if date.fromisoformat(str(item["values"]["hr_date"])) > _AS_OF]  # type: ignore[index]
-    maturity_cutoff = _AS_OF - timedelta(days=38)
+def _fur_boundary_rows(
+    tables: dict[str, list[dict[str, str]]],
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in tables["fur_hr"]:
+        key = (row["charge_id"], row["slab_no"])
+        grouped.setdefault(key, []).append(row)
+    result: list[dict[str, object]] = []
+    for (charge_id, slab_no), rows in grouped.items():
+        if not charge_id or not slab_no or len(rows) != 1:
+            continue
+        try:
+            date.fromisoformat(rows[0]["hr_date"])
+        except ValueError:
+            continue
+        result.append({
+            "charge_id": charge_id,
+            "slab_no": slab_no,
+            "values": {"hr_date": rows[0]["hr_date"]},
+        })
+    return result
+
+
+def _whole_date_boundary(
+    rows: list[dict[str, object]], field: str, fraction: Fraction | float,
+) -> date:
+    if not rows:
+        raise ValueError("whole-date boundary population must not be empty")
+    ratio = fraction if isinstance(fraction, Fraction) else Fraction(str(fraction))
+    if ratio <= 0 or ratio > 1:
+        raise ValueError("whole-date boundary fraction must be in (0, 1]")
+    dates = sorted(
+        date.fromisoformat(str(item["values"][field]))  # type: ignore[index]
+        for item in rows
+    )
+    required = _integer_ceiling(ratio * len(dates))
+    return dates[required - 1]
+
+
+def _purge_crossing_charges(
+    earlier: list[dict[str, object]], later: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, int]]:
+    crossing = _crossing_charge_ids(earlier, later)
+    purged_earlier = [
+        item for item in earlier if str(item["charge_id"]) not in crossing
+    ]
+    purged_later = [
+        item for item in later if str(item["charge_id"]) not in crossing
+    ]
+    return purged_earlier, purged_later, {
+        "chargeCount": len(crossing),
+        "rowCount": len(earlier) + len(later) - len(purged_earlier) - len(purged_later),
+    }
+
+
+def _crossing_charge_ids(
+    earlier: list[dict[str, object]], later: list[dict[str, object]],
+) -> set[str]:
+    return (
+        {str(item["charge_id"]) for item in earlier}
+        & {str(item["charge_id"]) for item in later}
+    )
+
+
+def _split_materials(
+    materials: list[dict[str, object]],
+    config: dict[str, object],
+    boundary_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    splits = config["splits"]  # type: ignore[assignment]
+    as_of = _whole_date_boundary(
+        boundary_rows, "hr_date", float(splits["referenceFraction"]),  # type: ignore[index]
+    )
+    earlier_boundary = [
+        item for item in boundary_rows
+        if date.fromisoformat(str(item["values"]["hr_date"])) <= as_of  # type: ignore[index]
+    ]
+    later_boundary = [
+        item for item in boundary_rows
+        if date.fromisoformat(str(item["values"]["hr_date"])) > as_of  # type: ignore[index]
+    ]
+    crossing_outer = _crossing_charge_ids(earlier_boundary, later_boundary)
+    outer_purge = {
+        "chargeCount": len(crossing_outer),
+        "rowCount": sum(
+            str(item["charge_id"]) in crossing_outer
+            for item in boundary_rows
+        ),
+    }
+    reference = [
+        item for item in materials
+        if date.fromisoformat(str(item["values"]["hr_date"])) <= as_of  # type: ignore[index]
+        and str(item["charge_id"]) not in crossing_outer
+    ]
+    holdout = [
+        item for item in materials
+        if date.fromisoformat(str(item["values"]["hr_date"])) > as_of  # type: ignore[index]
+        and str(item["charge_id"]) not in crossing_outer
+    ]
+
+    maturity_cutoff = as_of - timedelta(days=int(config["labelMaturityDays"]))
     mature: list[dict[str, object]] = []
+    censor_counts: dict[str, int] = {}
     for item in reference:
         values = item["values"]  # type: ignore[assignment]
-        ap = item["ap"]
-        if (
-            ap is not None
-            and date.fromisoformat(str(values["hr_date"])) <= maturity_cutoff
-            and date.fromisoformat(str(values["ap_date"])) <= _AS_OF
-            and values["judge"] in {"양품", "불량"}
+        if item["ap"] is None:
+            reason = "AP_UNLINKED"
+        elif (
+            values.get("ap_date") is None
+            or date.fromisoformat(str(values["hr_date"])) > maturity_cutoff
+            or date.fromisoformat(str(values["ap_date"])) > as_of
         ):
+            reason = "LABEL_NOT_YET_AVAILABLE"
+        elif values.get("judge") not in {"양품", "불량"}:
+            reason = "LABEL_MISSING"
+        else:
             mature.append(item)
-    discovery = [item for item in mature if date.fromisoformat(str(item["values"]["hr_date"])) <= _INNER_SPLIT]  # type: ignore[index]
-    confirmation = [item for item in mature if date.fromisoformat(str(item["values"]["hr_date"])) > _INNER_SPLIT]  # type: ignore[index]
+            continue
+        censor_counts[reason] = censor_counts.get(reason, 0) + 1
+
+    for item in holdout:
+        values = item["values"]  # type: ignore[assignment]
+        reason = (
+            "AP_UNLINKED" if item["ap"] is None
+            else "LABEL_MISSING" if values.get("judge") not in {"양품", "불량"}
+            else None
+        )
+        if reason is not None:
+            censor_counts[reason] = censor_counts.get(reason, 0) + 1
+
+    inner_split = _whole_date_boundary(
+        mature, "hr_date", float(splits["discoveryFraction"]),  # type: ignore[index]
+    )
+    discovery = [
+        item for item in mature
+        if date.fromisoformat(str(item["values"]["hr_date"])) <= inner_split  # type: ignore[index]
+    ]
+    confirmation = [
+        item for item in mature
+        if date.fromisoformat(str(item["values"]["hr_date"])) > inner_split  # type: ignore[index]
+    ]
+    discovery, confirmation, inner_purge = _purge_crossing_charges(
+        discovery, confirmation,
+    )
+    retained_mature = discovery + confirmation
     return {
+        "AS_OF": as_of,
+        "INNER_SPLIT": inner_split,
         "REFERENCE": reference,
         "DISCOVERY": discovery,
         "CONFIRMATION": confirmation,
         "HOLDOUT": holdout,
-        "MATURE": mature,
+        "MATURE": retained_mature,
+        "CENSOR_COUNTS": {
+            reason: censor_counts[reason]
+            for reason in sorted(censor_counts, key=lambda value: value.encode("utf-8"))
+        },
+        "PURGE_COUNTS": {"outer": outer_purge, "inner": inner_purge},
     }
 
 
-def _band_cuts(split: dict[str, list[dict[str, object]]]) -> dict[str, tuple[int | float, ...]]:
-    reference = split["REFERENCE"]
-    ap_reference = [item for item in reference if item["ap"] is not None and date.fromisoformat(str(item["values"]["ap_date"])) <= _AS_OF]  # type: ignore[index]
+def _band_cuts(split: dict[str, object]) -> dict[str, tuple[int | float, ...]]:
+    reference = split["REFERENCE"]  # type: ignore[assignment]
+    as_of = split["AS_OF"]
+    ap_reference = [item for item in reference if item["ap"] is not None and date.fromisoformat(str(item["values"]["ap_date"])) <= as_of]  # type: ignore[index,operator]
     sources = {
         "slab_width_band": (reference, "slab_width"),
         "hr_thick_band": (reference, "hr_thick"),
@@ -708,7 +840,8 @@ def _band_cuts(split: dict[str, list[dict[str, object]]]) -> dict[str, tuple[int
 
 
 def _context_for(
-    item: dict[str, object], equipment_type: str, config: dict[str, object], cuts: dict[str, tuple[int | float, ...]]
+    item: dict[str, object], equipment_type: str, config: dict[str, object],
+    cuts: dict[str, tuple[int | float, ...]], level: int = 0,
 ) -> dict[str, object]:
     hierarchy = next(
         entry for entry in config["rangeContextHierarchies"]  # type: ignore[index]
@@ -716,7 +849,7 @@ def _context_for(
     )
     values = item["values"]  # type: ignore[assignment]
     context: dict[str, object] = {}
-    for field in hierarchy["levels"][0]:
+    for field in hierarchy["levels"][level]:
         if field.endswith("_band"):
             base = field[:-5]
             value = values[base]
@@ -727,7 +860,7 @@ def _context_for(
 
 
 def _criteria_projection(
-    config: dict[str, object], split: dict[str, list[dict[str, object]]]
+    config: dict[str, object], split: dict[str, object]
 ) -> bytes:
     definitions = [
         item for item in config["fields"]  # type: ignore[index]
@@ -738,6 +871,7 @@ def _criteria_projection(
         if item["featureRole"] in _QUALITY_ROLES
     ]
     cuts = _band_cuts(split)
+    as_of = split["AS_OF"]
     lines: list[tuple[tuple[object, ...], bytes]] = []
     for item in split["REFERENCE"]:
         values = item["values"]  # type: ignore[assignment]
@@ -751,7 +885,7 @@ def _criteria_projection(
             )
             event_date = values.get(event_date_field)
             value = values.get(field)
-            if event_date is None or date.fromisoformat(str(event_date)) > _AS_OF or type(value) not in (int, float):
+            if event_date is None or date.fromisoformat(str(event_date)) > as_of or type(value) not in (int, float):  # type: ignore[operator]
                 continue
             line = {
                 "kind": "OPERATING_RANGE_INPUT",
@@ -794,7 +928,174 @@ def _criteria_projection(
     return b"".join(payload for _, payload in sorted(lines, key=lambda pair: pair[0]))
 
 
+def _stage_event_date(item: dict[str, object], stage: str) -> date | None:
+    values = item["values"]  # type: ignore[assignment]
+    date_field = (
+        "cast_date" if stage == "CAST_RECORDED"
+        else "ap_date" if stage == "AP_RECORDED_WITH_RESULT"
+        else "f_ext_date"
+    )
+    value = values.get(date_field)
+    return None if value is None else date.fromisoformat(str(value))
+
+
+def _range_equipment_id(item: dict[str, object], equipment_type: str) -> str:
+    values = item["values"]  # type: ignore[assignment]
+    if equipment_type == "SM_CC":
+        return str(values["sm_plant"])
+    if equipment_type == "FURNACE":
+        return str(values["furnace_no"])
+    if equipment_type == "AP":
+        return str(values["ap_plant"])
+    return "RM4_PROCESS"
+
+
+def _operating_range_rules(
+    config: dict[str, object],
+    reference: list[dict[str, object]],
+    as_of: date,
+) -> tuple[list[dict[str, object]], dict[str, list[str]]]:
+    definitions_by_field = {
+        str(definition["field"]): definition
+        for definition in config["fields"]  # type: ignore[index]
+    }
+    band_fields = {
+        str(field)
+        for hierarchy in config["rangeContextHierarchies"]  # type: ignore[index]
+        for level in hierarchy["levels"]
+        for field in level
+        if str(field).endswith("_band")
+    }
+    cuts: dict[str, tuple[int | float, ...]] = {}
+    for band_name in band_fields:
+        base = band_name[:-5]
+        definition = definitions_by_field.get(base)
+        values = [
+            item["values"].get(base)  # type: ignore[union-attr]
+            for item in reference
+            if item["values"].get(base) is not None  # type: ignore[union-attr]
+            and (
+                definition is None
+                or (
+                    _stage_event_date(
+                        item, str(definition["firstAvailableStage"])
+                    ) is not None
+                    and _stage_event_date(
+                        item, str(definition["firstAvailableStage"])
+                    ) <= as_of  # type: ignore[operator]
+                )
+            )
+        ]
+        finite = [value for value in values if type(value) in (int, float)]
+        if finite:
+            cuts[band_name] = _quartile_cuts(finite)
+    if set(cuts) != band_fields and band_fields:
+        missing = sorted(band_fields - set(cuts))
+        raise ValueError("range band has no finite reference values: " + ",".join(missing))
+
+    minimum = int(config["operatingRanges"]["minimumSupport"])  # type: ignore[index]
+    extreme_minimum = int(config["operatingRanges"]["extremeTailMinimumSupport"])  # type: ignore[index]
+    probabilities = {
+        name: Fraction(str(config["operatingRanges"][policy]))  # type: ignore[index]
+        for name, policy in (
+            ("p01", "extremeLowerQuantile"),
+            ("p05", "typicalLowerQuantile"),
+            ("p95", "typicalUpperQuantile"),
+            ("p99", "extremeUpperQuantile"),
+        )
+    }
+    definitions = [
+        definition for definition in config["fields"]  # type: ignore[index]
+        if definition["featureRole"] in _RANGE_ROLES
+        and definition["dataType"] == "NUMBER"
+    ]
+    rules_by_identity: dict[bytes, dict[str, object]] = {}
+    memberships: dict[str, list[str]] = {}
+    for definition in definitions:
+        field = str(definition["field"])
+        stage = str(definition["firstAvailableStage"])
+        equipment_type = str(definition["equipmentType"])
+        eligible = [
+            item for item in reference
+            if (_stage_event_date(item, stage) is not None)
+            and _stage_event_date(item, stage) <= as_of  # type: ignore[operator]
+            and type(item["values"].get(field)) in (int, float)  # type: ignore[union-attr]
+            and math.isfinite(float(item["values"][field]))  # type: ignore[index]
+        ]
+        hierarchy = next(
+            entry for entry in config["rangeContextHierarchies"]  # type: ignore[index]
+            if entry["equipmentType"] == equipment_type
+        )
+        groups_by_level: list[dict[tuple[tuple[str, str], ...], list[dict[str, object]]]] = []
+        contexts_by_level: list[dict[tuple[tuple[str, str], ...], dict[str, object]]] = []
+        for level_index, _level in enumerate(hierarchy["levels"]):
+            groups: dict[tuple[tuple[str, str], ...], list[dict[str, object]]] = {}
+            contexts: dict[tuple[tuple[str, str], ...], dict[str, object]] = {}
+            for item in eligible:
+                context = _context_for(item, equipment_type, config, cuts, level_index)
+                key = tuple(
+                    (name, _json_text(context[name]))
+                    for name in sorted(context, key=lambda value: value.encode("utf-8"))
+                )
+                groups.setdefault(key, []).append(item)
+                contexts[key] = context
+            groups_by_level.append(groups)
+            contexts_by_level.append(contexts)
+
+        selected_groups: set[tuple[int, tuple[tuple[str, str], ...]]] = set()
+        for item in eligible:
+            for level_index, groups in enumerate(groups_by_level):
+                context = _context_for(item, equipment_type, config, cuts, level_index)
+                key = tuple(
+                    (name, _json_text(context[name]))
+                    for name in sorted(context, key=lambda value: value.encode("utf-8"))
+                )
+                if len(groups[key]) >= minimum:
+                    selected_groups.add((level_index, key))
+                    break
+
+        for level_index, key in selected_groups:
+            rows = groups_by_level[level_index][key]
+            context = contexts_by_level[level_index][key]
+            numeric = [item["values"][field] for item in rows]  # type: ignore[index]
+            support = len(numeric)
+            p01 = _type1(numeric, probabilities["p01"]) if support >= extreme_minimum else None
+            p05 = _type1(numeric, probabilities["p05"])
+            median = _type1(numeric, Fraction(1, 2))
+            p95 = _type1(numeric, probabilities["p95"])
+            p99 = _type1(numeric, probabilities["p99"]) if support >= extreme_minimum else None
+            identity = {
+                "context": context,
+                "contextLevel": level_index,
+                "equipmentId": _range_equipment_id(rows[0], equipment_type),
+                "equipmentType": equipment_type,
+                "field": field,
+                "fieldRole": definition["featureRole"],
+                "firstAvailableStage": stage,
+                "lowerTailEnabled": p01 is not None and p01 != p05,
+                "median": median,
+                "p01": p01,
+                "p05": p05,
+                "p95": p95,
+                "p99": p99,
+                "support": support,
+                "upperTailEnabled": p99 is not None and p99 != p95,
+            }
+            identity_bytes = _json_bytes(identity)
+            rule_id = _sha256_uri(identity_bytes)
+            rule = {"ruleId": rule_id, **identity}
+            rules_by_identity[identity_bytes] = rule
+            memberships[rule_id] = sorted(
+                (str(item["material_key"]) for item in rows),
+                key=lambda value: value.encode("utf-8"),
+            )
+    rules = [rules_by_identity[key] for key in sorted(rules_by_identity)]
+    return rules, memberships
+
+
 def _numeric_terms(field: str, values: list[int | float], bins: int) -> list[dict[str, object]]:
+    if not values:
+        return []
     boundaries = tuple(dict.fromkeys(
         _type1(values, Fraction(index, bins)) for index in range(1, bins + 1)
     ))
@@ -839,41 +1140,231 @@ def _wilson(defects: int, support: int, z: float) -> tuple[float | None, float |
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
+def _quality_axis_is_observed(term: dict[str, object], value: object) -> bool:
+    if term["type"] == "CATEGORY_IN":
+        return value is not None and value != ""
+    return type(value) in (int, float) and math.isfinite(float(value))
+
+
+def _quality_context_value(
+    item: dict[str, object], field: str,
+    cuts: dict[str, tuple[int | float, ...]],
+) -> object:
+    values = item["values"]  # type: ignore[assignment]
+    if field.endswith("_band"):
+        value = values.get(field[:-5])
+        if type(value) not in (int, float) or field not in cuts:
+            return None
+        return _band(value, cuts[field])
+    return values.get(field)
+
+
+def _quality_cells(
+    rows: list[dict[str, object]],
+    terms: tuple[dict[str, object], ...],
+    strata_fields: tuple[str, ...],
+    cuts: dict[str, tuple[int | float, ...]],
+    fixed_keys: set[tuple[object, ...]] | None = None,
+) -> dict[tuple[object, ...], dict[str, object]]:
+    raw: dict[tuple[object, ...], dict[str, object]] = {}
+    for item in rows:
+        values = item["values"]  # type: ignore[assignment]
+        axis_values = [values.get(str(term["field"])) for term in terms]
+        if not all(
+            _quality_axis_is_observed(term, value)
+            for term, value in zip(terms, axis_values)
+        ):
+            continue
+        key = tuple(
+            _quality_context_value(item, field, cuts) for field in strata_fields
+        )
+        if any(value is None for value in key):
+            continue
+        if fixed_keys is not None and key not in fixed_keys:
+            continue
+        cell = raw.setdefault(key, {
+            "candidateDefects": 0,
+            "candidateNonDefects": 0,
+            "candidateRows": [],
+            "comparatorDefects": 0,
+            "comparatorNonDefects": 0,
+            "comparatorRows": [],
+        })
+        candidate = all(
+            _term_matches(term, value)
+            for term, value in zip(terms, axis_values)
+        )
+        side = "candidate" if candidate else "comparator"
+        label = values.get("judge")
+        if label == "불량":
+            cell[side + "Defects"] += 1  # type: ignore[operator]
+        elif label == "양품":
+            cell[side + "NonDefects"] += 1  # type: ignore[operator]
+        cell[side + "Rows"].append(item)  # type: ignore[union-attr]
+    return {
+        key: cell for key, cell in raw.items()
+        if cell["candidateRows"] and cell["comparatorRows"]
+    }
+
+
+def _cell_support(cell: dict[str, object], side: str) -> int:
+    return int(cell[side + "Defects"]) + int(cell[side + "NonDefects"])
+
+
+def _cell_row_count(cell: dict[str, object], side: str) -> int:
+    return len(cell[side + "Rows"])  # type: ignore[arg-type]
+
+
+def _mh_relative_risk(cells: list[dict[str, object]], correction: float) -> float | None:
+    numerator = 0.0
+    denominator = 0.0
+    for cell in cells:
+        a = float(cell["candidateDefects"])
+        b = float(cell["candidateNonDefects"])
+        c = float(cell["comparatorDefects"])
+        d = float(cell["comparatorNonDefects"])
+        if 0.0 in {a, b, c, d}:
+            a += correction
+            b += correction
+            c += correction
+            d += correction
+        n1 = a + b
+        n0 = c + d
+        total = n1 + n0
+        numerator += a * n0 / total
+        denominator += c * n1 / total
+    if denominator == 0:
+        return None
+    result = numerator / denominator
+    return result if math.isfinite(result) else None
+
+
+def _cmh_p_value(cells: list[dict[str, object]]) -> tuple[float, str]:
+    observed_minus_expected = 0.0
+    variance = 0.0
+    for cell in cells:
+        a = int(cell["candidateDefects"])
+        b = int(cell["candidateNonDefects"])
+        c = int(cell["comparatorDefects"])
+        d = int(cell["comparatorNonDefects"])
+        n1 = a + b
+        n0 = c + d
+        total = n1 + n0
+        if total <= 1:
+            continue
+        defects = a + c
+        non_defects = b + d
+        observed_minus_expected += a - n1 * defects / total
+        variance += n1 * n0 * defects * non_defects / (
+            total * total * (total - 1)
+        )
+    if variance == 0:
+        return 1.0, "ZERO_VARIANCE"
+    z_value = observed_minus_expected / math.sqrt(variance)
+    return math.erfc(abs(z_value) / math.sqrt(2.0)), "NONE"
+
+
 def _metric(
-    rows: list[dict[str, object]], terms: tuple[dict[str, object], ...], z: float, *, discovery: bool
-) -> dict[str, object]:
-    selected = [
-        item for item in rows
-        if all(_term_matches(term, item["values"].get(str(term["field"]))) for term in terms)  # type: ignore[union-attr]
+    rows: list[dict[str, object]],
+    terms: tuple[dict[str, object], ...],
+    strata_fields: tuple[str, ...],
+    cuts: dict[str, tuple[int | float, ...]],
+    discovery_weights: dict[tuple[object, ...], Fraction],
+    z: float,
+    quality_policy: dict[str, object],
+    *,
+    discovery: bool,
+) -> tuple[dict[str, object], list[str]]:
+    fixed_keys = None if discovery else set(discovery_weights)
+    cells_by_key = _quality_cells(
+        rows, terms, strata_fields, cuts, fixed_keys=fixed_keys,
+    )
+    cells = [cells_by_key[key] for key in sorted(cells_by_key, key=_json_text)]
+    candidate_rows = [
+        item for cell in cells for item in cell["candidateRows"]  # type: ignore[union-attr]
     ]
-    informative = 0 < len(selected) < len(rows)
-    if not informative:
-        selected = []
-    support = len(selected)
-    defects = sum(item["values"].get("judge") == "불량" for item in selected)  # type: ignore[union-attr]
+    support = sum(_cell_support(cell, "candidate") for cell in cells)
+    comparator_support = sum(_cell_support(cell, "comparator") for cell in cells)
+    defects = sum(int(cell["candidateDefects"]) for cell in cells)
     crude = defects / support if support else None
     lower, upper = _wilson(defects, support, z)
-    return {
+    minimum_support = int(quality_policy[
+        "minimumDiscoverySupport" if discovery else "minimumConfirmationSupport"
+    ])
+    minimum_defects = int(quality_policy[
+        "minimumCautionDefects" if discovery else "minimumConfirmationDefects"
+    ])
+    required_strata = (
+        int(quality_policy["minimumInformativeStrata"])
+        if strata_fields else 1
+    )
+    adjusted = comparator_adjusted = risk_difference = relative_risk = None
+    p_value: float | None = 1.0 if discovery else None
+    reason = "NONE"
+    structure_and_support_pass = True
+    if len(cells) < required_strata:
+        reason = "NO_INFORMATIVE_STRATA"
+        structure_and_support_pass = False
+    elif support < minimum_support or comparator_support < minimum_support:
+        reason = "LOW_SUPPORT"
+        structure_and_support_pass = False
+
+    if structure_and_support_pass:
+        surviving = {
+            key: discovery_weights[key]
+            for key in cells_by_key if key in discovery_weights
+        }
+        weight_total = sum(surviving.values(), Fraction(0, 1))
+        weights = {
+            key: float(weight / weight_total) for key, weight in surviving.items()
+        }
+        adjusted = sum(
+            weights[key] * int(cell["candidateDefects"])
+            / _cell_support(cell, "candidate")
+            for key, cell in cells_by_key.items()
+        )
+        comparator_adjusted = sum(
+            weights[key] * int(cell["comparatorDefects"])
+            / _cell_support(cell, "comparator")
+            for key, cell in cells_by_key.items()
+        )
+        risk_difference = adjusted - comparator_adjusted
+        relative_risk = _mh_relative_risk(
+            cells, float(quality_policy["zeroCellCorrection"]),
+        )
+        p_value, statistical_reason = _cmh_p_value(cells)
+        if defects < minimum_defects:
+            reason = "LOW_DEFECT_COUNT"
+        elif relative_risk is None:
+            reason = "ZERO_COMPARATOR_RISK"
+        elif statistical_reason != "NONE":
+            reason = statistical_reason
+    metric = {
         "support": support,
         "defects": defects,
         "crudeRate": crude,
         "crudeRateCiLower": lower,
         "crudeRateCiUpper": upper,
-        "adjustedRate": None,
-        "comparatorAdjustedRate": None,
-        "riskDifference": None,
-        "relativeRisk": None,
+        "adjustedRate": adjusted,
+        "comparatorAdjustedRate": comparator_adjusted,
+        "riskDifference": risk_difference,
+        "relativeRisk": relative_risk,
         "relativeRiskCiLower": None,
         "relativeRiskCiUpper": None,
-        "pValue": 1.0 if discovery else None,
-        "qValue": 1.0 if discovery else None,
-        "reasonCode": "LOW_SUPPORT" if informative else "NO_INFORMATIVE_STRATA",
+        "pValue": p_value,
+        "qValue": None,
+        "reasonCode": reason,
     }
+    return metric, sorted(
+        (str(item["material_key"]) for item in candidate_rows),
+        key=lambda value: value.encode("utf-8"),
+    )
 
 
 def _dropped_adjustment_fields(
     field_names: tuple[str, ...], equipment_type: str, analysis_family: str,
     definitions: dict[str, dict[str, object]],
+    hierarchy: dict[str, object],
 ) -> list[str]:
     dropped = {name for field in field_names for name in (field, field + "_band")}
     candidate_stage = str(definitions[field_names[0]]["firstAvailableStage"])
@@ -884,22 +1375,45 @@ def _dropped_adjustment_fields(
             and definition["firstAvailableStage"] == candidate_stage
         ):
             dropped.add(field)
+    if equipment_type == "AP" and analysis_family != "INTERACTION":
+        dropped.update(
+            field + "_band"
+            for field, definition in definitions.items()
+            if definition["equipmentType"] == "AP"
+            and definition["dataType"] == "NUMBER"
+            and definition["featureRole"] == "PRODUCT_STATE_REFERENCE"
+        )
+    candidate_stage_rank = _STAGE_RANK[candidate_stage]
+    for configured_fields in hierarchy["levels"]:  # type: ignore[index]
+        for raw_field in configured_fields:
+            field = str(raw_field)
+            base = field[:-5] if field.endswith("_band") else field
+            definition = definitions.get(base)
+            if (
+                definition is not None
+                and _STAGE_RANK[str(definition["firstAvailableStage"])]
+                > candidate_stage_rank
+            ):
+                dropped.add(field)
     changed = True
     while changed:
         changed = False
         for field, definition in definitions.items():
             dependencies = {str(value) for value in definition["dependencies"]}
-            if dependencies.intersection(dropped) and field not in dropped:
-                dropped.add(field)
+            additions = {field, *dependencies}
+            if (
+                (field in dropped or dependencies.intersection(dropped))
+                and not additions <= dropped
+            ):
+                dropped.update(additions)
                 changed = True
-    if equipment_type == "AP" and analysis_family != "INTERACTION":
-        dropped.update(("ap_thick_band", "ap_width_band"))
     return sorted(dropped, key=lambda item: item.encode("utf-8"))
 
 
 def _candidate(
     config: dict[str, object], definitions: dict[str, dict[str, object]],
     analysis_family: str, field_names: tuple[str, ...], terms: tuple[dict[str, object], ...],
+    discovery: list[dict[str, object]], cuts: dict[str, tuple[int | float, ...]],
 ) -> dict[str, object]:
     first = definitions[field_names[0]]
     equipment_type = str(first["equipmentType"])
@@ -909,9 +1423,65 @@ def _candidate(
     )
     equipment_specific = (
         analysis_family == "CATEGORICAL"
-        and field_names[0] in {"sm_plant", "furnace_no", "ap_plant"}
+        and first["featureRole"] == "EQUIPMENT_IDENTIFIER"
     )
     equipment_id = str(terms[0]["values"][0]) if equipment_specific else "ALL"  # type: ignore[index]
+    dropped = _dropped_adjustment_fields(
+        field_names, equipment_type, analysis_family, definitions, hierarchy,
+    )
+    minimum_support = int(config["qualityRisk"]["minimumDiscoverySupport"])  # type: ignore[index]
+    minimum_strata = int(config["qualityRisk"]["minimumInformativeStrata"])  # type: ignore[index]
+    selected_level: int | None = None
+    selected_fields: tuple[str, ...] = ()
+    selected_cells: dict[tuple[object, ...], dict[str, object]] = {}
+    attempted_context_fields: set[str] = set()
+    candidate_stage = _STAGE_RANK[str(first["firstAvailableStage"])]
+    for level_index, configured_fields in enumerate(hierarchy["levels"]):
+        available: list[str] = []
+        for raw_field in configured_fields:
+            field = str(raw_field)
+            base = field[:-5] if field.endswith("_band") else field
+            definition = definitions.get(base)
+            if field in dropped or base in dropped:
+                continue
+            if definition is not None and _STAGE_RANK[str(definition["firstAvailableStage"])] > candidate_stage:
+                continue
+            available.append(field)
+            attempted_context_fields.add(base)
+        strata_fields = tuple(available)
+        cells = _quality_cells(discovery, terms, strata_fields, cuts)
+        candidate_support = sum(
+            _cell_row_count(cell, "candidate") for cell in cells.values()
+        )
+        comparator_support = sum(
+            _cell_row_count(cell, "comparator") for cell in cells.values()
+        )
+        if (
+            candidate_support >= minimum_support
+            and comparator_support >= minimum_support
+            and len(cells) >= minimum_strata
+        ):
+            selected_level = level_index
+            selected_fields = strata_fields
+            selected_cells = cells
+            break
+    adjustment_kind = "STRATIFIED"
+    if selected_level is None:
+        selected_level = len(hierarchy["levels"]) - 1
+        selected_fields = ()
+        selected_cells = _quality_cells(discovery, terms, (), cuts)
+        adjustment_kind = "UNADJUSTED_FALLBACK"
+    total_weight = sum(
+        _cell_row_count(cell, "candidate") + _cell_row_count(cell, "comparator")
+        for cell in selected_cells.values()
+    )
+    weights = {
+        key: Fraction(
+            _cell_row_count(cell, "candidate") + _cell_row_count(cell, "comparator"),
+            total_weight,
+        )
+        for key, cell in selected_cells.items()
+    } if total_weight else {}
     identity = {
         "analysisFamily": analysis_family,
         "fieldNames": list(field_names),
@@ -921,23 +1491,443 @@ def _candidate(
         "applicationScope": "EQUIPMENT_SPECIFIC" if equipment_specific else "PROCESS_GLOBAL",
         "equipmentId": equipment_id,
         "applicationContext": {},
-        "adjustmentLevel": len(hierarchy["levels"]) - 1,
-        "adjustmentFieldsDropped": _dropped_adjustment_fields(
-            field_names, equipment_type, analysis_family, definitions
-        ),
-        "adjustmentKind": "UNADJUSTED_FALLBACK",
+        "adjustmentLevel": selected_level,
+        "adjustmentFieldsDropped": dropped,
+        "adjustmentKind": adjustment_kind,
     }
-    return {"identity": identity, "definitions": first}
+    return {
+        "identity": identity,
+        "definitions": first,
+        "attemptedContextFields": sorted(
+            attempted_context_fields, key=lambda item: item.encode("utf-8")
+        ),
+        "strataFields": selected_fields,
+        "weights": weights,
+    }
+
+
+def _benjamini_hochberg(values: list[float]) -> list[float]:
+    count = len(values)
+    ordered = sorted(enumerate(values), key=lambda pair: (pair[1], pair[0]))
+    adjusted = [1.0] * count
+    running = 1.0
+    for reverse_index in range(count - 1, -1, -1):
+        original_index, value = ordered[reverse_index]
+        rank = reverse_index + 1
+        running = min(running, value * count / rank)
+        adjusted[original_index] = min(1.0, running)
+    return adjusted
+
+
+def _grade_rule(
+    discovery: dict[str, object], confirmation: dict[str, object],
+    adjustment_kind: str, policy: dict[str, object],
+) -> str:
+    insufficient_reasons = {
+        "LOW_SUPPORT",
+        "LOW_DEFECT_COUNT",
+        "NO_INFORMATIVE_STRATA",
+        "NO_VARIATION",
+        "NON_FINITE_ESTIMATE",
+        "ZERO_COMPARATOR_RISK",
+    }
+    if (
+        discovery["reasonCode"] in insufficient_reasons
+        or confirmation["reasonCode"] in insufficient_reasons
+    ):
+        return "INSUFFICIENT_EVIDENCE"
+    discovery_rr = float(discovery["relativeRisk"])
+    discovery_difference = float(discovery["riskDifference"])
+    discovery_q = float(discovery["qValue"])
+    confirmation_rr = float(confirmation["relativeRisk"])
+    confirmation_difference = float(confirmation["riskDifference"])
+    caution = (
+        int(discovery["defects"]) >= int(policy["minimumCautionDefects"])
+        and discovery_rr >= float(policy["relativeRisk"]["caution"])  # type: ignore[index]
+        and discovery_difference >= float(policy["riskDifference"]["caution"])  # type: ignore[index]
+        and discovery_q <= float(policy["bhQ"]["caution"])  # type: ignore[index]
+    )
+    danger = (
+        caution
+        and int(discovery["defects"]) >= int(policy["minimumDangerDefects"])
+        and discovery_rr >= float(policy["relativeRisk"]["danger"])  # type: ignore[index]
+        and discovery_difference >= float(policy["riskDifference"]["danger"])  # type: ignore[index]
+        and discovery["relativeRiskCiLower"] is not None
+        and float(discovery["relativeRiskCiLower"]) > 1.0
+        and discovery_q <= float(policy["bhQ"]["danger"])  # type: ignore[index]
+    )
+    confirmation_caution = (
+        confirmation_rr > float(policy["confirmationRelativeRisk"]["cautionExclusive"])  # type: ignore[index]
+        and confirmation_difference > 0.0
+    )
+    confirmation_danger = (
+        confirmation_rr >= float(policy["confirmationRelativeRisk"]["danger"])  # type: ignore[index]
+        and confirmation_difference > 0.0
+    )
+    if danger and confirmation_danger and adjustment_kind == "STRATIFIED":
+        return "DANGER"
+    if (caution or danger) and confirmation_caution:
+        return "CAUTION"
+    if caution or danger:
+        confirmation["reasonCode"] = "DIRECTION_NOT_REPEATED"
+        return "UNCONFIRMED"
+    return "NORMAL"
+
+
+def _bootstrap_applicable(
+    discovery_metric: dict[str, object], quality_policy: dict[str, object],
+) -> bool:
+    reason = str(discovery_metric["reasonCode"])
+    support = int(discovery_metric["support"])
+    minimum_support = int(quality_policy["minimumDiscoverySupport"])
+    if support < minimum_support:
+        return False
+    return reason == "NONE"
+
+
+def _quality_bootstrap_task_count(
+    rules: list[dict[str, object]], config: dict[str, object],
+) -> int:
+    quality_policy = config["qualityRisk"]  # type: ignore[assignment]
+    return sum(
+        _bootstrap_applicable(rule["discovery"], quality_policy)  # type: ignore[arg-type]
+        for rule in rules
+    )
+
+
+def _quality_feature_node(field: str) -> str:
+    return "replay_events.values_json." + field
+
+
+def _concrete_quality_lineage(
+    rules: list[dict[str, object]], config: dict[str, object],
+    attempted_contexts: dict[str, list[str]] | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    definitions = {
+        str(definition["field"]): definition
+        for definition in config["fields"]  # type: ignore[index]
+    }
+    result: dict[str, dict[str, list[str]]] = {}
+    predicate_paths = {
+        "quality_risk_intervals.rules[].predicate.allOf[]." + suffix
+        for suffix in (
+            "field", "type", "lower", "lowerInclusive", "upper",
+            "upperInclusive", "values[]",
+        )
+    }
+    rule_identity_paths = {
+        "quality_risk_intervals.rules[]." + suffix
+        for suffix in (
+            "adjustmentFieldsDropped[]", "adjustmentKind", "adjustmentLevel",
+            "analysisFamily", "applicationContext", "applicationScope",
+            "equipmentId", "equipmentType", "fieldNames[]",
+            "firstAvailableStage", "predicate.allOf[].field",
+            "predicate.allOf[].lower", "predicate.allOf[].lowerInclusive",
+            "predicate.allOf[].type", "predicate.allOf[].upper",
+            "predicate.allOf[].upperInclusive", "predicate.allOf[].values[]",
+        )
+    }
+    display_dependencies = {
+        "quality_risk_intervals.rules[]." + suffix
+        for suffix in (
+            "analysisFamily", "applicationContext", "applicationScope",
+            "equipmentId", "equipmentType", "fieldNames[]",
+            "firstAvailableStage", "adjustmentFieldsDropped[]",
+            "adjustmentKind", "adjustmentLevel", "grade",
+            "predicate.allOf[].lower", "predicate.allOf[].lowerInclusive",
+            "predicate.allOf[].upper", "predicate.allOf[].upperInclusive",
+            "ruleId",
+        )
+    }
+    for rule in rules:
+        family = str(rule["analysisFamily"])
+        field_names = tuple(str(value) for value in rule["fieldNames"])
+        axes = {_quality_feature_node(field) for field in field_names}
+        trace: dict[str, set[str]] = {}
+
+        def record(path: str, dependencies: set[str] | list[str]) -> None:
+            trace[path] = set(dependencies)
+
+        candidate_roots = {
+            "config.fields[].dataType",
+            "config.fields[].featureRole",
+            "config.fields[].field",
+            "population.DISCOVERY",
+            *axes,
+        }
+        if family == "NUMERIC":
+            candidate_roots.add("config.qualityRisk.numericBins")
+        elif family == "INTERACTION":
+            candidate_roots.update({
+                "config.fixedInteractions[][]",
+                "config.qualityRisk.interactionBins",
+            })
+        record("rules[].predicate.allOf[].field", candidate_roots)
+        record("rules[].predicate.allOf[].type", {
+            "quality_risk_intervals.rules[].predicate.allOf[].field",
+            "config.fields[].dataType", "config.fields[].field",
+        })
+        record("rules[].fieldNames[]", {
+            "quality_risk_intervals.rules[].predicate.allOf[].field",
+        })
+        record("rules[].analysisFamily", {
+            "quality_risk_intervals.rules[].fieldNames[]",
+            "quality_risk_intervals.rules[].predicate.allOf[].type",
+        })
+        numeric_bound_dependencies = {
+            "quality_risk_intervals.rules[].analysisFamily",
+            "quality_risk_intervals.rules[].predicate.allOf[].field",
+            "quality_risk_intervals.rules[].predicate.allOf[].type",
+            "population.DISCOVERY",
+            *axes,
+            (
+                "config.qualityRisk.interactionBins"
+                if family == "INTERACTION"
+                else "config.qualityRisk.numericBins"
+            ),
+        }
+        null_bound_dependencies = {
+            "quality_risk_intervals.rules[].predicate.allOf[].field",
+            "quality_risk_intervals.rules[].predicate.allOf[].type",
+        }
+        for suffix in ("lower", "lowerInclusive", "upper"):
+            record(
+                "rules[].predicate.allOf[]." + suffix,
+                numeric_bound_dependencies
+                if family in {"NUMERIC", "INTERACTION"}
+                else null_bound_dependencies,
+            )
+        record("rules[].predicate.allOf[].upperInclusive", null_bound_dependencies)
+        if family == "CATEGORICAL":
+            record("rules[].predicate.allOf[].values[]", {
+                "quality_risk_intervals.rules[].predicate.allOf[].field",
+                "quality_risk_intervals.rules[].predicate.allOf[].type",
+                "population.DISCOVERY", *axes,
+            })
+
+        for path, metadata in (
+            ("rules[].firstAvailableStage", "firstAvailableStage"),
+            ("rules[].equipmentType", "equipmentType"),
+            ("rules[].evidenceFamily", "evidenceFamily"),
+        ):
+            record(path, {
+                "quality_risk_intervals.rules[].fieldNames[]",
+                "config.fields[].field", "config.fields[]." + metadata,
+            })
+        record("rules[].applicationScope", {
+            "quality_risk_intervals.rules[].analysisFamily",
+            "quality_risk_intervals.rules[].fieldNames[]",
+            "config.fields[].field", "config.fields[].featureRole",
+        })
+        equipment_dependencies = {
+            "quality_risk_intervals.rules[].applicationScope",
+        }
+        if rule["applicationScope"] == "EQUIPMENT_SPECIFIC":
+            equipment_dependencies.add(
+                "quality_risk_intervals.rules[].predicate.allOf[].values[]"
+            )
+        record("rules[].equipmentId", equipment_dependencies)
+        record("rules[].applicationContext", {
+            "quality_risk_intervals.rules[].fieldNames[]",
+        })
+
+        dropped_dependencies = {
+            "quality_risk_intervals.rules[].analysisFamily",
+            "quality_risk_intervals.rules[].equipmentType",
+            "quality_risk_intervals.rules[].fieldNames[]",
+            "quality_risk_intervals.rules[].firstAvailableStage",
+            "config.fields[].dataType", "config.fields[].dependencies[]",
+            "config.fields[].equipmentType", "config.fields[].featureRole",
+            "config.fields[].field", "config.fields[].firstAvailableStage",
+            "config.riskAdjustmentHierarchies[].equipmentType",
+            "config.riskAdjustmentHierarchies[].levels[][]",
+        }
+        record("rules[].adjustmentFieldsDropped[]", dropped_dependencies)
+        if attempted_contexts is not None:
+            attempted_context_fields = attempted_contexts[str(rule["ruleId"])]
+        else:
+            hierarchy = next(
+                item for item in config["riskAdjustmentHierarchies"]  # type: ignore[index]
+                if item["equipmentType"] == rule["equipmentType"]
+            )
+            dropped = set(rule["adjustmentFieldsDropped"])
+            candidate_stage = _STAGE_RANK[str(rule["firstAvailableStage"])]
+            attempted: set[str] = set()
+            last_attempted_level = int(rule["adjustmentLevel"])
+            for configured_fields in hierarchy["levels"][:last_attempted_level + 1]:
+                for context_field in configured_fields:
+                    name = str(context_field)
+                    base = name[:-5] if name.endswith("_band") else name
+                    definition = definitions.get(base)
+                    if name in dropped or base in dropped:
+                        continue
+                    if (
+                        definition is not None
+                        and _STAGE_RANK[str(definition["firstAvailableStage"])]
+                        > candidate_stage
+                    ):
+                        continue
+                    attempted.add(base)
+            attempted_context_fields = sorted(
+                attempted, key=lambda value: value.encode("utf-8")
+            )
+        context_axes = {
+            _quality_feature_node(field) for field in attempted_context_fields
+        }
+        adjustment_dependencies = {
+            "quality_risk_intervals.rules[].adjustmentFieldsDropped[]",
+            "quality_risk_intervals.rules[].equipmentType",
+            "quality_risk_intervals.rules[].firstAvailableStage",
+            *predicate_paths,
+            "config.fields[].field", "config.fields[].firstAvailableStage",
+            "config.qualityRisk.minimumDiscoverySupport",
+            "config.qualityRisk.minimumInformativeStrata",
+            "config.riskAdjustmentHierarchies[].equipmentType",
+            "config.riskAdjustmentHierarchies[].levels[][]",
+            "population.DISCOVERY", *axes, *context_axes,
+        }
+        record("rules[].adjustmentLevel", adjustment_dependencies)
+        record("rules[].adjustmentKind", adjustment_dependencies)
+        record("rules[].ruleId", rule_identity_paths)
+        record("rules[].earlyWarningEligible", {
+            "quality_risk_intervals.rules[].firstAvailableStage",
+        })
+        record("rules[].grade", {
+            "quality_risk_intervals.rules[].discovery.reasonCode",
+        })
+        if rule["displayMergeRuleIds"]:
+            record("rules[].displayMergeRuleIds[]", display_dependencies)
+
+        for split_name in ("discovery", "confirmation"):
+            population_dependencies = {
+                "population.DISCOVERY", *predicate_paths, *axes,
+                "quality_risk_intervals.rules[].adjustmentKind",
+            }
+            if split_name == "confirmation":
+                population_dependencies.add("population.CONFIRMATION")
+            prefix = "quality_risk_intervals.rules[]." + split_name + "."
+            support_path = "rules[]." + split_name + ".support"
+            defects_path = "rules[]." + split_name + ".defects"
+            reason_path = "rules[]." + split_name + ".reasonCode"
+            record(support_path, population_dependencies)
+            record(defects_path, population_dependencies | {
+                "replay_events.values_json.judge",
+            })
+            count_nodes = {prefix + "support", prefix + "defects"}
+            record("rules[]." + split_name + ".crudeRate", count_nodes)
+            record("rules[]." + split_name + ".crudeRateCiLower", count_nodes | {
+                "config.wilsonZ",
+            })
+            record("rules[]." + split_name + ".crudeRateCiUpper", count_nodes | {
+                "config.wilsonZ",
+            })
+            minimum_support = (
+                "config.qualityRisk.minimumDiscoverySupport"
+                if split_name == "discovery"
+                else "config.qualityRisk.minimumConfirmationSupport"
+            )
+            reason_dependencies = set(population_dependencies)
+            reason_code = rule[split_name]["reasonCode"]  # type: ignore[index]
+            if reason_code != "NO_INFORMATIVE_STRATA":
+                reason_dependencies.update({
+                    prefix + "support", minimum_support,
+                })
+            record(reason_path, reason_dependencies)
+            for suffix in (
+                "adjustedRate", "comparatorAdjustedRate", "riskDifference",
+                "relativeRisk",
+            ):
+                record("rules[]." + split_name + "." + suffix, {
+                    prefix + "reasonCode",
+                })
+            record("rules[]." + split_name + ".pValue", {
+                prefix + "reasonCode",
+            })
+            if split_name == "discovery":
+                record("rules[].discovery.qValue", {
+                    "config.fdrFamilies[]",
+                    "quality_risk_intervals.rules[].analysisFamily",
+                    "quality_risk_intervals.rules[].discovery.pValue",
+                })
+                rr_ci_dependencies = {
+                    "config.qualityRisk.minimumDiscoverySupport",
+                    "quality_risk_intervals.rules[].discovery.reasonCode",
+                    "quality_risk_intervals.rules[].discovery.support",
+                }
+            else:
+                record("rules[].confirmation.qValue", {
+                    "quality_risk_intervals.rules[].confirmation.reasonCode",
+                })
+                rr_ci_dependencies = {
+                    "quality_risk_intervals.rules[].confirmation.reasonCode",
+                }
+            record(
+                "rules[]." + split_name + ".relativeRiskCiLower",
+                rr_ci_dependencies,
+            )
+            record(
+                "rules[]." + split_name + ".relativeRiskCiUpper",
+                rr_ci_dependencies,
+            )
+        result[str(rule["ruleId"])] = {
+            path: sorted(dependencies, key=lambda value: value.encode("utf-8"))
+            for path, dependencies in trace.items()
+        }
+    return result
+
+
+def _normalize_quality_lineage(
+    concrete: dict[str, dict[str, list[str]]],
+) -> dict[str, list[str]]:
+    normalized: dict[str, set[str]] = {}
+    for trace in concrete.values():
+        for path, dependencies in trace.items():
+            normalized.setdefault(path, set()).update(dependencies)
+    return {
+        path: sorted(dependencies, key=lambda value: value.encode("utf-8"))
+        for path, dependencies in normalized.items()
+    }
+
+
+def _display_intervals_are_adjacent(
+    previous: dict[str, object], current: dict[str, object],
+) -> bool:
+    return (
+        previous["upper"] == current["lower"]
+        and previous["upperInclusive"] is True
+        and current["lowerInclusive"] is False
+    )
 
 
 def _quality_rules(
-    config: dict[str, object], split: dict[str, list[dict[str, object]]]
-) -> tuple[list[dict[str, object]], dict[str, dict[str, list[str]]]]:
+    config: dict[str, object], split: dict[str, object]
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, dict[str, list[str]]],
+    dict[str, set[str]],
+]:
     definitions = {
         str(item["field"]): item for item in config["fields"]  # type: ignore[index]
         if item["featureRole"] in _QUALITY_ROLES
     }
-    discovery = split["DISCOVERY"]
+    discovery = split["DISCOVERY"]  # type: ignore[assignment]
+    band_source = discovery
+    quality_band_names = {
+        str(field)
+        for hierarchy in config["riskAdjustmentHierarchies"]  # type: ignore[index]
+        for level in hierarchy["levels"]
+        for field in level
+        if str(field).endswith("_band")
+    }
+    cuts: dict[str, tuple[int | float, ...]] = {}
+    for band_name in quality_band_names:
+        values = [
+            item["values"].get(band_name[:-5])  # type: ignore[union-attr]
+            for item in band_source  # type: ignore[union-attr]
+        ]
+        finite = [value for value in values if type(value) in (int, float)]
+        if finite:
+            cuts[band_name] = _quartile_cuts(finite)
     candidates: list[dict[str, object]] = []
     numeric_bins = int(config["qualityRisk"]["numericBins"])  # type: ignore[index]
     interaction_bins = int(config["qualityRisk"]["interactionBins"])  # type: ignore[index]
@@ -946,7 +1936,9 @@ def _quality_rules(
         if definition["dataType"] == "NUMBER":
             finite = [value for value in values if type(value) in (int, float) and math.isfinite(float(value))]
             for term in _numeric_terms(field, finite, numeric_bins):
-                candidates.append(_candidate(config, definitions, "NUMERIC", (field,), (term,)))
+                candidates.append(_candidate(
+                    config, definitions, "NUMERIC", (field,), (term,), discovery, cuts,
+                ))
         elif definition["dataType"] == "STRING":
             categories = sorted(
                 {value for value in values if type(value) is str and value != ""},
@@ -962,7 +1954,9 @@ def _quality_rules(
                     "upperInclusive": None,
                     "values": [category],
                 }
-                candidates.append(_candidate(config, definitions, "CATEGORICAL", (field,), (term,)))
+                candidates.append(_candidate(
+                    config, definitions, "CATEGORICAL", (field,), (term,), discovery, cuts,
+                ))
     for configured_pair in config["fixedInteractions"]:  # type: ignore[index]
         field_names = tuple(str(field) for field in configured_pair)
         terms_by_field: list[list[dict[str, object]]] = []
@@ -970,6 +1964,8 @@ def _quality_rules(
             values = [item["values"].get(field) for item in discovery]  # type: ignore[union-attr]
             finite = [value for value in values if type(value) in (int, float) and math.isfinite(float(value))]
             terms_by_field.append(_numeric_terms(field, finite, interaction_bins))
+        if any(len(axis_terms) < 2 for axis_terms in terms_by_field):
+            continue
         for first_term in terms_by_field[0]:
             for second_term in terms_by_field[1]:
                 terms = (first_term, second_term)
@@ -977,22 +1973,34 @@ def _quality_rules(
                     all(_term_matches(term, item["values"].get(str(term["field"]))) for term in terms)  # type: ignore[union-attr]
                     for item in discovery
                 ):
-                    candidates.append(_candidate(config, definitions, "INTERACTION", field_names, terms))
+                    candidates.append(_candidate(
+                        config, definitions, "INTERACTION", field_names, terms,
+                        discovery, cuts,
+                    ))
     rules: list[dict[str, object]] = []
     memberships: dict[str, dict[str, list[str]]] = {}
+    attempted_contexts: dict[str, list[str]] = {}
     z = float(config["wilsonZ"])
     for candidate in candidates:
         identity = candidate["identity"]
         rule_id = _sha256_uri(_json_bytes(identity))
         terms = tuple(identity["predicate"]["allOf"])  # type: ignore[index]
-        discovery_metric = _metric(split["DISCOVERY"], terms, z, discovery=True)
-        confirmation_metric = _metric(split["CONFIRMATION"], terms, z, discovery=False)
+        strata_fields = candidate["strataFields"]
+        weights = candidate["weights"]
+        discovery_metric, discovery_members = _metric(
+            split["DISCOVERY"], terms, strata_fields, cuts, weights, z,  # type: ignore[arg-type]
+            config["qualityRisk"], discovery=True,  # type: ignore[arg-type]
+        )
+        confirmation_metric, confirmation_members = _metric(
+            split["CONFIRMATION"], terms, strata_fields, cuts, weights, z,  # type: ignore[arg-type]
+            config["qualityRisk"], discovery=False,  # type: ignore[arg-type]
+        )
         definition = candidate["definitions"]
         rule = {
             **identity,
             "ruleId": rule_id,
             "evidenceFamily": definition["evidenceFamily"],
-            "grade": "INSUFFICIENT_EVIDENCE",
+            "grade": None,
             "earlyWarningEligible": definition["firstAvailableStage"] != "AP_RECORDED_WITH_RESULT",
             "discovery": discovery_metric,
             "confirmation": confirmation_metric,
@@ -1000,20 +2008,25 @@ def _quality_rules(
         }
         rules.append(rule)
         memberships[rule_id] = {
-            split_name: sorted(
-                [
-                    str(item["material_key"])
-                    for item in split[split_name]
-                    if all(
-                        _term_matches(term, item["values"].get(str(term["field"])))  # type: ignore[union-attr]
-                        for term in terms
-                    )
-                ],
-                key=lambda item: item.encode("utf-8"),
-            )
-            for split_name in ("DISCOVERY", "CONFIRMATION")
+            "DISCOVERY": discovery_members,
+            "CONFIRMATION": confirmation_members,
         }
-    family_rank = {"NUMERIC": 0, "CATEGORICAL": 1, "INTERACTION": 2}
+        attempted_contexts[rule_id] = list(candidate["attemptedContextFields"])
+
+    fdr_families = tuple(str(value) for value in config["fdrFamilies"])  # type: ignore[index]
+    for family in fdr_families:
+        family_rules = [rule for rule in rules if rule["analysisFamily"] == family]
+        q_values = _benjamini_hochberg([
+            float(rule["discovery"]["pValue"]) for rule in family_rules  # type: ignore[index]
+        ])
+        for rule, q_value in zip(family_rules, q_values):
+            rule["discovery"]["qValue"] = q_value  # type: ignore[index]
+    for rule in rules:
+        rule["grade"] = _grade_rule(
+            rule["discovery"], rule["confirmation"],  # type: ignore[arg-type]
+            str(rule["adjustmentKind"]), config["qualityRisk"],  # type: ignore[arg-type]
+        )
+    family_rank = {family: index for index, family in enumerate(fdr_families)}
     interaction_rank = {
         tuple(str(field) for field in pair): index
         for index, pair in enumerate(config["fixedInteractions"])  # type: ignore[index]
@@ -1037,17 +2050,42 @@ def _quality_rules(
             str(rule["ruleId"]).encode("utf-8"),
         )
     rules.sort(key=rule_sort_key)
-    numeric_runs: dict[tuple[str, ...], list[dict[str, object]]] = {}
+    numeric_runs: dict[tuple[object, ...], list[dict[str, object]]] = {}
     for rule in rules:
         if rule["analysisFamily"] == "NUMERIC":
-            numeric_runs.setdefault(tuple(str(value) for value in rule["fieldNames"]), []).append(rule)
+            numeric_runs.setdefault((
+                tuple(str(value) for value in rule["fieldNames"]),
+                rule["firstAvailableStage"], rule["equipmentType"],
+                rule["applicationScope"], rule["equipmentId"],
+                _json_text(rule["applicationContext"]), rule["adjustmentLevel"],
+                tuple(rule["adjustmentFieldsDropped"]), rule["adjustmentKind"],
+                rule["grade"],
+            ), []).append(rule)
     for run in numeric_runs.values():
-        constituent_ids = sorted(
-            (str(rule["ruleId"]) for rule in run), key=lambda item: item.encode("utf-8")
-        )
+        contiguous: list[list[dict[str, object]]] = []
         for rule in run:
-            rule["displayMergeRuleIds"] = constituent_ids
-    return rules, memberships
+            if not contiguous:
+                contiguous.append([rule])
+                continue
+            previous_term = contiguous[-1][-1]["predicate"]["allOf"][0]  # type: ignore[index]
+            term = rule["predicate"]["allOf"][0]  # type: ignore[index]
+            if _display_intervals_are_adjacent(previous_term, term):
+                contiguous[-1].append(rule)
+            else:
+                contiguous.append([rule])
+        for group in contiguous:
+            if len(group) < 2:
+                continue
+            constituent_ids = sorted(
+                (str(rule["ruleId"]) for rule in group),
+                key=lambda item: item.encode("utf-8"),
+            )
+            for rule in group:
+                rule["displayMergeRuleIds"] = constituent_ids
+    concrete_lineage = _concrete_quality_lineage(
+        rules, config, attempted_contexts,
+    )
+    return rules, memberships, _normalize_quality_lineage(concrete_lineage)
 
 
 def _event_values(
@@ -1063,9 +2101,9 @@ def _event_values(
     }
 
 
-def _replay_events(
+def _replay_event_records(
     config: dict[str, object], materials: list[dict[str, object]]
-) -> bytes:
+) -> list[dict[str, object]]:
     definitions = list(config["fields"])  # type: ignore[arg-type]
     events: list[dict[str, object]] = []
     for item in materials:
@@ -1151,6 +2189,16 @@ def _replay_events(
         )
 
     events.sort(key=event_sort_key)
+    return events
+
+
+def _replay_events(
+    config: dict[str, object], materials: list[dict[str, object]]
+) -> bytes:
+    return _serialize_replay_events(_replay_event_records(config, materials))
+
+
+def _serialize_replay_events(events: list[dict[str, object]]) -> bytes:
     header = (
         "schema_version", "bundle_id", "criteria_id", "event_id", "replay_date",
         "replay_hour", "batch_kind", "batch_id", "equipment_batch_id", "batch_step",
@@ -1238,13 +2286,15 @@ def _source_profiles(
 
 
 def _distribution(
-    rows: list[dict[str, object]], field: str, data_type: str, *, reference_ap: bool = False,
+    rows: list[dict[str, object]], field: str, data_type: str, *,
+    reference_ap: bool = False, as_of: date | None = None,
 ) -> dict[str, object]:
     raw = [
         None
         if reference_ap and (
             item["values"].get("ap_date") is None  # type: ignore[union-attr]
-            or date.fromisoformat(str(item["values"]["ap_date"])) > _AS_OF  # type: ignore[index]
+            or as_of is None
+            or date.fromisoformat(str(item["values"]["ap_date"])) > as_of  # type: ignore[index]
         )
         else item["values"].get(field)  # type: ignore[union-attr]
         for item in rows
@@ -1272,7 +2322,7 @@ def _distribution(
 
 
 def _drift_metrics(
-    config: dict[str, object], split: dict[str, list[dict[str, object]]]
+    config: dict[str, object], split: dict[str, object]
 ) -> list[dict[str, object]]:
     definitions = [
         definition for definition in config["fields"]  # type: ignore[index]
@@ -1293,6 +2343,7 @@ def _drift_metrics(
             "reference": _distribution(
                 split["REFERENCE"], field, data_type,
                 reference_ap=definition["firstAvailableStage"] == "AP_RECORDED_WITH_RESULT",
+                as_of=split["AS_OF"],
             ),
         })
     return result
@@ -1317,35 +2368,159 @@ def _split_count(
     }
 
 
-def _holdout_rate_metric(point: float | None, reason: str) -> dict[str, object]:
-    if reason == "ZERO_DENOMINATOR":
-        return {
-            "lower": None, "pointEstimate": None, "reasonCode": reason,
-            "upper": None, "validReplicates": 0,
-        }
+def _matching_alert_material_keys(
+    rows: list[dict[str, object]], rules: list[dict[str, object]],
+    grades: set[str], as_of: date,
+) -> set[str]:
+    matched: set[str] = set()
+    for item in rows:
+        for rule in rules:
+            if (
+                rule["grade"] not in grades
+                or not rule["earlyWarningEligible"]
+                or rule["firstAvailableStage"] == "AP_RECORDED_WITH_RESULT"
+            ):
+                continue
+            event_date = _stage_event_date(item, str(rule["firstAvailableStage"]))
+            if event_date is None or event_date <= as_of:
+                continue
+            terms = rule["predicate"]["allOf"]  # type: ignore[index]
+            if all(
+                _term_matches(term, item["values"].get(str(term["field"])))  # type: ignore[union-attr]
+                for term in terms
+            ):
+                matched.add(str(item["material_key"]))
+                break
+    return matched
+
+
+def _confusion_counts(
+    rows: list[dict[str, object]], alerted: set[str],
+) -> dict[str, int]:
+    counts = {
+        "truePositive": 0, "falsePositive": 0,
+        "trueNegative": 0, "falseNegative": 0,
+    }
+    for item in rows:
+        alert = str(item["material_key"]) in alerted
+        defect = item["values"].get("judge") == "불량"  # type: ignore[union-attr]
+        name = (
+            "truePositive" if alert and defect
+            else "falsePositive" if alert
+            else "falseNegative" if defect
+            else "trueNegative"
+        )
+        counts[name] += 1
+    return counts
+
+
+def _holdout_points(counts: dict[str, int]) -> dict[str, float | None]:
+    true_positive = counts["truePositive"]
+    false_positive = counts["falsePositive"]
+    false_negative = counts["falseNegative"]
+    total = sum(counts.values())
+    alerts = true_positive + false_positive
+    defects = true_positive + false_negative
+    precision = None if alerts == 0 else true_positive / alerts
+    base = None if total == 0 else defects / total
     return {
-        "lower": point, "pointEstimate": point, "reasonCode": "NONE",
-        "upper": point, "validReplicates": 2000,
+        "alertRate": None if total == 0 else alerts / total,
+        "precision": precision,
+        "recall": None if defects == 0 else true_positive / defects,
+        "baseDefectRate": base,
+        "lift": None if precision is None or base in {None, 0} else precision / base,
+        "falseAlertsPer100": None if total == 0 else 100.0 * false_positive / total,
     }
 
 
-def _holdout_profiles() -> list[dict[str, object]]:
+def _sample_charge_indices(seed: bytes, replicate: int, size: int) -> tuple[int, ...]:
+    return tuple(
+        int.from_bytes(
+            hashlib.sha256(
+                seed + struct.pack(">Q", replicate) + struct.pack(">Q", draw)
+            ).digest()[:8],
+            "big",
+        ) % size
+        for draw in range(size)
+    )
+
+
+def _holdout_metric(
+    point: float | None, values: list[float], minimum_valid: int,
+) -> dict[str, object]:
+    if point is None:
+        return {
+            "lower": None, "pointEstimate": None,
+            "reasonCode": "ZERO_DENOMINATOR", "upper": None,
+            "validReplicates": 0,
+        }
+    if len(values) < minimum_valid:
+        return {
+            "lower": None, "pointEstimate": point,
+            "reasonCode": "TOO_FEW_VALID_BOOTSTRAPS", "upper": None,
+            "validReplicates": len(values),
+        }
+    return {
+        "lower": _type1(values, Fraction(1, 40)),
+        "pointEstimate": point,
+        "reasonCode": "NONE",
+        "upper": _type1(values, Fraction(39, 40)),
+        "validReplicates": len(values),
+    }
+
+
+def _holdout_profiles(
+    config: dict[str, object], split: dict[str, object],
+    rules: list[dict[str, object]], criteria_id: str, as_of: date,
+) -> list[dict[str, object]]:
+    evaluated = [
+        item for item in split["HOLDOUT"]  # type: ignore[union-attr]
+        if item["ap"] is not None
+        and item["values"].get("judge") in {"양품", "불량"}  # type: ignore[union-attr]
+    ]
+    charge_ids = sorted(
+        {str(item["charge_id"]) for item in evaluated},
+        key=lambda value: value.encode("utf-8"),
+    )
+    rows_by_charge = {
+        charge: [item for item in evaluated if item["charge_id"] == charge]
+        for charge in charge_ids
+    }
+    replicates = int(config["bootstrap"]["replicates"])  # type: ignore[index]
+    minimum_valid = int(config["bootstrap"]["minimumValidReplicates"])  # type: ignore[index]
+    seed = hashlib.sha256(
+        (criteria_id + "\0holdout-bootstrap-v1").encode("utf-8")
+    ).digest()
     result: list[dict[str, object]] = []
-    for grade in ("DANGER", "CAUTION_OR_DANGER"):
-        result.append({
-            "alertGrade": grade,
-            "alertRate": _holdout_rate_metric(0.0, "NONE"),
-            "baseDefectRate": _holdout_rate_metric(0.5, "NONE"),
-            "falseAlertsPer100": _holdout_rate_metric(0.0, "NONE"),
-            "falseNegative": 1,
-            "falsePositive": 0,
-            "lift": _holdout_rate_metric(None, "ZERO_DENOMINATOR"),
-            "precision": _holdout_rate_metric(None, "ZERO_DENOMINATOR"),
-            "recall": _holdout_rate_metric(0.0, "NONE"),
-            "total": 2,
-            "trueNegative": 1,
-            "truePositive": 0,
-        })
+    for profile_name, grades in (
+        ("DANGER", {"DANGER"}),
+        ("CAUTION_OR_DANGER", {"CAUTION", "DANGER"}),
+    ):
+        alerted = _matching_alert_material_keys(evaluated, rules, grades, as_of)
+        counts = _confusion_counts(evaluated, alerted)
+        point_values = _holdout_points(counts)
+        bootstrap_values: dict[str, list[float]] = {
+            name: [] for name in point_values
+        }
+        if charge_ids:
+            for replicate in range(replicates):
+                sampled: list[dict[str, object]] = []
+                for index in _sample_charge_indices(seed, replicate, len(charge_ids)):
+                    sampled.extend(rows_by_charge[charge_ids[index]])
+                sampled_counts = _confusion_counts(sampled, alerted)
+                for name, value in _holdout_points(sampled_counts).items():
+                    if value is not None:
+                        bootstrap_values[name].append(value)
+        profile: dict[str, object] = {
+            "alertGrade": profile_name,
+            "total": len(evaluated),
+            **counts,
+        }
+        for name, point in point_values.items():
+            profile[name] = _holdout_metric(
+                point, bootstrap_values[name], minimum_valid,
+            )
+        result.append(profile)
     return result
 
 
@@ -1434,7 +2609,9 @@ def _derived_field(
     }
 
 
-def _field_lineage(config: dict[str, object]) -> list[dict[str, object]]:
+def _field_lineage(
+    config: dict[str, object], quality_lineage: dict[str, set[str]],
+) -> list[dict[str, object]]:
     definitions = {str(item["field"]): item for item in config["fields"]}  # type: ignore[index]
     identifier_paths = {
         "charge_id": "charge_id", "slab_no": "slab_no",
@@ -1473,38 +2650,6 @@ def _field_lineage(config: dict[str, object]) -> list[dict[str, object]]:
         for field, definition in definitions.items()
         if definition["featureRole"] in _QUALITY_ROLES
         and definition["firstAvailableStage"] != "AP_RECORDED_WITH_RESULT"
-    }
-    rule_identity_nodes = {
-        "quality_risk_intervals.rules[]." + path for path in (
-            "adjustmentFieldsDropped[]", "adjustmentKind", "adjustmentLevel", "analysisFamily",
-            "applicationContext", "applicationScope", "equipmentId", "equipmentType",
-            "fieldNames[]", "firstAvailableStage", "predicate.allOf[].field",
-            "predicate.allOf[].lower", "predicate.allOf[].lowerInclusive",
-            "predicate.allOf[].type", "predicate.allOf[].upper",
-            "predicate.allOf[].upperInclusive", "predicate.allOf[].values[]",
-        )
-    }
-    rule_config_terminals = {
-        "config.fields[].dataType", "config.fields[].dependencies[]", "config.fields[].equipmentType",
-        "config.fields[].evidenceFamily", "config.fields[].featureRole", "config.fields[].field",
-        "config.fields[].firstAvailableStage", "config.fixedInteractions[][]",
-        "config.qualityRisk.interactionBins", "config.qualityRisk.numericBins",
-        "config.riskAdjustmentHierarchies[].equipmentType",
-        "config.riskAdjustmentHierarchies[].levels[][]",
-    }
-    rule_config_terminals.update({
-        "config.evidenceFamilies[]", "config.fdrFamilies[]",
-        "config.qualityRisk.minimumDiscoverySupport",
-        "config.qualityRisk.minimumInformativeStrata",
-    })
-    rule_candidate_evaluation_nodes = {
-        "quality_risk_intervals.rules[]." + path for path in (
-            "adjustmentFieldsDropped[]", "adjustmentKind", "adjustmentLevel",
-            "predicate.allOf[].field", "predicate.allOf[].lower",
-            "predicate.allOf[].lowerInclusive", "predicate.allOf[].type",
-            "predicate.allOf[].upper", "predicate.allOf[].upperInclusive",
-            "predicate.allOf[].values[]",
-        )
     }
     non_manifest_nodes = {
         role + "." + path
@@ -1716,60 +2861,20 @@ def _field_lineage(config: dict[str, object]) -> list[dict[str, object]]:
                         "config.splits.referenceFraction", "fur_hr.charge_id",
                         "fur_hr.hr_date", "fur_hr.slab_no",
                     ], "SELECT_TIME_BOUNDARY"
-                elif path == "rules[].ruleId":
-                    dependencies, conversion = sorted(rule_identity_nodes), "COMPUTE_IDENTITY"
-                elif path.startswith("rules[].discovery."):
-                    dependencies, conversion = sorted(
-                        quality_feature_nodes
-                        | rule_candidate_evaluation_nodes
-                        | {
-                            "population.DISCOVERY", "replay_events.values_json.judge",
-                            "config.fdrFamilies[]", "config.qualityRisk.minimumCautionDefects",
-                            "config.qualityRisk.minimumDiscoverySupport", "config.wilsonZ",
-                        }
-                    ), "COMPUTE_QUALITY_METRIC"
-                elif path.startswith("rules[].confirmation."):
-                    dependencies, conversion = sorted(
-                        quality_feature_nodes
-                        | rule_candidate_evaluation_nodes
-                        | {
-                            "population.CONFIRMATION", "population.DISCOVERY",
-                            "replay_events.values_json.judge",
-                            "config.qualityRisk.minimumConfirmationDefects",
-                            "config.qualityRisk.minimumConfirmationSupport", "config.wilsonZ",
-                        }
-                    ), "COMPUTE_QUALITY_METRIC"
-                elif path == "rules[].grade":
-                    dependencies, conversion = [
-                        "quality_risk_intervals.rules[].discovery.reasonCode",
-                    ], "APPLY_GRADE_POLICY"
-                elif path == "rules[].earlyWarningEligible":
-                    dependencies, conversion = [
-                        "quality_risk_intervals.rules[].firstAvailableStage",
-                    ], "DERIVE_STAGE_ELIGIBILITY"
-                elif path == "rules[].displayMergeRuleIds[]":
-                    dependencies, conversion = sorted({
-                        "quality_risk_intervals.rules[].analysisFamily",
-                        "quality_risk_intervals.rules[].applicationContext",
-                        "quality_risk_intervals.rules[].applicationScope",
-                        "quality_risk_intervals.rules[].equipmentId",
-                        "quality_risk_intervals.rules[].equipmentType",
-                        "quality_risk_intervals.rules[].fieldNames[]",
-                        "quality_risk_intervals.rules[].firstAvailableStage",
-                        "quality_risk_intervals.rules[].grade",
-                        "quality_risk_intervals.rules[].adjustmentFieldsDropped[]",
-                        "quality_risk_intervals.rules[].adjustmentKind",
-                        "quality_risk_intervals.rules[].adjustmentLevel",
-                        "quality_risk_intervals.rules[].predicate.allOf[].lower",
-                        "quality_risk_intervals.rules[].predicate.allOf[].lowerInclusive",
-                        "quality_risk_intervals.rules[].predicate.allOf[].upper",
-                        "quality_risk_intervals.rules[].predicate.allOf[].upperInclusive",
-                        "quality_risk_intervals.rules[].ruleId",
-                    }), "MERGE_DISPLAY_INTERVALS"
                 else:
-                    dependencies, conversion = sorted(
-                        rule_config_terminals | quality_feature_nodes | {"population.DISCOVERY"}
-                    ), "DERIVE_RULE_CANDIDATE"
+                    dependencies = quality_lineage[path]
+                    conversion = (
+                        "COMPUTE_IDENTITY" if path == "rules[].ruleId"
+                        else "COMPUTE_QUALITY_METRIC" if path.startswith((
+                            "rules[].discovery.", "rules[].confirmation.",
+                        ))
+                        else "APPLY_GRADE_POLICY" if path == "rules[].grade"
+                        else "DERIVE_STAGE_ELIGIBILITY"
+                        if path == "rules[].earlyWarningEligible"
+                        else "MERGE_DISPLAY_INTERVALS"
+                        if path == "rules[].displayMergeRuleIds[]"
+                        else "DERIVE_RULE_CANDIDATE"
+                    )
                 result.append(_derived_field(role, path, conversion, dependencies))
             else:
                 if path == "bundleId":
@@ -2006,27 +3111,33 @@ def _field_lineage(config: dict[str, object]) -> list[dict[str, object]]:
 def _summary_artifact(
     config: dict[str, object], tables: dict[str, list[dict[str, str]]],
     materials: list[dict[str, object]], quarantine: dict[str, int],
-    split: dict[str, list[dict[str, object]]], rules: list[dict[str, object]],
+    split: dict[str, object], rules: list[dict[str, object]],
     memberships: dict[str, dict[str, list[str]]],
+    replay_events: list[dict[str, object]],
+    quality_lineage: dict[str, set[str]],
 ) -> dict[str, object]:
-    mature_keys = {str(item["material_key"]) for item in split["MATURE"]}
+    mature_keys = {str(item["material_key"]) for item in split["MATURE"]}  # type: ignore[union-attr]
+    replay_dates = [str(event["replay_date"]) for event in replay_events]
+    as_of = split["AS_OF"]
     return {
-        "asOf": _AS_OF.isoformat(),
+        "asOf": as_of.isoformat(),  # type: ignore[union-attr]
         "bundleId": _BUNDLE_TOKEN,
-        "chargePurgeCounts": {
-            "inner": {"chargeCount": 0, "rowCount": 0},
-            "outer": {"chargeCount": 0, "rowCount": 0},
-        },
+        "chargePurgeCounts": split["PURGE_COUNTS"],
         "criteriaId": _CRITERIA_TOKEN,
-        "dateRange": {"from": "2025-01-01", "to": "2025-04-02"},
+        "dateRange": {
+            "from": min(replay_dates) if replay_dates else None,
+            "to": max(replay_dates) if replay_dates else None,
+        },
         "driftMetrics": _drift_metrics(config, split),
         "evaluationMode": "LOCKED_RETROSPECTIVE_HOLDOUT",
-        "holdoutMetrics": _holdout_profiles(),
-        "innerSplitDate": _INNER_SPLIT.isoformat(),
-        "labelCensoringCounts": {"AP_UNLINKED": 1, "LABEL_NOT_YET_AVAILABLE": 2},
+        "holdoutMetrics": _holdout_profiles(
+            config, split, rules, _CRITERIA_TOKEN, as_of,  # type: ignore[arg-type]
+        ),
+        "innerSplitDate": split["INNER_SPLIT"].isoformat(),  # type: ignore[union-attr]
+        "labelCensoringCounts": split["CENSOR_COUNTS"],
         "lineage": {
             "aggregates": _aggregate_lineage(rules, memberships, split),
-            "fields": _field_lineage(config),
+            "fields": _field_lineage(config, quality_lineage),
             "materials": _material_lineage(materials),
             "populations": _population_lineage(split),
         },
@@ -2047,30 +3158,46 @@ def _cached_semantics(root_text: str) -> MappingProxyType:
     root = Path(root_text)
     config, tables = _load_inputs(root)
     materials, quarantine = _derive_materials(config, tables)
-    split = _split_materials(materials)
+    split = _split_materials(materials, config, _fur_boundary_rows(tables))
     projection = _criteria_projection(config, split)
-    quality_rules, memberships = _quality_rules(config, split)
-    replay = _replay_events(config, materials)
+    quality_rules, memberships, quality_lineage = _quality_rules(config, split)
+    bootstrap_task_count = _quality_bootstrap_task_count(quality_rules, config)
+    if bootstrap_task_count:
+        raise ValueError(
+            "golden rule bootstrap execution is undefined for applicable tasks: "
+            + str(bootstrap_task_count)
+        )
+    replay_event_records = _replay_event_records(config, materials)
+    replay = _serialize_replay_events(replay_event_records)
+    range_rules, _range_memberships = _operating_range_rules(
+        config, split["REFERENCE"], split["AS_OF"],  # type: ignore[arg-type]
+    )
     ranges = _json_bytes({
-        "asOf": _AS_OF.isoformat(),
+        "asOf": split["AS_OF"].isoformat(),  # type: ignore[union-attr]
         "criteriaId": _CRITERIA_TOKEN,
-        "ranges": [],
+        "ranges": range_rules,
         "schemaVersion": "sfep-operating-ranges/v1",
     })
     rules = _json_bytes({
-        "asOf": _AS_OF.isoformat(),
+        "asOf": split["AS_OF"].isoformat(),  # type: ignore[union-attr]
         "criteriaId": _CRITERIA_TOKEN,
         "rules": quality_rules,
         "schemaVersion": "sfep-quality-rules/v1",
     })
     summary = _json_bytes(_summary_artifact(
         config, tables, materials, quarantine, split, quality_rules, memberships,
+        replay_event_records, quality_lineage,
     ))
+    active_alerts = _matching_alert_material_keys(
+        materials, quality_rules, {"CAUTION", "DANGER"}, split["AS_OF"],  # type: ignore[arg-type]
+    )
+    if active_alerts:
+        raise ValueError("golden alert serialization is undefined for active rules")
     alerts = _json_bytes({
-        "alerts": [],
+        "alerts": sorted(active_alerts, key=lambda value: value.encode("utf-8")),
         "bundleId": _BUNDLE_TOKEN,
         "criteriaId": _CRITERIA_TOKEN,
-        "expectedReplayEventCount": 95,
+        "expectedReplayEventCount": len(replay_event_records),
         "provenance": {
             "analysisConfigArtifactSha256": "@ARTIFACT_ANALYSIS_CONFIG_SHA256@",
             "analysisConfigSchemaSha256": "@SCHEMA_ANALYSIS_CONFIG_SHA256@",

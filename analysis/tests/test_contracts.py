@@ -8,9 +8,12 @@ import io
 import inspect
 import json
 import math
+import os
 import re
 import shutil
 import struct
+import subprocess
+import sys
 from collections import Counter
 from collections.abc import Mapping
 from datetime import date, timedelta
@@ -22,7 +25,9 @@ from jsonschema import ValidationError
 from jsonschema.validators import validator_for
 
 
-CONTRACT = Path("contracts/equipment-monitor/v1")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
+CONTRACT = REPOSITORY_ROOT / "contracts/equipment-monitor/v1"
 SCHEMA_NAMES = [
     "bundle_manifest.schema.json",
     "analysis_config.schema.json",
@@ -171,6 +176,7 @@ CONVERSIONS = {
     "CLASSIFY_REPLAY_SCHEDULE", "SELECT_STAGE_EQUIPMENT", "DERIVE_RULE_CANDIDATE",
     "COMPUTE_QUALITY_METRIC", "APPLY_GRADE_POLICY", "DERIVE_STAGE_ELIGIBILITY",
     "MERGE_DISPLAY_INTERVALS", "COPY_POLICY_VALUE", "COMPUTE_DATE_RANGE",
+    "DERIVE_RANGE_GROUP", "COUNT_RANGE_SUPPORT", "APPLY_RANGE_TAIL_POLICY",
 }
 AGGREGATE_FILTERS = {
     "STAGE_AVAILABLE_AT_AS_OF", "FINITE_VALUE", "LABEL_AVAILABLE_AND_MATURE",
@@ -488,7 +494,7 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 
 def _validate_summary_application_contract(summary: dict) -> None:
-    config = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))
+    config = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8"))
     source_names = {
         "sm_cc": "sts_1sm_cc_1.csv", "fur_hr": "sts_2fur_hr_2.csv", "ap": "sts_3ap_3.csv",
     }
@@ -978,7 +984,7 @@ def _summary() -> dict:
                 "dependencies": [], "firstAvailableStage": "PREHEAT_COMPLETE",
             }, {
                 "artifactRole": "analysis_summary", "outputField": "driftMetrics[].reference.median",
-                "sourceRole": None, "sourceColumn": None, "conversion": "TYPE1_QUANTILE",
+                "sourceRole": None, "sourceColumn": None, "conversion": "COMPARE_DISTRIBUTIONS",
                 "dependencies": ["fur_hr.f_pre_temp"], "firstAvailableStage": None,
             }],
             "materials": [{
@@ -1019,7 +1025,7 @@ def _replay_row() -> dict:
 
 VALID_INSTANCES = {
     "bundle_manifest.schema.json": _manifest,
-    "analysis_config.schema.json": lambda: json.loads(Path("analysis/analysis_config.json").read_text()),
+    "analysis_config.schema.json": lambda: json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text()),
     "producer_runtime.schema.json": _runtime,
     "equipment_operating_ranges.schema.json": _range_artifact,
     "quality_risk_intervals.schema.json": _rules_artifact,
@@ -1040,7 +1046,7 @@ def test_all_normative_schemas_compile_and_close_every_object_boundary():
 
 def test_normative_json_and_json_lines_are_canonical_utf8_bytes():
     json_paths = [
-        Path("analysis/analysis_config.json"), CONTRACT / "id-test-vectors.json",
+        ANALYSIS_ROOT / "analysis_config.json", CONTRACT / "id-test-vectors.json",
         CONTRACT / "canonical-number-test-vectors.json",
     ]
     json_paths.extend(CONTRACT / name for name in SCHEMA_NAMES)
@@ -1267,7 +1273,7 @@ def test_lineage_source_dependency_enum_is_the_exact_50_source_terminals():
 
 def test_range_and_risk_context_output_paths_use_exact_configured_keys():
     config = json.loads(
-        Path("analysis/analysis_config.json").read_text(encoding="utf-8")
+        (ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8")
     )
     configured_range_keys = {
         key
@@ -1435,7 +1441,7 @@ def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and
     defects = sum(judge_by_hr[by_key[key]["hr_coil_id"]] == "불량" for key in candidate_keys)
     assert rule["discovery"]["defects"] == defects
     assert rule["discovery"]["crudeRate"] == defects / len(candidate_keys)
-    z = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))["wilsonZ"]
+    z = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8"))["wilsonZ"]
     n = len(candidate_keys)
     rate = defects / n
     denominator = 1 + z * z / n
@@ -1445,6 +1451,187 @@ def test_golden_quality_candidate_is_derived_from_source_and_matches_metrics_and
     assert rule["discovery"]["crudeRateCiUpper"] == pytest.approx(center + radius)
     assert rule["discovery"]["adjustedRate"] is None
     assert rule["discovery"]["reasonCode"] == "LOW_SUPPORT"
+
+
+def test_golden_categorical_rule_has_literal_predicate_identity_metrics_and_memberships():
+    root = CONTRACT / "golden-expectation"
+    rules = json.loads(
+        _replace_tokens((root / "quality_risk_intervals.template.json").read_bytes())
+    )
+    summary = json.loads(
+        _replace_tokens((root / "analysis_summary.template.json").read_bytes())
+    )
+    expected_rule_id = (
+        "sha256:0c1b606da50df74f380fe23ee71deaaf"
+        "2220e8681fb5ff15b2952a793b9f06f3"
+    )
+    predicate = {
+        "allOf": [{
+            "field": "f_jangip_gubun",
+            "lower": None,
+            "lowerInclusive": None,
+            "type": "CATEGORY_IN",
+            "upper": None,
+            "upperInclusive": None,
+            "values": ["COLD"],
+        }],
+    }
+    rule = next(item for item in rules["rules"] if item["ruleId"] == expected_rule_id)
+    assert rule["predicate"] == predicate
+    assert {
+        key: rule[key]
+        for key in (
+            "analysisFamily",
+            "evidenceFamily",
+            "firstAvailableStage",
+            "equipmentType",
+            "applicationScope",
+            "equipmentId",
+            "applicationContext",
+            "fieldNames",
+            "adjustmentLevel",
+            "adjustmentFieldsDropped",
+            "adjustmentKind",
+            "grade",
+            "earlyWarningEligible",
+            "displayMergeRuleIds",
+        )
+    } == {
+        "analysisFamily": "CATEGORICAL",
+        "evidenceFamily": "CHARGE",
+        "firstAvailableStage": "FURNACE_CHARGED",
+        "equipmentType": "FURNACE",
+        "applicationScope": "PROCESS_GLOBAL",
+        "equipmentId": "ALL",
+        "applicationContext": {},
+        "fieldNames": ["f_jangip_gubun"],
+        "adjustmentLevel": 5,
+        "adjustmentFieldsDropped": [
+            "f_jangip_gubun",
+            "f_jangip_gubun_band",
+            "f_jangip_temp",
+        ],
+        "adjustmentKind": "UNADJUSTED_FALLBACK",
+        "grade": "INSUFFICIENT_EVIDENCE",
+        "earlyWarningEligible": True,
+        "displayMergeRuleIds": [],
+    }
+    identity = {
+        key: rule[key]
+        for key in (
+            "analysisFamily",
+            "fieldNames",
+            "predicate",
+            "firstAvailableStage",
+            "equipmentType",
+            "applicationScope",
+            "equipmentId",
+            "applicationContext",
+            "adjustmentLevel",
+            "adjustmentFieldsDropped",
+            "adjustmentKind",
+        )
+    }
+    assert "sha256:" + hashlib.sha256(_canonical_json_bytes(identity)).hexdigest() == (
+        expected_rule_id
+    )
+
+    fur_rows = list(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-source" / "sts_2fur_hr_2.csv").read_text(
+            encoding="cp949"
+        )
+    )))
+    by_key = {
+        _digest_id(
+            "sfep-material-key/v1",
+            {"chargeId": row["charge_id"], "slabNo": row["slab_no"]},
+        )[1]: row
+        for row in fur_rows
+    }
+    populations = {
+        item["populationRef"]: item["materialKeys"]
+        for item in summary["lineage"]["populations"]
+    }
+    selected_by_split = {
+        split: [
+            material_key
+            for material_key in populations[split]
+            if by_key[material_key]["f_jangip_gubun"] == "COLD"
+        ]
+        for split in ("DISCOVERY", "CONFIRMATION")
+    }
+    assert selected_by_split == {
+        "DISCOVERY": [
+            "sha256:0be5c92fa23c49ff2a32d7948db6928a472d3d50419d227d9751048bab3d6c45",
+            "sha256:b313bfca80b92882d529a186bb7fc082e65020c409956481283745421ec1ce5a",
+            "sha256:c51ab0d3a1baea29ad03b1e617ebec46ca635b3ba6cf930a90d0ab649a8c45e2",
+        ],
+        "CONFIRMATION": [],
+    }
+    aggregates = {
+        item["split"]: item
+        for item in summary["lineage"]["aggregates"]
+        if item["ruleId"] == expected_rule_id
+    }
+    assert aggregates["DISCOVERY"]["inputMaterialKeys"] == selected_by_split["DISCOVERY"]
+    assert aggregates["CONFIRMATION"]["inputMaterialKeys"] == []
+    assert aggregates["DISCOVERY"]["filters"] == [
+        "LABEL_AVAILABLE_AND_MATURE",
+        "PREDICATE_MATCH",
+        "INFORMATIVE_STRATA_ONLY",
+    ]
+    assert aggregates["CONFIRMATION"]["filters"] == [
+        "LABEL_AVAILABLE_AND_MATURE",
+        "PREDICATE_MATCH",
+        "FIXED_DISCOVERY_STRATA",
+        "INFORMATIVE_STRATA_ONLY",
+    ]
+
+    ap_rows = list(csv.DictReader(io.StringIO(
+        (CONTRACT / "golden-source" / "sts_3ap_3.csv").read_text(encoding="cp949")
+    )))
+    unambiguous_judge = {
+        row["hr_coil_id"]: row["judge"]
+        for row in ap_rows
+        if row["hr_coil_id"] != "H006"
+    }
+    discovery_defects = sum(
+        unambiguous_judge[by_key[material_key]["hr_coil_id"]] == "불량"
+        for material_key in selected_by_split["DISCOVERY"]
+    )
+    assert discovery_defects == 0
+    assert rule["discovery"] == {
+        "support": 3,
+        "defects": discovery_defects,
+        "crudeRate": 0,
+        "crudeRateCiLower": 5.551115123125783e-17,
+        "crudeRateCiUpper": 0.5614970317550454,
+        "adjustedRate": None,
+        "comparatorAdjustedRate": None,
+        "riskDifference": None,
+        "relativeRisk": None,
+        "relativeRiskCiLower": None,
+        "relativeRiskCiUpper": None,
+        "pValue": 1,
+        "qValue": 1,
+        "reasonCode": "LOW_SUPPORT",
+    }
+    assert rule["confirmation"] == {
+        "support": 0,
+        "defects": 0,
+        "crudeRate": None,
+        "crudeRateCiLower": None,
+        "crudeRateCiUpper": None,
+        "adjustedRate": None,
+        "comparatorAdjustedRate": None,
+        "riskDifference": None,
+        "relativeRisk": None,
+        "relativeRiskCiLower": None,
+        "relativeRiskCiUpper": None,
+        "pValue": None,
+        "qValue": None,
+        "reasonCode": "NO_INFORMATIVE_STRATA",
+    }
 
 
 def test_canonical_number_edge_vectors_use_shortest_finite_binary64_spelling():
@@ -1525,19 +1712,24 @@ def test_exact_binary64_oracle_has_no_float_formatting_or_production_import():
     }
     assert prohibited_calls == set()
     module_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    assert not any(
-        (
-            isinstance(node, ast.ImportFrom)
-            and (node.module or "").startswith("equipment_quality")
-        )
-        or (
-            isinstance(node, ast.Import)
-            and any(
-                alias.name.startswith("equipment_quality") for alias in node.names
+    imported_names: set[str] = set()
+    for node in ast.walk(module_tree):
+        if isinstance(node, ast.Import):
+            imported_names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported_names.add(module)
+            imported_names.update(
+                f"{module}.{alias.name}" if module else alias.name
+                for alias in node.names
             )
-        )
-        for node in ast.walk(module_tree)
-    )
+    assert not {
+        name for name in imported_names
+        if name == "equipment_quality"
+        or name.startswith("equipment_quality.")
+        or name == "analysis.equipment_quality"
+        or name.startswith("analysis.equipment_quality.")
+    }
 
 
 def test_every_current_golden_json_numeric_token_uses_the_exact_global_winner():
@@ -1882,7 +2074,7 @@ def test_manifest_roles_are_exactly_ordered_and_unique():
 
 
 def test_analysis_config_contains_the_exact_quality_analysis_v1_policy():
-    config = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))
+    config = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8"))
     assert config["schemaVersion"] == "sfep-analysis-config/v1"
     assert config["analysisConfigVersion"] == "quality-analysis-v1"
     assert config["timezone"] == "Asia/Seoul"
@@ -1914,7 +2106,7 @@ def test_analysis_config_contains_the_exact_quality_analysis_v1_policy():
 
 
 def test_slab_grind_config_is_categorical_product_state_evidence():
-    config = json.loads(Path("analysis/analysis_config.json").read_text(encoding="utf-8"))
+    config = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8"))
     slab_grind = next(field for field in config["fields"] if field["field"] == "slab_grind")
     assert slab_grind == {
         "field": "slab_grind",
@@ -2287,7 +2479,7 @@ def _isolated_golden_oracle_root(tmp_path: Path) -> Path:
     root = tmp_path / "oracle-root"
     source_root = root / "golden-source"
     source_root.mkdir(parents=True)
-    shutil.copyfile(Path("analysis/analysis_config.json"), root / "analysis_config.json")
+    shutil.copyfile(ANALYSIS_ROOT / "analysis_config.json", root / "analysis_config.json")
     for name in ("sts_1sm_cc_1.csv", "sts_2fur_hr_2.csv", "sts_3ap_3.csv"):
         shutil.copyfile(CONTRACT / "golden-source" / name, source_root / name)
     assert sorted(
@@ -2303,50 +2495,889 @@ def _isolated_golden_oracle_root(tmp_path: Path) -> Path:
     return root
 
 
+def _golden_oracle_module():
+    try:
+        from tests.oracles import golden_semantics
+    except ModuleNotFoundError as error:
+        if error.name not in {"tests", "tests.oracles"}:
+            raise
+        from oracles import golden_semantics
+    return golden_semantics
+
+
+def _oracle_material(
+    day: str,
+    *,
+    charge: str,
+    slab: str,
+    judge: str | None = "양품",
+    ap_date: str | None = None,
+    ap_linked: bool = True,
+    **values: object,
+) -> dict[str, object]:
+    merged_values = {
+        "hr_date": day,
+        "cast_date": day,
+        "f_ext_date": day,
+        "f_ext_time": 7,
+        "ap_date": ap_date or day,
+        "judge": judge,
+        "sm_plant": "SM1",
+        "furnace_no": "1",
+        "ap_plant": "AP1",
+        "ap_prod_id": "P-" + slab,
+        **values,
+    }
+    return {
+        "material_key": "sha256:" + hashlib.sha256(
+            f"{charge}\0{slab}".encode("utf-8")
+        ).hexdigest(),
+        "charge_id": charge,
+        "slab_no": slab,
+        "hr_coil_id": "H-" + slab,
+        "values": merged_values,
+        "ap": {} if ap_linked else None,
+        "sm": {},
+        "fur": {},
+    }
+
+
+def test_oracle_derives_whole_date_boundaries_charge_purges_and_censor_precedence():
+    oracle = _golden_oracle_module()
+
+    boundary_rows = [
+        _oracle_material("2025-01-01", charge="CROSS", slab="1"),
+        _oracle_material("2025-01-02", charge="A", slab="1"),
+        _oracle_material("2025-01-02", charge="A", slab="2"),
+        _oracle_material("2025-01-03", charge="CROSS", slab="2"),
+    ]
+    cutoff = oracle._whole_date_boundary(
+        boundary_rows, "hr_date", Fraction(1, 2)
+    )
+    assert cutoff == date(2025, 1, 2)
+    earlier = [row for row in boundary_rows if row["values"]["hr_date"] <= cutoff.isoformat()]
+    later = [row for row in boundary_rows if row["values"]["hr_date"] > cutoff.isoformat()]
+    earlier, later, purge = oracle._purge_crossing_charges(earlier, later)
+    assert [row["charge_id"] for row in earlier] == ["A", "A"]
+    assert later == []
+    assert purge == {"chargeCount": 1, "rowCount": 2}
+
+    config = {
+        "labelMaturityDays": 0,
+        "splits": {"referenceFraction": 1.0, "discoveryFraction": 0.5},
+    }
+    materials = [
+        _oracle_material("2025-01-01", charge="A", slab="1", ap_linked=False),
+        _oracle_material("2025-01-02", charge="B", slab="1", ap_date="2025-01-05"),
+        _oracle_material("2025-01-03", charge="C", slab="1", judge=None),
+        _oracle_material("2025-01-03", charge="D", slab="1"),
+    ]
+    split = oracle._split_materials(materials, config, materials)
+    assert split["AS_OF"] == date(2025, 1, 3)
+    assert split["CENSOR_COUNTS"] == {
+        "AP_UNLINKED": 1,
+        "LABEL_MISSING": 1,
+        "LABEL_NOT_YET_AVAILABLE": 1,
+    }
+    assert split["PURGE_COUNTS"]["outer"] == {"chargeCount": 0, "rowCount": 0}
+
+
+def test_oracle_derives_stage_safe_operating_range_group_and_tail_policy():
+    oracle = _golden_oracle_module()
+
+    config = {
+        "fields": [{
+            "field": "temperature",
+            "featureRole": "DIRECT_OPERATION",
+            "dataType": "NUMBER",
+            "firstAvailableStage": "CAST_RECORDED",
+            "equipmentType": "SM_CC",
+        }],
+        "rangeContextHierarchies": [{
+            "equipmentType": "SM_CC",
+            "levels": [["group"], []],
+        }],
+        "operatingRanges": {
+            "minimumSupport": 2,
+            "extremeTailMinimumSupport": 4,
+            "typicalLowerQuantile": 0.05,
+            "typicalUpperQuantile": 0.95,
+            "extremeLowerQuantile": 0.01,
+            "extremeUpperQuantile": 0.99,
+        },
+    }
+    rows = [
+        _oracle_material("2025-01-01", charge="A", slab="1", temperature=10, group="G"),
+        _oracle_material("2025-01-02", charge="B", slab="1", temperature=20, group="G"),
+        _oracle_material("2025-01-03", charge="C", slab="1", temperature=99, group="G"),
+    ]
+    rows[-1]["values"]["cast_date"] = "2025-02-01"
+    rules, memberships = oracle._operating_range_rules(
+        config, rows, date(2025, 1, 31)
+    )
+    rule = next(item for item in rules if item["context"] == {"group": "G"})
+    assert rule["contextLevel"] == 0
+    assert rule["support"] == 2
+    assert (rule["p05"], rule["median"], rule["p95"]) == (10, 10, 20)
+    assert (rule["p01"], rule["p99"]) == (None, None)
+    assert not rule["lowerTailEnabled"] and not rule["upperTailEnabled"]
+    assert len(memberships[rule["ruleId"]]) == 2
+    duplicate_cuts = oracle._quartile_cuts([1, 1, 1, 2])
+    assert duplicate_cuts == (1, 1, 1)
+    assert oracle._band(1, duplicate_cuts) == "Q1"
+    assert oracle._band(2, duplicate_cuts) == "Q4"
+
+
+def _oracle_quality_config() -> dict[str, object]:
+    return {
+        "fields": [
+            {
+                "field": "x", "sourceRole": "sm_cc", "sourceColumn": "x",
+                "dataType": "NUMBER", "featureRole": "DIRECT_OPERATION",
+                "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+                "evidenceFamily": "TEST", "dependencies": [],
+            },
+            {
+                "field": "group", "sourceRole": "sm_cc", "sourceColumn": "group",
+                "dataType": "STRING", "featureRole": "CONTEXT",
+                "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+                "evidenceFamily": "TEST", "dependencies": [],
+            },
+        ],
+        "fixedInteractions": [],
+        "riskAdjustmentHierarchies": [{
+            "equipmentType": "SM_CC", "levels": [["group"], []],
+        }],
+        "qualityRisk": {
+            "numericBins": 2, "interactionBins": 2,
+            "minimumDiscoverySupport": 2, "minimumInformativeStrata": 2,
+            "minimumConfirmationSupport": 1, "minimumCautionDefects": 1,
+            "minimumDangerDefects": 2, "minimumConfirmationDefects": 1,
+            "zeroCellCorrection": 0.5,
+            "bhQ": {"caution": 0.1, "danger": 0.05},
+            "relativeRisk": {"caution": 1.5, "danger": 2.0},
+            "riskDifference": {"caution": 0.005, "danger": 0.01},
+            "confirmationRelativeRisk": {"cautionExclusive": 1.0, "danger": 1.5},
+        },
+        "fdrFamilies": ["NUMERIC", "CATEGORICAL", "INTERACTION"],
+        "evidenceFamilies": ["TEST"],
+        "bootstrap": {"replicates": 20, "minimumValidReplicates": 10},
+        "wilsonZ": 1.959963984540054,
+    }
+
+
+def test_oracle_selects_configured_quality_strata_and_global_fallback_from_rows():
+    oracle = _golden_oracle_module()
+
+    config = _oracle_quality_config()
+    discovery = [
+        _oracle_material(
+            "2025-01-0" + str(index + 1),
+            charge="C" + str(index),
+            slab="1",
+            judge="불량" if index in {0, 4} else "양품",
+            x=index % 2,
+            group="A" if index < 4 else "B",
+        )
+        for index in range(8)
+    ]
+    rules, _memberships, _lineage = oracle._quality_rules(
+        config,
+        {"DISCOVERY": discovery, "CONFIRMATION": discovery},
+    )
+    first_x = next(
+        rule for rule in rules
+        if rule["analysisFamily"] == "NUMERIC"
+        and rule["fieldNames"] == ["x"]
+        and rule["predicate"]["allOf"][0]["upper"] == 0
+    )
+    assert first_x["adjustmentLevel"] == 0
+    assert first_x["adjustmentKind"] == "STRATIFIED"
+    assert first_x["discovery"]["support"] == 4
+
+    fallback_rows = [
+        _oracle_material("2025-01-01", charge="A", slab="1", x=0, group="A"),
+        _oracle_material("2025-01-02", charge="B", slab="1", x=1, group="B"),
+    ]
+    fallback_config = copy.deepcopy(config)
+    fallback_config["qualityRisk"]["minimumDiscoverySupport"] = 1
+    fallback_rules, _, _ = oracle._quality_rules(
+        fallback_config,
+        {"DISCOVERY": fallback_rows, "CONFIRMATION": fallback_rows},
+    )
+    fallback_x = next(
+        rule for rule in fallback_rules
+        if rule["analysisFamily"] == "NUMERIC"
+        and rule["fieldNames"] == ["x"]
+        and rule["predicate"]["allOf"][0]["upper"] == 0
+    )
+    assert fallback_x["adjustmentLevel"] == 1
+    assert fallback_x["adjustmentKind"] == "UNADJUSTED_FALLBACK"
+
+
+def test_oracle_quality_metadata_drops_and_interaction_guards_are_config_driven():
+    oracle = _golden_oracle_module()
+
+    definitions = {
+        "raw_x": {
+            "field": "raw_x", "dataType": "STRING", "featureRole": "CONTEXT",
+            "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+            "dependencies": [],
+        },
+        "x": {
+            "field": "x", "dataType": "NUMBER", "featureRole": "DIRECT_OPERATION",
+            "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+            "dependencies": ["raw_x"],
+        },
+        "derived_x": {
+            "field": "derived_x", "dataType": "NUMBER",
+            "featureRole": "PRODUCT_STATE_REFERENCE", "equipmentType": "SM_CC",
+            "firstAvailableStage": "CAST_RECORDED", "dependencies": ["x"],
+        },
+        "same_stage_proxy": {
+            "field": "same_stage_proxy", "dataType": "NUMBER",
+            "featureRole": "DIRECT_OPERATION", "equipmentType": "SM_CC",
+            "firstAvailableStage": "CAST_RECORDED", "dependencies": [],
+        },
+        "future": {
+            "field": "future", "dataType": "NUMBER", "featureRole": "CONTEXT",
+            "equipmentType": "SM_CC", "firstAvailableStage": "FURNACE_CHARGED",
+            "dependencies": [],
+        },
+    }
+    hierarchy = {
+        "equipmentType": "SM_CC",
+        "levels": [["future_band"], []],
+    }
+    assert oracle._dropped_adjustment_fields(
+        ("x",), "SM_CC", "NUMERIC", definitions, hierarchy,
+    ) == [
+        "derived_x", "future_band", "raw_x", "same_stage_proxy", "x", "x_band",
+    ]
+
+    ap_definitions = {
+        "speed": {
+            "field": "speed", "dataType": "NUMBER", "featureRole": "DIRECT_OPERATION",
+            "equipmentType": "AP", "firstAvailableStage": "AP_RECORDED_WITH_RESULT",
+            "dependencies": [],
+        },
+        "custom_dimension": {
+            "field": "custom_dimension", "dataType": "NUMBER",
+            "featureRole": "PRODUCT_STATE_REFERENCE", "equipmentType": "AP",
+            "firstAvailableStage": "AP_RECORDED_WITH_RESULT", "dependencies": [],
+        },
+    }
+    assert "custom_dimension_band" in oracle._dropped_adjustment_fields(
+        ("speed",), "AP", "NUMERIC", ap_definitions,
+        {"equipmentType": "AP", "levels": [[]]},
+    )
+
+    config = _oracle_quality_config()
+    config["fields"].append({
+        "field": "line_id", "sourceRole": "sm_cc", "sourceColumn": "line_id",
+        "dataType": "STRING", "featureRole": "EQUIPMENT_IDENTIFIER",
+        "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+        "evidenceFamily": "TEST", "dependencies": [],
+    })
+    rows = [
+        _oracle_material("2025-01-01", charge="A", slab="1", x=0, group="A", line_id="L1"),
+        _oracle_material("2025-01-02", charge="B", slab="1", x=1, group="A", line_id="L2"),
+    ]
+    rules, _, _ = oracle._quality_rules(
+        config, {"DISCOVERY": rows, "CONFIRMATION": rows},
+    )
+    line_rule = next(
+        rule for rule in rules
+        if rule["analysisFamily"] == "CATEGORICAL"
+        and rule["fieldNames"] == ["line_id"]
+        and rule["predicate"]["allOf"][0]["values"] == ["L1"]
+    )
+    assert line_rule["applicationScope"] == "EQUIPMENT_SPECIFIC"
+    assert line_rule["equipmentId"] == "L1"
+
+    interaction_config = _oracle_quality_config()
+    interaction_config["fields"].append({
+        "field": "y", "sourceRole": "sm_cc", "sourceColumn": "y",
+        "dataType": "NUMBER", "featureRole": "DIRECT_OPERATION",
+        "equipmentType": "SM_CC", "firstAvailableStage": "CAST_RECORDED",
+        "evidenceFamily": "TEST", "dependencies": [],
+    })
+    interaction_config["fixedInteractions"] = [["x", "y"]]
+    constant_axis_rows = [
+        _oracle_material(
+            f"2025-01-0{index + 1}", charge=f"C{index}", slab="1",
+            x=index % 2, y=1, group="A",
+        )
+        for index in range(4)
+    ]
+    interaction_rules, _, _ = oracle._quality_rules(
+        interaction_config,
+        {"DISCOVERY": constant_axis_rows, "CONFIRMATION": constant_axis_rows},
+    )
+    assert not any(rule["analysisFamily"] == "INTERACTION" for rule in interaction_rules)
+    missing_axis_rows = [
+        _oracle_material(
+            f"2025-01-0{index + 1}", charge=f"M{index}", slab="1",
+            x=index % 2, y=None, group="A",
+        )
+        for index in range(4)
+    ]
+    missing_axis_rules, _, _ = oracle._quality_rules(
+        interaction_config,
+        {"DISCOVERY": missing_axis_rows, "CONFIRMATION": missing_axis_rows},
+    )
+    assert not any(rule["analysisFamily"] == "INTERACTION" for rule in missing_axis_rules)
+
+
+def test_oracle_low_defect_metric_retains_computed_adjusted_statistics():
+    oracle = _golden_oracle_module()
+    rows = [
+        _oracle_material("2025-01-01", charge="A", slab="1", x=1, judge="불량"),
+        _oracle_material("2025-01-02", charge="B", slab="1", x=1, judge="양품"),
+        _oracle_material("2025-01-03", charge="C", slab="1", x=0, judge="양품"),
+        _oracle_material("2025-01-04", charge="D", slab="1", x=0, judge="양품"),
+    ]
+    term = ({
+        "field": "x", "type": "NUMERIC_INTERVAL", "lower": 1,
+        "lowerInclusive": True, "upper": 1, "upperInclusive": True,
+        "values": None,
+    },)
+    policy = copy.deepcopy(_oracle_quality_config()["qualityRisk"])
+    policy["minimumDiscoverySupport"] = 1
+    policy["minimumCautionDefects"] = 2
+    metric, _ = oracle._metric(
+        rows, term, (), {}, {(): Fraction(1, 1)}, 1.959963984540054,
+        policy, discovery=True,
+    )
+    assert metric["reasonCode"] == "LOW_DEFECT_COUNT"
+    assert metric["adjustedRate"] == 0.5
+    assert metric["comparatorAdjustedRate"] == 0
+    assert metric["riskDifference"] == 0.5
+    assert metric["relativeRisk"] is not None
+    assert metric["pValue"] is not None
+
+
+def test_oracle_derives_grade_alert_matching_and_charge_bootstrap_metrics():
+    oracle = _golden_oracle_module()
+
+    policy = _oracle_quality_config()["qualityRisk"]
+    discovery = {
+        "support": 200, "defects": 10, "relativeRisk": 2.1,
+        "relativeRiskCiLower": 1.1, "riskDifference": 0.02, "qValue": 0.04,
+        "reasonCode": "NONE",
+    }
+    confirmation = {
+        "support": 100, "defects": 5, "relativeRisk": 1.6,
+        "riskDifference": 0.01, "reasonCode": "NONE",
+    }
+    assert oracle._grade_rule(discovery, confirmation, "STRATIFIED", policy) == "DANGER"
+    assert oracle._grade_rule(discovery, confirmation, "UNADJUSTED_FALLBACK", policy) == "CAUTION"
+    low = dict(discovery, reasonCode="LOW_SUPPORT")
+    assert oracle._grade_rule(low, confirmation, "STRATIFIED", policy) == "INSUFFICIENT_EVIDENCE"
+    not_repeated = dict(confirmation, relativeRisk=0.9, riskDifference=0.0)
+    assert oracle._grade_rule(
+        discovery, not_repeated, "STRATIFIED", policy,
+    ) == "UNCONFIRMED"
+    assert not_repeated["reasonCode"] == "DIRECTION_NOT_REPEATED"
+
+    rule = {
+        "grade": "DANGER", "earlyWarningEligible": True,
+        "firstAvailableStage": "CAST_RECORDED",
+        "predicate": {"allOf": [{
+            "field": "x", "type": "NUMERIC_INTERVAL", "lower": 1,
+            "lowerInclusive": True, "upper": 1, "upperInclusive": True,
+            "values": None,
+        }]},
+    }
+    holdout = [
+        _oracle_material("2025-02-02", charge="A", slab="1", judge="불량", x=1),
+        _oracle_material("2025-02-02", charge="A", slab="2", judge="양품", x=0),
+        _oracle_material("2025-02-03", charge="B", slab="1", judge="양품", x=1),
+    ]
+    config = _oracle_quality_config()
+    profiles = oracle._holdout_profiles(
+        config, {"HOLDOUT": holdout}, [rule], "sha256:" + "1" * 64,
+        date(2025, 2, 1),
+    )
+    danger = profiles[0]
+    assert (danger["total"], danger["truePositive"], danger["falsePositive"]) == (3, 1, 1)
+    assert danger["alertRate"]["pointEstimate"] == 2 / 3
+    assert danger["precision"]["pointEstimate"] == 1 / 2
+    assert danger["baseDefectRate"]["pointEstimate"] == 1 / 3
+    assert 0 < danger["alertRate"]["validReplicates"] <= 20
+
+    assert oracle._matching_alert_material_keys(
+        holdout, [dict(rule, grade="NORMAL")], {"DANGER"}, date(2025, 2, 1)
+    ) == set()
+    seed = hashlib.sha256(
+        ("sha256:" + "1" * 64).encode("ascii")
+        + b"\0holdout-bootstrap-v1"
+    ).digest()
+    assert Counter(
+        2 - sum(oracle._sample_charge_indices(seed, replicate, 2))
+        for replicate in range(2_000)
+    ) == {0: 499, 1: 1_009, 2: 492}
+    assert not oracle._bootstrap_applicable(
+        {"support": 3, "reasonCode": "LOW_SUPPORT"}, policy,
+    )
+    assert oracle._display_intervals_are_adjacent(
+        {"upper": 1, "upperInclusive": True},
+        {"lower": 1, "lowerInclusive": False},
+    )
+    assert not oracle._display_intervals_are_adjacent(
+        {"upper": 1, "upperInclusive": False},
+        {"lower": 1, "lowerInclusive": False},
+    )
+    assert not oracle._display_intervals_are_adjacent(
+        {"upper": 1, "upperInclusive": True},
+        {"lower": 1, "lowerInclusive": True},
+    )
+
+
+def test_oracle_derives_replay_count_and_date_span_from_emitted_events():
+    oracle = _golden_oracle_module()
+
+    material = _oracle_material(
+        "2025-01-10",
+        charge="A",
+        slab="1",
+        ap_date="2025-02-01",
+    )
+    material["values"]["cast_date"] = "2025-01-01"
+    config = {"fields": []}
+    records = oracle._replay_event_records(config, [material])
+    assert len(records) == 8
+    assert {record["batch_step"] for record in records} == {
+        "CAST_RECORDED",
+        "FURNACE_CHARGED",
+        "PREHEAT_COMPLETE",
+        "HEAT_COMPLETE",
+        "SOAK_COMPLETE",
+        "FURNACE_EXTRACTED",
+        "RM4_RECORDED",
+        "AP_RECORDED_WITH_RESULT",
+    }
+    assert min(record["replay_date"] for record in records) == "2025-01-01"
+    assert max(record["replay_date"] for record in records) == "2025-02-01"
+
+    material["ap"] = None
+    assert len(oracle._replay_event_records(config, [material])) == 7
+
+
+def test_oracle_quality_lineage_is_concrete_first_and_leaf_exact(tmp_path):
+    oracle = _golden_oracle_module()
+
+    root = _isolated_golden_oracle_root(tmp_path)
+    config, tables = oracle._load_inputs(root)
+    materials, _quarantine = oracle._derive_materials(config, tables)
+    split = oracle._split_materials(materials, config, oracle._fur_boundary_rows(tables))
+    rules, _memberships, normalized = oracle._quality_rules(config, split)
+    concrete = oracle._concrete_quality_lineage(rules, config)
+    manually_normalized: dict[str, set[str]] = {}
+    for trace in concrete.values():
+        for path, dependencies in trace.items():
+            manually_normalized.setdefault(path, set()).update(dependencies)
+    assert normalized == {
+        path: sorted(dependencies, key=lambda value: value.encode("utf-8"))
+        for path, dependencies in manually_normalized.items()
+    }
+    assert len(concrete) == len(rules) == 165
+    assert oracle._quality_bootstrap_task_count(rules, config) == 0
+
+    metric_paths = [
+        path for path in normalized
+        if path.startswith("rules[].discovery.")
+        or path.startswith("rules[].confirmation.")
+    ]
+    candidate_paths = [
+        path for path in normalized
+        if path.startswith("rules[].")
+        and not path.startswith(("rules[].discovery.", "rules[].confirmation."))
+        and path not in {
+            "rules[].ruleId", "rules[].grade", "rules[].earlyWarningEligible",
+            "rules[].displayMergeRuleIds[]",
+        }
+    ]
+    assert len({tuple(normalized[path]) for path in metric_paths}) > 8
+    assert len({tuple(normalized[path]) for path in candidate_paths}) > 8
+
+    for split_name in ("discovery", "confirmation"):
+        support = set(normalized[f"rules[].{split_name}.support"])
+        defects = set(normalized[f"rules[].{split_name}.defects"])
+        crude = set(normalized[f"rules[].{split_name}.crudeRate"])
+        lower = set(normalized[f"rules[].{split_name}.crudeRateCiLower"])
+        reason = set(normalized[f"rules[].{split_name}.reasonCode"])
+        assert "replay_events.values_json.judge" not in support
+        assert not any("wilsonZ" in value or "fdrFamilies" in value for value in support)
+        assert not any("minimum" in value for value in support)
+        assert defects == support | {"replay_events.values_json.judge"}
+        assert crude == {
+            f"quality_risk_intervals.rules[].{split_name}.defects",
+            f"quality_risk_intervals.rules[].{split_name}.support",
+        }
+        assert lower == crude | {"config.wilsonZ"}
+        assert "config.wilsonZ" not in reason
+        assert "config.fdrFamilies[]" not in reason
+        assert not any("Defects" in value for value in reason)
+
+    assert set(normalized["rules[].discovery.qValue"]) == {
+        "config.fdrFamilies[]",
+        "quality_risk_intervals.rules[].analysisFamily",
+        "quality_risk_intervals.rules[].discovery.pValue",
+    }
+    assert normalized["rules[].confirmation.qValue"] == [
+        "quality_risk_intervals.rules[].confirmation.reasonCode",
+    ]
+    assert normalized["rules[].grade"] == [
+        "quality_risk_intervals.rules[].discovery.reasonCode",
+    ]
+
+    quality_nodes = {
+        "replay_events.values_json." + definition["field"]
+        for definition in config["fields"]
+        if definition["featureRole"] in oracle._QUALITY_ROLES
+    }
+    numeric_nodes = {
+        "replay_events.values_json." + definition["field"]
+        for definition in config["fields"]
+        if definition["featureRole"] in oracle._QUALITY_ROLES
+        and definition["dataType"] == "NUMBER"
+    }
+    predicate_nodes = {
+        "quality_risk_intervals.rules[].predicate.allOf[]." + suffix
+        for suffix in (
+            "field", "type", "lower", "lowerInclusive", "upper",
+            "upperInclusive", "values[]",
+        )
+    }
+    metric_base = {
+        "population.DISCOVERY",
+        "quality_risk_intervals.rules[].adjustmentKind",
+        *predicate_nodes,
+        *quality_nodes,
+    }
+    assert set(normalized["rules[].discovery.reasonCode"]) == metric_base | {
+        "config.qualityRisk.minimumDiscoverySupport",
+        "quality_risk_intervals.rules[].discovery.support",
+    }
+    assert set(normalized["rules[].confirmation.reasonCode"]) == metric_base | {
+        "config.qualityRisk.minimumConfirmationSupport",
+        "population.CONFIRMATION",
+        "quality_risk_intervals.rules[].confirmation.support",
+    }
+    for path in metric_paths:
+        if path != "rules[].discovery.qValue":
+            assert "config.fdrFamilies[]" not in normalized[path], path
+
+    assert set(normalized["rules[].predicate.allOf[].lower"]) & quality_nodes == numeric_nodes
+    assert set(normalized["rules[].predicate.allOf[].values[]"]) & quality_nodes == quality_nodes - numeric_nodes
+
+    for path, metadata in (
+        ("rules[].firstAvailableStage", "firstAvailableStage"),
+        ("rules[].equipmentType", "equipmentType"),
+        ("rules[].evidenceFamily", "evidenceFamily"),
+    ):
+        assert set(normalized[path]) == {
+            "config.fields[].field",
+            "config.fields[]." + metadata,
+            "quality_risk_intervals.rules[].fieldNames[]",
+        }
+        assert not any(
+            dependency.startswith(("population.", "replay_events."))
+            or "qualityRisk" in dependency
+            for dependency in normalized[path]
+        )
+    dropped = set(normalized["rules[].adjustmentFieldsDropped[]"])
+    assert not any(
+        dependency.startswith(("population.", "replay_events."))
+        or "qualityRisk" in dependency
+        for dependency in dropped
+    )
+
+    display_dependencies = {
+        "quality_risk_intervals.rules[]." + suffix
+        for suffix in (
+            "adjustmentFieldsDropped[]", "adjustmentKind", "adjustmentLevel",
+            "analysisFamily", "applicationContext", "applicationScope",
+            "equipmentId", "equipmentType", "fieldNames[]",
+            "firstAvailableStage", "grade", "predicate.allOf[].lower",
+            "predicate.allOf[].lowerInclusive", "predicate.allOf[].upper",
+            "predicate.allOf[].upperInclusive", "ruleId",
+        )
+    }
+    assert set(normalized["rules[].displayMergeRuleIds[]"]) == display_dependencies
+    assert not any(
+        dependency.startswith("config.")
+        or ".discovery." in dependency
+        or ".confirmation." in dependency
+        for dependency in display_dependencies
+    )
+
+    representatives = {
+        family: next(rule for rule in rules if rule["analysisFamily"] == family)
+        for family in ("NUMERIC", "CATEGORICAL", "INTERACTION")
+    }
+    for family, rule in representatives.items():
+        axes = {
+            "replay_events.values_json." + term["field"]
+            for term in rule["predicate"]["allOf"]
+        }
+        support = set(concrete[rule["ruleId"]]["rules[].discovery.support"])
+        assert support & quality_nodes == axes, family
+
+    fallback = next(
+        rule for rule in rules
+        if rule["analysisFamily"] == "NUMERIC"
+        and rule["fieldNames"] == ["f_pre_temp"]
+    )
+    adjustment = set(
+        concrete[fallback["ruleId"]]["rules[].adjustmentKind"]
+    )
+    assert adjustment & quality_nodes == {
+        "replay_events.values_json.f_jangip_gubun",
+        "replay_events.values_json.f_pre_temp",
+        "replay_events.values_json.furnace_no",
+        "replay_events.values_json.slab_width",
+        "replay_events.values_json.steel_grade",
+        "replay_events.values_json.steel_usage",
+    }
+    traced_display = {
+        rule["ruleId"]
+        for rule in rules
+        if "rules[].displayMergeRuleIds[]" in concrete[rule["ruleId"]]
+    }
+    assert traced_display == {
+        rule["ruleId"] for rule in rules if rule["displayMergeRuleIds"]
+    }
+    assert len(traced_display) == 113
+    confirmation_no_information = next(
+        rule for rule in rules
+        if rule["confirmation"]["reasonCode"] == "NO_INFORMATIVE_STRATA"
+    )
+    no_information_dependencies = set(
+        concrete[confirmation_no_information["ruleId"]][
+            "rules[].confirmation.reasonCode"
+        ]
+    )
+    assert "config.qualityRisk.minimumConfirmationSupport" not in (
+        no_information_dependencies
+    )
+    assert "quality_risk_intervals.rules[].confirmation.support" not in (
+        no_information_dependencies
+    )
+    confirmation_low_support = next(
+        rule for rule in rules
+        if rule["confirmation"]["reasonCode"] == "LOW_SUPPORT"
+    )
+    low_support_dependencies = set(
+        concrete[confirmation_low_support["ruleId"]][
+            "rules[].confirmation.reasonCode"
+        ]
+    )
+    assert {
+        "config.qualityRisk.minimumConfirmationSupport",
+        "quality_risk_intervals.rules[].confirmation.support",
+    } <= low_support_dependencies
+
+
+_ORACLE_ALLOWED_IMPORT_ROOTS = frozenset({
+    "__future__",
+    "csv",
+    "datetime",
+    "fractions",
+    "functools",
+    "hashlib",
+    "io",
+    "json",
+    "math",
+    "pathlib",
+    "struct",
+    "types",
+})
+_ORACLE_FORBIDDEN_CALL_NAMES = frozenset({
+    "__import__",
+    "ArgumentParser",
+    "compile",
+    "copy",
+    "copyfile",
+    "copytree",
+    "delattr",
+    "eval",
+    "exec",
+    "format",
+    "getattr",
+    "globals",
+    "hardlink_to",
+    "hasattr",
+    "import_module",
+    "link",
+    "locals",
+    "makedirs",
+    "mkdir",
+    "mknod",
+    "move",
+    "open",
+    "parse_args",
+    "parse_known_args",
+    "remove",
+    "removedirs",
+    "rename",
+    "renames",
+    "replace",
+    "repr",
+    "rmdir",
+    "setattr",
+    "symlink",
+    "symlink_to",
+    "touch",
+    "truncate",
+    "unlink",
+    "vars",
+    "write",
+    "write_bytes",
+    "write_text",
+    "writelines",
+})
+
+
+def _assert_read_only_oracle_ast(source: str) -> None:
+    tree = ast.parse(source)
+    aliases: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                assert root in _ORACLE_ALLOWED_IMPORT_ROOTS, alias.name
+                aliases[alias.asname or root] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            module = node.module or ""
+            root = module.split(".", 1)[0]
+            assert root in _ORACLE_ALLOWED_IMPORT_ROOTS, module
+            for alias in node.names:
+                assert alias.name != "*"
+                aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
+
+    def resolved_name(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            prefix = resolved_name(node.value)
+            return f"{prefix}.{node.attr}" if prefix else node.attr
+        if isinstance(node, ast.Call):
+            return resolved_name(node.func)
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = resolved_name(node.func)
+        final_name = name.rsplit(".", 1)[-1] if name else ""
+        assert final_name not in _ORACLE_FORBIDDEN_CALL_NAMES, name
+
+
+_READ_ONLY_ORACLE_CHILD = r'''
+import os
+import sys
+
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+_MUTATION_EVENTS = {
+    "os.chmod", "os.chown", "os.link", "os.mkdir", "os.remove", "os.rename",
+    "os.rmdir", "os.symlink", "os.truncate", "os.utime", "shutil.copyfile",
+    "shutil.copytree", "shutil.move", "tempfile.mkstemp", "tempfile.mkdtemp",
+}
+
+def _deny_filesystem_mutation(event, args):
+    if event == "open":
+        mode = args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 else 0
+        writes = isinstance(mode, str) and any(char in mode for char in "wax+")
+        writes = writes or isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
+        if writes:
+            raise PermissionError("oracle filesystem mutation forbidden")
+    elif event in _MUTATION_EVENTS:
+        raise PermissionError("oracle filesystem mutation forbidden")
+
+sys.addaudithook(_deny_filesystem_mutation)
+
+if len(sys.argv) == 3:
+    with open(sys.argv[2], "w", encoding="utf-8") as stream:
+        stream.write("forbidden")
+else:
+    from pathlib import Path
+    from tests.oracles.golden_semantics import build_golden_semantics
+    result = build_golden_semantics(Path(sys.argv[1]))
+    assert len(result) == 6
+    assert all(type(value) is bytes for value in result.values())
+    print("oracle-read-only-audit-ok")
+'''
+
+
+def _run_read_only_oracle_child(
+    root: Path,
+    *,
+    write_probe: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, "-B", "-c", _READ_ONLY_ORACLE_CHILD, str(root)]
+    if write_probe is not None:
+        command.append(str(write_probe))
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    return subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os as harmless\nharmless.remove('victim')\n",
+        "import analysis.equipment_quality.schema as harmless\n",
+        "from importlib import import_module as load\nload('equipment_quality')\n",
+        "from os import truncate as observe\nobserve('victim', 0)\n",
+        "from pathlib import Path as P\nP('victim').open('w')\n",
+        "open('victim', 'w')\n",
+        "getattr(object(), 'write_text')('payload')\n",
+    ],
+)
+def test_oracle_ast_guard_rejects_alias_qualified_dynamic_and_write_bypasses(source):
+    with pytest.raises(AssertionError):
+        _assert_read_only_oracle_ast(source)
+
+
+def test_oracle_child_process_audit_rejects_inside_and_outside_filesystem_writes(
+    tmp_path,
+):
+    root = _isolated_golden_oracle_root(tmp_path)
+    audited = _run_read_only_oracle_child(root)
+    assert audited.returncode == 0, audited.stdout + audited.stderr
+    assert audited.stdout.strip() == "oracle-read-only-audit-ok"
+
+    for target in (root / "inside", tmp_path.parent / "outside-oracle-root"):
+        probed = _run_read_only_oracle_child(root, write_probe=target)
+        assert probed.returncode != 0
+        assert "oracle filesystem mutation forbidden" in probed.stderr
+        assert not target.exists()
+
+
 def test_independent_golden_oracle_has_one_read_only_stdlib_surface():
-    oracle_path = Path("analysis/tests/oracles/golden_semantics.py")
+    oracle_path = ANALYSIS_ROOT / "tests/oracles/golden_semantics.py"
     assert oracle_path.is_file()
     source_bytes = oracle_path.read_bytes()
-    assert len(source_bytes) == 94_171
+    assert len(source_bytes) == 138_506
     assert hashlib.sha256(source_bytes).hexdigest() == (
-        "377a65607ba437d3a9217afcca5c0d83a440d192e680e384e6988b59cf466dfa"
+        "9aae75fd4b27d5b236d3a306eefa64c17be5df473e81ba83868e764c41a0d655"
     )
     source = source_bytes.decode("utf-8")
     tree = ast.parse(source)
-
-    forbidden_import_roots = {
-        "equipment_quality", "numpy", "pandas", "scipy", "jsonschema",
-        "analysis.tests.factories", "analysis.tests.test_contracts",
-    }
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            imported.add(node.module or "")
-    assert not {
-        name
-        for name in imported
-        if any(name == root or name.startswith(root + ".") for root in forbidden_import_roots)
-    }
-
-    forbidden_calls = {
-        "eval", "exec", "compile", "__import__", "import_module",
-        "ArgumentParser", "parse_args", "parse_known_args",
-        "write_bytes", "write_text", "mkdir", "makedirs", "touch", "unlink",
-        "rmdir", "remove", "rename", "replace", "copy", "copyfile", "move",
-    }
-    calls = {
-        node.func.id
-        if isinstance(node.func, ast.Name)
-        else node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, (ast.Name, ast.Attribute))
-    }
-    assert not calls.intersection(forbidden_calls)
-    assert "repr" not in calls
-    assert "format" not in calls
+    _assert_read_only_oracle_ast(source)
 
     public_functions = [
         node.name
@@ -2359,7 +3390,7 @@ def test_independent_golden_oracle_has_one_read_only_stdlib_surface():
 
 
 def test_independent_golden_oracle_derives_complete_immutable_bytes(tmp_path):
-    from analysis.tests.oracles.golden_semantics import build_golden_semantics
+    build_golden_semantics = _golden_oracle_module().build_golden_semantics
 
     root = _isolated_golden_oracle_root(tmp_path)
     before = {
@@ -2380,7 +3411,7 @@ def test_independent_golden_oracle_derives_complete_immutable_bytes(tmp_path):
     assert all(type(value) is bytes for value in result.values())
     expected_outputs = {
         "analysis_summary.template.json": (
-            455_832, "72a1ecf6ef81a3626aea4f0f78414d0bc7ff711fc39c8d42fbbb8b7067fb8b2d",
+            383_700, "20acdfe66fc1167340c58f2ff91a00621725bace0b3b65832ab8629e51e04f1d",
         ),
         "criteria_projection.jsonl": (
             79_246, "6842fabd1cc79ca801e34bb0708498f4bea16317d4449e6d773e28e40c94ff5c",
@@ -2505,18 +3536,17 @@ def test_independent_golden_oracle_derives_complete_immutable_bytes(tmp_path):
     assert json.loads(extracted["values_json"])["f_ext_time"] == 7
 
     summary = json.loads(result["analysis_summary.template.json"])
-    assert len(result["analysis_summary.template.json"]) == 455_832
+    assert len(result["analysis_summary.template.json"]) == 383_700
     assert hashlib.sha256(result["analysis_summary.template.json"]).hexdigest() == (
-        "72a1ecf6ef81a3626aea4f0f78414d0bc7ff711fc39c8d42fbbb8b7067fb8b2d"
+        "20acdfe66fc1167340c58f2ff91a00621725bace0b3b65832ab8629e51e04f1d"
     )
     resolved_summary = json.loads(
         result["analysis_summary.template.json"]
         .replace(b"@BUNDLE_ID@", b"sha256:" + b"1" * 64)
         .replace(b"@CRITERIA_ID@", b"sha256:" + b"2" * 64)
     )
-    from analysis.equipment_quality.schema import validate_normative_instance
-
-    validate_normative_instance("analysis_summary.schema.json", resolved_summary)
+    _validator("analysis_summary.schema.json").validate(resolved_summary)
+    _validate_summary_application_contract(resolved_summary)
     assert summary["asOf"] == "2025-02-20"
     assert summary["innerSplitDate"] == "2025-01-03"
     assert summary["quarantineCounts"] == {"DUPLICATE_AP_KEY": 2, "UNLINKED_AP": 1}
@@ -2637,14 +3667,19 @@ def test_independent_golden_oracle_derives_complete_immutable_bytes(tmp_path):
     assert not any(item["outputField"] == "values_json" for item in summary["lineage"]["fields"])
     field_lineage = summary["lineage"]["fields"]
     field_lineage_bytes = _canonical_json_bytes(field_lineage)
-    assert len(field_lineage_bytes) == 269_053
+    assert len(field_lineage_bytes) == 196_921
     assert hashlib.sha256(field_lineage_bytes).hexdigest() == (
-        "d15bf75a994e991e647ebc5e228994d98cddf62af5c59288faeb6b1126170140"
+        "8cb915529575d5df9342117b02539ef76321f1146da6537dba1d2f1d448d25ef"
     )
-    assert sum(len(item["dependencies"]) for item in field_lineage) == 5_173
+    assert sum(len(item["dependencies"]) for item in field_lineage) == 3_340
     field_by_node = {
         (item["artifactRole"], item["outputField"]): item for item in field_lineage
     }
+    assert len({
+        tuple(item["dependencies"])
+        for item in field_lineage
+        if item["artifactRole"] == "quality_risk_intervals"
+    }) == 35
     assert Counter(item["conversion"] for item in field_lineage) == {
         "APPLY_GRADE_POLICY": 1,
         "CLASSIFY_REPLAY_SCHEDULE": 3,
