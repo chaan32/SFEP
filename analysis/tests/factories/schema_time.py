@@ -286,6 +286,7 @@ def dated_rows(rows: Iterable[tuple[str, str]]) -> GenealogyResult:
 def maturity_fixture() -> GenealogyResult:
     rows = dated_rows(
         [
+            ("MATURE", "2024-11-01"),
             ("C1", "2025-01-01"),
             ("C2", "2025-01-02"),
             ("C2", "2025-01-03"),

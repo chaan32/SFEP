@@ -134,7 +134,7 @@ class GenealogyResult:
 @dataclass(frozen=True)
 class TimeSplitResult:
     as_of: date
-    discovery_cutoff: date | None
+    discovery_cutoff: date
     reference_rows: pd.DataFrame
     discovery_rows: pd.DataFrame
     confirmation_rows: pd.DataFrame

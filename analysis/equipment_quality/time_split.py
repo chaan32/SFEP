@@ -221,30 +221,26 @@ def build_time_split(
     mature_rows = reference_rows.loc[
         reference_rows["label_status"] == "AVAILABLE"
     ].copy()
-    discovery_cutoff: date | None = None
-    inner_charge_ids: tuple[str, ...] = ()
     if mature_rows.empty:
-        discovery_rows = mature_rows.copy()
-        confirmation_rows = mature_rows.copy()
-    else:
-        discovery_cutoff = _whole_date_cutoff(
-            mature_rows, config.discovery_fraction, "discovery cutoff"
+        raise ValueError("no mature quality labels available for discovery split")
+    discovery_cutoff = _whole_date_cutoff(
+        mature_rows, config.discovery_fraction, "discovery cutoff"
+    )
+    inner_charge_ids = _charge_ids_on_both_sides(mature_rows, discovery_cutoff)
+    inner_charge_set = set(inner_charge_ids)
+    not_inner_purged = ~mature_rows["charge_id"].astype(str).isin(inner_charge_set)
+    discovery_rows = mature_rows.loc[
+        not_inner_purged
+        & mature_rows["hr_date"].map(
+            lambda value: _as_date(value, "mature hr_date") <= discovery_cutoff
         )
-        inner_charge_ids = _charge_ids_on_both_sides(mature_rows, discovery_cutoff)
-        inner_charge_set = set(inner_charge_ids)
-        not_inner_purged = ~mature_rows["charge_id"].astype(str).isin(inner_charge_set)
-        discovery_rows = mature_rows.loc[
-            not_inner_purged
-            & mature_rows["hr_date"].map(
-                lambda value: _as_date(value, "mature hr_date") <= discovery_cutoff
-            )
-        ].copy()
-        confirmation_rows = mature_rows.loc[
-            not_inner_purged
-            & mature_rows["hr_date"].map(
-                lambda value: _as_date(value, "mature hr_date") > discovery_cutoff
-            )
-        ].copy()
+    ].copy()
+    confirmation_rows = mature_rows.loc[
+        not_inner_purged
+        & mature_rows["hr_date"].map(
+            lambda value: _as_date(value, "mature hr_date") > discovery_cutoff
+        )
+    ].copy()
     discovery_rows = _ordered(discovery_rows)
     confirmation_rows = _ordered(confirmation_rows)
 
@@ -268,9 +264,7 @@ def build_time_split(
             "innerChargeIds": inner_charge_ids,
             "innerMatureRows": int(
                 mature_rows["charge_id"].astype(str).isin(set(inner_charge_ids)).sum()
-            )
-            if not mature_rows.empty
-            else 0,
+            ),
         },
     }
     return TimeSplitResult(

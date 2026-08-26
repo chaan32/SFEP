@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from equipment_quality.genealogy import build_genealogy
 from equipment_quality.time_split import build_time_split
 from factories.schema_time import (
@@ -10,8 +12,6 @@ from factories.schema_time import (
     maturity_boundary_fixture,
     maturity_fixture,
     tables,
-    tables_with_different_sm_ap_linkage_same_fur,
-    tables_with_unlinked_sm_and_ap,
 )
 
 
@@ -27,7 +27,7 @@ def test_reference_cutoff_keeps_date_whole_and_does_not_recalculate_after_charge
     )
 
     split = build_time_split(
-        rows, analysis_config(reference_fraction=0.70, maturity_days=38)
+        rows, analysis_config(reference_fraction=0.70, maturity_days=0)
     )
 
     assert split.as_of.isoformat() == "2025-01-04"
@@ -46,7 +46,7 @@ def test_reference_cutoff_includes_every_record_on_threshold_date():
         ]
     )
 
-    split = build_time_split(rows, analysis_config())
+    split = build_time_split(rows, analysis_config(maturity_days=0))
 
     assert split.as_of == date(2025, 1, 2)
     assert set(split.reference_rows.charge_id) == {"C1", "C2", "C3"}
@@ -54,13 +54,45 @@ def test_reference_cutoff_includes_every_record_on_threshold_date():
 
 
 def test_boundary_linkage_changes_do_not_change_fur_only_cutoff():
-    baseline = build_genealogy(tables_with_unlinked_sm_and_ap())
-    mutated = build_genealogy(tables_with_different_sm_ap_linkage_same_fur())
+    fur_rows = [
+        {
+            "charge_id": "C1",
+            "slab_no": "1",
+            "hr_coil_id": "H1",
+            "hr_date": "2024-11-02",
+        },
+        {
+            "charge_id": "C2",
+            "slab_no": "2",
+            "hr_coil_id": "H2",
+            "hr_date": "2024-11-03",
+        },
+    ]
+    baseline = build_genealogy(
+        tables(
+            sm=[{"charge_id": "C1", "slab_no": "1"}],
+            fur=fur_rows,
+            ap=[{"hr_coil_id": "H1", "ap_prod_id": "A1"}],
+        )
+    )
+    mutated = build_genealogy(
+        tables(
+            sm=[
+                {"charge_id": "C1", "slab_no": "1"},
+                {"charge_id": "C2", "slab_no": "2"},
+            ],
+            fur=fur_rows,
+            ap=[
+                {"hr_coil_id": "H1", "ap_prod_id": "A1"},
+                {"hr_coil_id": "H2", "ap_prod_id": "A2"},
+            ],
+        )
+    )
 
-    baseline_split = build_time_split(baseline, analysis_config())
-    mutated_split = build_time_split(mutated, analysis_config())
+    baseline_split = build_time_split(baseline, analysis_config(maturity_days=0))
+    mutated_split = build_time_split(mutated, analysis_config(maturity_days=0))
 
-    assert baseline_split.as_of == date(2024, 11, 2)
+    assert baseline_split.as_of == date(2024, 11, 3)
     assert baseline_split.as_of == mutated_split.as_of
 
 
@@ -71,8 +103,9 @@ def test_unmatured_label_is_censored_not_good():
     )
 
     assert split.counts["reference"]["unknownOrCensored"] == 1
-    assert split.counts["reference"]["nonDefects"] == 0
-    assert split.reference_rows.iloc[0]["label_status"] == "LABEL_NOT_YET_AVAILABLE"
+    assert split.counts["reference"]["nonDefects"] == 1
+    reference = split.reference_rows.set_index("charge_id")
+    assert reference.loc["C1", "label_status"] == "LABEL_NOT_YET_AVAILABLE"
 
 
 def test_maturity_is_inclusive_at_exact_38_days_and_ap_on_as_of():
@@ -87,17 +120,50 @@ def test_maturity_is_inclusive_at_exact_38_days_and_ap_on_as_of():
     assert reference.loc["MISSING", "label_status"] == "LABEL_MISSING"
     assert split.counts["reference"]["nonDefects"] == 1
     assert split.counts["reference"]["unknownOrCensored"] == 6
+    assert split.discovery_cutoff == date(2025, 1, 1)
+    assert split.counts["discovery"]["total"] == 1
 
 
 def test_ap_unlinked_row_remains_replayable_but_censored():
-    genealogy = build_genealogy(tables(ap=[]))
+    genealogy = build_genealogy(
+        tables(
+            sm=[
+                {"charge_id": "MATURE", "slab_no": "1", "cast_date": "2024-11-01"},
+                {"charge_id": "UNLINKED", "slab_no": "2", "cast_date": "2025-01-10"},
+            ],
+            fur=[
+                {
+                    "charge_id": "MATURE",
+                    "slab_no": "1",
+                    "hr_coil_id": "H-MATURE",
+                    "f_ext_date": "2024-11-02",
+                    "hr_date": "2024-11-02",
+                },
+                {
+                    "charge_id": "UNLINKED",
+                    "slab_no": "2",
+                    "hr_coil_id": "H-UNLINKED",
+                    "f_ext_date": "2025-01-10",
+                    "hr_date": "2025-01-10",
+                },
+            ],
+            ap=[
+                {
+                    "hr_coil_id": "H-MATURE",
+                    "ap_prod_id": "A-MATURE",
+                    "ap_date": "2024-11-03",
+                }
+            ],
+        )
+    )
 
     split = build_time_split(genealogy, analysis_config())
 
-    assert len(split.reference_rows) == 1
-    assert split.reference_rows.iloc[0]["label_status"] == "AP_UNLINKED"
+    assert len(split.reference_rows) == 2
+    reference = split.reference_rows.set_index("charge_id")
+    assert reference.loc["UNLINKED", "label_status"] == "AP_UNLINKED"
     assert split.counts["reference"]["unknownOrCensored"] == 1
-    assert split.counts["reference"]["nonDefects"] == 0
+    assert split.counts["reference"]["nonDefects"] == 1
 
 
 def test_inner_cutoff_is_not_recomputed_after_second_charge_purge():
@@ -149,16 +215,28 @@ def test_discovery_cutoff_keeps_all_mature_rows_on_boundary_date():
     assert set(split.confirmation_rows.charge_id) == {"C5"}
 
 
-def test_no_mature_quality_rows_yields_no_inner_cutoff_or_false_goods():
+def test_no_mature_quality_rows_fail_closed_with_stable_domain_error():
     genealogy = build_genealogy(tables(ap=[]))
 
-    split = build_time_split(genealogy, analysis_config())
+    with pytest.raises(ValueError) as error:
+        build_time_split(genealogy, analysis_config())
 
-    assert split.discovery_cutoff is None
-    assert split.discovery_rows.empty
-    assert split.confirmation_rows.empty
-    assert split.counts["discovery"]["total"] == 0
-    assert split.counts["confirmation"]["total"] == 0
+    assert str(error.value) == "no mature quality labels available for discovery split"
+
+
+def test_all_censored_reference_rows_fail_before_returning_a_split():
+    genealogy = maturity_boundary_fixture()
+    genealogy.replay_rows.loc[
+        genealogy.replay_rows["charge_id"] == "M38", "judge"
+    ] = None
+    genealogy.quality_rows.loc[
+        genealogy.quality_rows["charge_id"] == "M38", "judge"
+    ] = None
+
+    with pytest.raises(ValueError) as error:
+        build_time_split(genealogy, analysis_config())
+
+    assert str(error.value) == "no mature quality labels available for discovery split"
 
 
 def test_holdout_counts_only_observed_final_labels_as_good_or_defect():
@@ -174,7 +252,7 @@ def test_holdout_counts_only_observed_final_labels_as_good_or_defect():
     rows.replay_rows.loc[rows.replay_rows["charge_id"] == "C5", "judge"] = "불량"
     rows.quality_rows.loc[rows.quality_rows["charge_id"] == "C5", "judge"] = "불량"
 
-    split = build_time_split(rows, analysis_config())
+    split = build_time_split(rows, analysis_config(maturity_days=0))
 
     assert split.counts["holdout"]["total"] == 1
     assert split.counts["holdout"]["defects"] == 1

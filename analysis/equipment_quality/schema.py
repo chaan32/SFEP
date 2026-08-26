@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import importlib.resources
 import json
 import math
 import re
@@ -74,6 +75,7 @@ _NUMERIC_COLUMNS = {
     "ap": {"ap_thick", "ap_width", "ap_line_speed"},
 }
 _DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_EQUIPMENT_TYPES = ("SM_CC", "FURNACE", "RM4", "AP")
 
 
 def _parse_date(raw: str, *, role: str, column: str, record_number: int) -> date:
@@ -232,7 +234,16 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"analysis config numbers must be finite; found {value}")
 
 
-def _hierarchies(items: list[dict[str, object]]) -> dict[str, tuple[tuple[str, ...], ...]]:
+def _hierarchies(
+    items: list[dict[str, object]], *, label: str
+) -> dict[str, tuple[tuple[str, ...], ...]]:
+    equipment_types = [str(item["equipmentType"]) for item in items]
+    if any(equipment_types.count(value) != 1 for value in _EQUIPMENT_TYPES) or any(
+        value not in _EQUIPMENT_TYPES for value in equipment_types
+    ):
+        raise ValueError(
+            f"{label} must contain exactly one policy for each equipment type"
+        )
     return {
         str(item["equipmentType"]): tuple(
             tuple(str(field) for field in level) for level in item["levels"]
@@ -250,11 +261,10 @@ def load_analysis_config(path: Path) -> AnalysisConfig:
         )
     except UnicodeDecodeError as error:
         raise ValueError("analysis config must be UTF-8") from error
-    schema_path = (
-        Path(__file__).resolve().parents[2]
-        / "contracts/equipment-monitor/v1/analysis_config.schema.json"
-    )
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema_bytes = importlib.resources.files("equipment_quality").joinpath(
+        "analysis_config.schema.json"
+    ).read_bytes()
+    schema = json.loads(schema_bytes.decode("utf-8"))
     validator_class = validator_for(schema)
     validator_class.check_schema(schema)
     validator_class(schema, format_checker=FormatChecker()).validate(payload)
@@ -285,9 +295,12 @@ def load_analysis_config(path: Path) -> AnalysisConfig:
         bootstrap=payload["bootstrap"],
         wilson_z=payload["wilsonZ"],
         fields=tuple(payload["fields"]),
-        range_context_hierarchies=_hierarchies(payload["rangeContextHierarchies"]),
+        range_context_hierarchies=_hierarchies(
+            payload["rangeContextHierarchies"], label="rangeContextHierarchies"
+        ),
         risk_adjustment_hierarchies=_hierarchies(
-            payload["riskAdjustmentHierarchies"]
+            payload["riskAdjustmentHierarchies"],
+            label="riskAdjustmentHierarchies",
         ),
         fixed_interactions=tuple(
             tuple(interaction) for interaction in payload["fixedInteractions"]

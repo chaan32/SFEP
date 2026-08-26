@@ -3,7 +3,12 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import importlib.resources
 import json
+import os
+import shutil
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from datetime import date
 from pathlib import Path
@@ -14,6 +19,7 @@ from jsonschema import ValidationError
 
 from equipment_quality.genealogy import build_genealogy
 from equipment_quality.schema import load_analysis_config, read_inputs
+from equipment_quality.time_split import build_time_split
 from factories.schema_time import (
     tables,
     tables_with_different_sm_ap_linkage_same_fur,
@@ -63,6 +69,13 @@ HEADERS = {
     "sts_2fur_hr_2.csv": FUR_HEADER,
     "sts_3ap_3.csv": AP_HEADER,
 }
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
+NORMATIVE_CONFIG_SCHEMA = (
+    REPOSITORY_ROOT
+    / "contracts/equipment-monitor/v1/analysis_config.schema.json"
+)
 
 
 def _csv_bytes(header: list[str], rows: list[list[str]]) -> bytes:
@@ -304,6 +317,110 @@ def test_load_analysis_config_is_complete_validated_and_deeply_immutable():
         config.label_maturity_days = 1
 
 
+def test_packaged_analysis_config_schema_bytes_match_normative_contract():
+    packaged_schema = importlib.resources.files("equipment_quality").joinpath(
+        "analysis_config.schema.json"
+    )
+
+    assert packaged_schema.is_file()
+    assert packaged_schema.read_bytes() == NORMATIVE_CONFIG_SCHEMA.read_bytes()
+
+
+def test_installed_wheel_loads_config_outside_checkout_without_contracts(tmp_path):
+    wheel_source = tmp_path / "wheel-source"
+    wheel_source.mkdir()
+    shutil.copy2(ANALYSIS_ROOT / "pyproject.toml", wheel_source / "pyproject.toml")
+    shutil.copytree(
+        ANALYSIS_ROOT / "equipment_quality",
+        wheel_source / "equipment_quality",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    wheel_dir = tmp_path / "wheel"
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(wheel_dir),
+            str(wheel_source),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+
+    installed_root = tmp_path / "installed"
+    install = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed_root),
+            str(wheels[0]),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+
+    outside_checkout = tmp_path / "outside-checkout"
+    outside_checkout.mkdir()
+    config_path = outside_checkout / "analysis_config.json"
+    config_path.write_bytes((ANALYSIS_ROOT / "analysis_config.json").read_bytes())
+    assert not (tmp_path / "contracts").exists()
+    assert not (outside_checkout / "contracts").exists()
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(installed_root)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["SFEP_INSTALLED_ROOT"] = str(installed_root)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os\n"
+                "import hashlib\n"
+                "import importlib.resources\n"
+                "from pathlib import Path\n"
+                "import equipment_quality\n"
+                "from equipment_quality.schema import load_analysis_config\n"
+                "root = Path(os.environ['SFEP_INSTALLED_ROOT']).resolve()\n"
+                "module = Path(equipment_quality.__file__).resolve()\n"
+                "assert module.is_relative_to(root), module\n"
+                "assert not (Path.cwd() / 'contracts').exists()\n"
+                "schema = importlib.resources.files('equipment_quality').joinpath('analysis_config.schema.json').read_bytes()\n"
+                "print(hashlib.sha256(schema).hexdigest())\n"
+                "config = load_analysis_config(Path('analysis_config.json'))\n"
+                "print(config.analysis_config_version)\n"
+            ),
+        ],
+        cwd=outside_checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.splitlines() == [
+        hashlib.sha256(NORMATIVE_CONFIG_SCHEMA.read_bytes()).hexdigest(),
+        "quality-analysis-v1",
+    ]
+
+
 @pytest.mark.parametrize("mutation", ["missing", "unknown", "nested_unknown"])
 def test_load_analysis_config_rejects_missing_and_unknown_keys_without_defaults(
     tmp_path, mutation
@@ -328,6 +445,46 @@ def test_load_analysis_config_rejects_non_standard_nan_json(tmp_path):
     path.write_text(text.replace("1.959963984540054", "NaN"), encoding="utf-8")
 
     with pytest.raises(ValueError, match="finite"):
+        load_analysis_config(path)
+
+
+@pytest.mark.parametrize(
+    "hierarchy_name",
+    ["rangeContextHierarchies", "riskAdjustmentHierarchies"],
+)
+def test_load_analysis_config_rejects_duplicate_hierarchy_equipment_policy(
+    tmp_path, hierarchy_name
+):
+    payload = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text("utf-8"))
+    payload[hierarchy_name][-1]["equipmentType"] = "SM_CC"
+    path = tmp_path / "duplicate-hierarchy.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one policy for each equipment type"):
+        load_analysis_config(path)
+
+
+@pytest.mark.parametrize(
+    ("hierarchy_name", "mutation"),
+    [
+        ("rangeContextHierarchies", "missing"),
+        ("rangeContextHierarchies", "extra"),
+        ("riskAdjustmentHierarchies", "missing"),
+        ("riskAdjustmentHierarchies", "extra"),
+    ],
+)
+def test_load_analysis_config_rejects_missing_or_extra_hierarchy_policy(
+    tmp_path, hierarchy_name, mutation
+):
+    payload = json.loads((ANALYSIS_ROOT / "analysis_config.json").read_text("utf-8"))
+    if mutation == "missing":
+        payload[hierarchy_name].pop()
+    else:
+        payload[hierarchy_name].append(dict(payload[hierarchy_name][-1]))
+    path = tmp_path / f"{mutation}-hierarchy.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValidationError):
         load_analysis_config(path)
 
 
@@ -483,6 +640,43 @@ def test_impossible_stage_date_order_is_quarantined_not_replayed(
     assert set(result.quarantine_rows["reason"]) == {"IMPOSSIBLE_STAGE_DATE_ORDER"}
 
 
+def test_impossible_stage_date_order_attributes_every_linked_source_record_once():
+    result = build_genealogy(
+        tables(
+            sm=[
+                {
+                    "_source_record_number": 17,
+                    "cast_date": "2025-01-03",
+                }
+            ],
+            fur=[
+                {
+                    "_source_record_number": 23,
+                    "f_ext_date": "2025-01-02",
+                    "hr_date": "2025-01-04",
+                }
+            ],
+            ap=[
+                {
+                    "_source_record_number": 31,
+                    "ap_date": "2025-01-05",
+                }
+            ],
+        )
+    )
+
+    rejected = result.quarantine_rows.loc[
+        result.quarantine_rows["reason"] == "IMPOSSIBLE_STAGE_DATE_ORDER",
+        ["source_role", "source_name", "source_record_number"],
+    ]
+    assert list(rejected.itertuples(index=False, name=None)) == [
+        ("sm_cc", "sts_1sm_cc_1.csv", 17),
+        ("fur_hr", "sts_2fur_hr_2.csv", 23),
+        ("ap", "sts_3ap_3.csv", 31),
+    ]
+    assert result.audit["quarantine"]["IMPOSSIBLE_STAGE_DATE_ORDER"] == 3
+
+
 def test_join_preserves_exact_source_record_provenance_without_absolute_paths():
     result = build_genealogy(tables_with_known_record_numbers())
 
@@ -502,15 +696,98 @@ def test_gas_ratios_are_derived_from_amounts_not_source_percent_columns():
     result = build_genealogy(tables())
     row = result.replay_rows.iloc[0]
 
-    assert row["f_bfg_ratio"] == 25.0
-    assert row["f_cog_ratio"] == 25.0
-    assert row["f_ldg_ratio"] == 50.0
+    assert (
+        row["f_bfg_ratio"],
+        row["f_cog_ratio"],
+        row["f_ldg_ratio"],
+    ) == pytest.approx((0.25, 0.25, 0.5))
     assert row["f_bfg_per"] == 99.0
     assert "_source_record_number" not in result.replay_rows.columns
     assert not any(
         dependency.endswith("._source_record_number")
         for dependency in result.audit["derived_features"]["f_bfg_ratio"]
     )
+
+
+@pytest.mark.parametrize(
+    ("amounts", "expected"),
+    [
+        ((100.0, 30.0, 20.0), (0.6666666666666666, 0.2, 0.13333333333333333)),
+        ((100.0, 0.0, 50.0), (0.6666666666666666, 0.0, 0.3333333333333333)),
+    ],
+    ids=["golden-fractions", "partial-zero-component"],
+)
+def test_gas_ratios_are_unit_fractions_for_nonzero_observed_amounts(
+    amounts, expected
+):
+    result = build_genealogy(
+        tables(
+            fur=[
+                {
+                    "f_bfg": amounts[0],
+                    "f_cog": amounts[1],
+                    "f_ldg": amounts[2],
+                }
+            ]
+        )
+    )
+    row = result.replay_rows.iloc[0]
+
+    assert (
+        row["f_bfg_ratio"],
+        row["f_cog_ratio"],
+        row["f_ldg_ratio"],
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "amounts",
+    [(0.0, 0.0, 0.0), (100.0, None, 50.0)],
+    ids=["zero-total", "missing-component"],
+)
+def test_gas_ratios_are_missing_when_fraction_is_not_defined(amounts):
+    result = build_genealogy(
+        tables(
+            fur=[
+                {
+                    "f_bfg": amounts[0],
+                    "f_cog": amounts[1],
+                    "f_ldg": amounts[2],
+                }
+            ]
+        )
+    )
+    row = result.replay_rows.iloc[0]
+
+    assert pd.isna(row["f_bfg_ratio"])
+    assert pd.isna(row["f_cog_ratio"])
+    assert pd.isna(row["f_ldg_ratio"])
+
+
+def test_fixed_golden_source_runs_complete_task3_pipeline():
+    golden_source = REPOSITORY_ROOT / "contracts/equipment-monitor/v1/golden-source"
+
+    inputs = read_inputs(golden_source)
+    genealogy = build_genealogy(inputs)
+    split = build_time_split(
+        genealogy,
+        load_analysis_config(ANALYSIS_ROOT / "analysis_config.json"),
+    )
+
+    assert len(genealogy.boundary_rows) == 12
+    assert len(genealogy.replay_rows) == 12
+    assert len(genealogy.quality_rows) == 11
+    assert len(genealogy.quarantine_rows) == 3
+    h001 = genealogy.replay_rows.set_index("hr_coil_id").loc["H001"]
+    assert (
+        h001["f_bfg_ratio"],
+        h001["f_cog_ratio"],
+        h001["f_ldg_ratio"],
+    ) == pytest.approx((0.6666666666666666, 0.2, 0.13333333333333333))
+    assert split.as_of == date(2025, 2, 20)
+    assert split.discovery_cutoff == date(2025, 1, 3)
+    assert split.counts["discovery"]["total"] == 5
+    assert split.counts["confirmation"]["total"] == 2
 
 
 def test_quarantine_rows_have_stable_role_record_reason_order():

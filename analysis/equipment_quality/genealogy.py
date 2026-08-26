@@ -103,7 +103,7 @@ def _derived_gas_ratios(row: pd.Series) -> tuple[float | None, float | None, flo
     total = sum(numbers)
     if total == 0.0:
         return None, None, None
-    return tuple(100.0 * value / total for value in numbers)  # type: ignore[return-value]
+    return tuple(value / total for value in numbers)  # type: ignore[return-value]
 
 
 def build_genealogy(inputs: InputTables) -> GenealogyResult:
@@ -262,7 +262,10 @@ def build_genealogy(inputs: InputTables) -> GenealogyResult:
     accepted_records: list[dict[str, object]] = []
     for _, joined in chain.iterrows():
         if not _monotonic_stage_dates(joined):
+            add_quarantine("sm_cc", joined, "IMPOSSIBLE_STAGE_DATE_ORDER")
             add_quarantine("fur_hr", joined, "IMPOSSIBLE_STAGE_DATE_ORDER")
+            if not _missing(joined.get("ap_record_number")):
+                add_quarantine("ap", joined, "IMPOSSIBLE_STAGE_DATE_ORDER")
             continue
         record = joined.to_dict()
         bfg_ratio, cog_ratio, ldg_ratio = _derived_gas_ratios(joined)
