@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import runpy
 import shutil
 import stat
@@ -4602,3 +4603,1005 @@ def test_runtime_seal_rolls_back_new_manifest_on_final_joint_reauthentication(
     assert output.is_file()
     assert output.read_bytes() == b""
     assert not list(tmp_path.glob(".sfep-runtime-*"))
+
+
+# Task 9f: an independent, byte-for-byte seal for the reviewed golden Bundle.
+_GOLDEN_CONTRACT_ROOT = ANALYSIS_ROOT.parent / "contracts/equipment-monitor/v1"
+_GOLDEN_SEAL_TOOL = TOOLS_ROOT / "seal_golden_bundle.py"
+_GOLDEN_OUTPUT_NAMES = (
+    "analysis_config.json",
+    "producer_runtime.json",
+    "equipment_operating_ranges.json",
+    "quality_risk_intervals.json",
+    "replay_events.csv",
+    "analysis_summary.json",
+    "bundle_manifest.json",
+    "expected_alerts.json",
+)
+_GOLDEN_ARTIFACT_ROLES = (
+    ("analysis_config", "analysis_config.json", "sfep-analysis-config/v1"),
+    ("producer_runtime", "producer_runtime.json", "sfep-producer-runtime/v1"),
+    (
+        "equipment_operating_ranges",
+        "equipment_operating_ranges.json",
+        "sfep-operating-ranges/v1",
+    ),
+    (
+        "quality_risk_intervals",
+        "quality_risk_intervals.json",
+        "sfep-quality-rules/v1",
+    ),
+    ("replay_events", "replay_events.csv", "sfep-replay-events/v1"),
+    ("analysis_summary", "analysis_summary.json", "sfep-analysis-summary/v1"),
+)
+_GOLDEN_EXPECTATION_LITERALS = {
+    "analysis_summary.template.json": (
+        383700,
+        "20acdfe66fc1167340c58f2ff91a00621725bace0b3b65832ab8629e51e04f1d",
+    ),
+    "criteria_projection.jsonl": (
+        79246,
+        "6842fabd1cc79ca801e34bb0708498f4bea16317d4449e6d773e28e40c94ff5c",
+    ),
+    "equipment_operating_ranges.template.json": (
+        106,
+        "77fa2a0665d6d5bf0cbd754b56a86c38b159cfa26abee6685fc910cf7e546581",
+    ),
+    "expected_alerts.json": (
+        1244,
+        "2c3bb6bc8e29fe077e71fd8f1b54efaa272ca31ae2676e87be8bcf549bc550ed",
+    ),
+    "quality_risk_intervals.template.json": (
+        260272,
+        "d47e7d8c230f31f56719056fc3a79505847863a51e686b1aac1aee9505143996",
+    ),
+    "replay_events.template.csv": (
+        47904,
+        "c516b9f8cebc2642b9c9b75a3bc12f1608df651522ccb2a65c2eb5c1424ce17c",
+    ),
+}
+_GOLDEN_SOURCE_LITERALS = {
+    "sts_1sm_cc_1.csv": (
+        1056,
+        "c3bba5c7235166b6693ff657a25797933ea9d83c6392437af9b5141f4e56a68c",
+    ),
+    "sts_2fur_hr_2.csv": (
+        1866,
+        "973e864ed996ca48c44a00943efc0ea51a878b94b8aac7452c7254a572fe7e67",
+    ),
+    "sts_3ap_3.csv": (
+        711,
+        "efaef9f283a28e63dff54b26bc3dd42c6a72e20f0b75d2fa13a6ab47f41405c9",
+    ),
+}
+_GOLDEN_SCHEMA_LITERALS = {
+    "analysis_config.schema.json": (
+        5073,
+        "fad28561dfe9d9fe3cd09b025bb18c2101be053cb094b08442ea45963b86f549",
+    ),
+    "analysis_summary.schema.json": (
+        40096,
+        "6cb6077cc7093b90e464cc794604ca6b7682002a138ebed051801aee29f9d374",
+    ),
+    "bundle_manifest.schema.json": (
+        5512,
+        "666e880d296c0d7e3df5af1aa80e6865922ebfb337fb9aca48f93eddfd89e8a5",
+    ),
+    "equipment_operating_ranges.schema.json": (
+        2545,
+        "bee7d8be181dae4844c51d4627c5a1f068583b60a60c854f17035a8291cd7d89",
+    ),
+    "producer_runtime.schema.json": (
+        2916,
+        "97131d80a993d09d17c2c040b0e1cb2bd0eed5948d7a11608f26331d18f557e6",
+    ),
+    "quality_risk_intervals.schema.json": (
+        5319,
+        "2c8775fec18671030cf58ea0e94a3c99f8dac075fa9d5fe8dce724c2462f42ad",
+    ),
+    "replay_event_row.schema.json": (
+        7865,
+        "309749f73cf2a5a522617f975128ac005298f2fd71412903d76263702c1b6bd6",
+    ),
+}
+_GOLDEN_ANALYSIS_CONFIG_LITERAL = (
+    13830,
+    "bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b",
+)
+_GOLDEN_RUNTIME_LITERAL = (
+    5537,
+    "3c1daabb3e868fc6cebc75023980fcb71d947996170de6d8e58cd06b18231407",
+)
+_GOLDEN_CRITERIA_ID = (
+    "sha256:8c88d3109bd6945b76317ee415c7821524f515c9bd79d36b8072c285c6434af7"
+)
+_GOLDEN_BUNDLE_ID = (
+    "sha256:4f40427690116f0defcbe609d9e5e1ef4025bb4193cdf099386659a26dd9f8bc"
+)
+_GOLDEN_OUTPUT_LITERALS = {
+    "analysis_config.json": (
+        13830,
+        "bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b",
+    ),
+    "analysis_summary.json": (
+        383818,
+        "aec581bca1e6b4eaed1ddae36c53cd3d5c70e2afb582589e1bc299dd2743876e",
+    ),
+    "bundle_manifest.json": (
+        3676,
+        "d717b150fcd7cf80065e2a71744091da387d38243f30d816f4cc83e63d605a33",
+    ),
+    "equipment_operating_ranges.json": (
+        164,
+        "bd8ab5dc79a1a7e97d64132dd3669befbe3fa28493a57eff5918818933526200",
+    ),
+    "expected_alerts.json": (
+        2032,
+        "bb1834b04cc847d52f1a5e2d9fa9268140dbbab4af86e69d310d1c1c1278e0ae",
+    ),
+    "producer_runtime.json": (
+        5537,
+        "3c1daabb3e868fc6cebc75023980fcb71d947996170de6d8e58cd06b18231407",
+    ),
+    "quality_risk_intervals.json": (
+        260330,
+        "3b0a85925ab1ae7b42d70989c32fad3ea3b881cf9647a6a13a72db3d42b7eb30",
+    ),
+    "replay_events.csv": (
+        59114,
+        "10b39aac41f317210074e42b44a0e1ab6f521b7c432647edf72be80a4e0fef8c",
+    ),
+}
+
+
+def _golden_digest(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _golden_id(version: str, fields: dict[str, str]) -> str:
+    lines = version + "\n" + "".join(
+        f"{key}={fields[key]}\n"
+        for key in sorted(fields, key=lambda item: item.encode("utf-8"))
+    )
+    return _golden_digest(lines.encode("utf-8"))
+
+
+def _golden_independent_oracle(
+    contract_root: Path = _GOLDEN_CONTRACT_ROOT,
+    analysis_config: Path = ANALYSIS_ROOT / "analysis_config.json",
+    runtime_manifest: Path = ANALYSIS_ROOT / "producer_runtime.json",
+) -> tuple[str, str, dict[str, str], dict[str, str], dict[str, bytes]]:
+    expectation = contract_root / "golden-expectation"
+    source = contract_root / "golden-source"
+    config_bytes = analysis_config.read_bytes()
+    runtime_bytes = runtime_manifest.read_bytes()
+    projection = (expectation / "criteria_projection.jsonl").read_bytes()
+    schema_bytes = {
+        name: (contract_root / name).read_bytes()
+        for name in _GOLDEN_SCHEMA_LITERALS
+    }
+    schema_digests = {
+        name: _golden_digest(payload) for name, payload in schema_bytes.items()
+    }
+    criteria_fields = {
+        "analysis_config_sha256": _golden_digest(config_bytes),
+        "as_of": "2025-02-20",
+        "criteria_projection_sha256": _golden_digest(projection),
+        "producer_runtime_sha256": _golden_digest(runtime_bytes),
+        "schema.analysis_config.sha256": schema_digests[
+            "analysis_config.schema.json"
+        ],
+        "schema.equipment_operating_ranges.sha256": schema_digests[
+            "equipment_operating_ranges.schema.json"
+        ],
+        "schema.producer_runtime.sha256": schema_digests[
+            "producer_runtime.schema.json"
+        ],
+        "schema.quality_risk_intervals.sha256": schema_digests[
+            "quality_risk_intervals.schema.json"
+        ],
+    }
+    criteria_id = _golden_id("sfep-criteria-id/v1", criteria_fields)
+    source_specs = (
+        ("sm_cc", "sts_1sm_cc_1.csv"),
+        ("fur_hr", "sts_2fur_hr_2.csv"),
+        ("ap", "sts_3ap_3.csv"),
+    )
+    bundle_fields = {
+        "analysis_config_sha256": _golden_digest(config_bytes),
+        "criteria_id": criteria_id,
+        "producer_runtime_sha256": _golden_digest(runtime_bytes),
+    }
+    for role, name in source_specs:
+        payload = (source / name).read_bytes()
+        bundle_fields[f"source.{role}.name"] = name
+        bundle_fields[f"source.{role}.sha256"] = _golden_digest(payload)
+        bundle_fields[f"source.{role}.size_bytes"] = str(len(payload))
+    for role, name in (
+        ("analysis_config", "analysis_config.schema.json"),
+        ("analysis_summary", "analysis_summary.schema.json"),
+        ("bundle_manifest", "bundle_manifest.schema.json"),
+        ("equipment_operating_ranges", "equipment_operating_ranges.schema.json"),
+        ("producer_runtime", "producer_runtime.schema.json"),
+        ("quality_risk_intervals", "quality_risk_intervals.schema.json"),
+        ("replay_events", "replay_event_row.schema.json"),
+    ):
+        bundle_fields[f"schema.{role}.sha256"] = schema_digests[name]
+    bundle_id = _golden_id("sfep-bundle-id/v1", bundle_fields)
+
+    outputs = {
+        "analysis_config.json": config_bytes,
+        "producer_runtime.json": runtime_bytes,
+        "equipment_operating_ranges.json": (
+            expectation / "equipment_operating_ranges.template.json"
+        ).read_bytes().replace(b"@CRITERIA_ID@", criteria_id.encode("ascii")),
+        "quality_risk_intervals.json": (
+            expectation / "quality_risk_intervals.template.json"
+        ).read_bytes().replace(b"@CRITERIA_ID@", criteria_id.encode("ascii")),
+        "replay_events.csv": (
+            expectation / "replay_events.template.csv"
+        ).read_bytes().replace(b"@BUNDLE_ID@", bundle_id.encode("ascii")).replace(
+            b"@CRITERIA_ID@", criteria_id.encode("ascii")
+        ),
+        "analysis_summary.json": (
+            expectation / "analysis_summary.template.json"
+        ).read_bytes().replace(b"@BUNDLE_ID@", bundle_id.encode("ascii")).replace(
+            b"@CRITERIA_ID@", criteria_id.encode("ascii")
+        ),
+    }
+    artifact_metadata = [
+        {
+            "role": role,
+            "schemaVersion": schema_version,
+            "sha256": _golden_digest(outputs[name]),
+            "sizeBytes": len(outputs[name]),
+        }
+        for role, name, schema_version in _GOLDEN_ARTIFACT_ROLES
+    ]
+    manifest = {
+        "artifacts": artifact_metadata,
+        "asOf": "2025-02-20",
+        "bundleId": bundle_id,
+        "criteriaId": criteria_id,
+        "criteriaIdentity": criteria_fields,
+        "identity": bundle_fields,
+        "labelMaturityDays": 38,
+        "schemaVersion": "sfep-equipment-bundle/v1",
+        "timezone": "Asia/Seoul",
+    }
+    outputs["bundle_manifest.json"] = _canonical_json_bytes(manifest)
+    token_values = {
+        "ARTIFACT_ANALYSIS_CONFIG_SHA256": _golden_digest(
+            outputs["analysis_config.json"]
+        ),
+        "ARTIFACT_ANALYSIS_SUMMARY_SHA256": _golden_digest(
+            outputs["analysis_summary.json"]
+        ),
+        "ARTIFACT_EQUIPMENT_OPERATING_RANGES_SHA256": _golden_digest(
+            outputs["equipment_operating_ranges.json"]
+        ),
+        "ARTIFACT_PRODUCER_RUNTIME_SHA256": _golden_digest(
+            outputs["producer_runtime.json"]
+        ),
+        "ARTIFACT_QUALITY_RISK_INTERVALS_SHA256": _golden_digest(
+            outputs["quality_risk_intervals.json"]
+        ),
+        "ARTIFACT_REPLAY_EVENTS_SHA256": _golden_digest(
+            outputs["replay_events.csv"]
+        ),
+        "BUNDLE_ID": bundle_id,
+        "CRITERIA_ID": criteria_id,
+        "PRODUCER_RUNTIME_SHA256": _golden_digest(runtime_bytes),
+        "SCHEMA_ANALYSIS_CONFIG_SHA256": schema_digests[
+            "analysis_config.schema.json"
+        ],
+        "SCHEMA_ANALYSIS_SUMMARY_SHA256": schema_digests[
+            "analysis_summary.schema.json"
+        ],
+        "SCHEMA_BUNDLE_MANIFEST_SHA256": schema_digests[
+            "bundle_manifest.schema.json"
+        ],
+        "SCHEMA_EQUIPMENT_OPERATING_RANGES_SHA256": schema_digests[
+            "equipment_operating_ranges.schema.json"
+        ],
+        "SCHEMA_PRODUCER_RUNTIME_SHA256": schema_digests[
+            "producer_runtime.schema.json"
+        ],
+        "SCHEMA_QUALITY_RISK_INTERVALS_SHA256": schema_digests[
+            "quality_risk_intervals.schema.json"
+        ],
+        "SCHEMA_REPLAY_EVENTS_SHA256": schema_digests[
+            "replay_event_row.schema.json"
+        ],
+        "SOURCE_AP_SHA256": _golden_digest(
+            (source / "sts_3ap_3.csv").read_bytes()
+        ),
+        "SOURCE_FUR_HR_SHA256": _golden_digest(
+            (source / "sts_2fur_hr_2.csv").read_bytes()
+        ),
+        "SOURCE_SM_CC_SHA256": _golden_digest(
+            (source / "sts_1sm_cc_1.csv").read_bytes()
+        ),
+    }
+    alerts = (expectation / "expected_alerts.json").read_bytes()
+    for token, value in token_values.items():
+        alerts = alerts.replace(f"@{token}@".encode("ascii"), value.encode("ascii"))
+    outputs["expected_alerts.json"] = alerts
+    return criteria_id, bundle_id, criteria_fields, bundle_fields, outputs
+
+
+def _copy_golden_seal_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    root = tmp_path / "contract-v1"
+    root.mkdir()
+    shutil.copytree(
+        _GOLDEN_CONTRACT_ROOT / "golden-expectation",
+        root / "golden-expectation",
+    )
+    shutil.copytree(
+        _GOLDEN_CONTRACT_ROOT / "golden-source",
+        root / "golden-source",
+    )
+    for name in _GOLDEN_SCHEMA_LITERALS:
+        shutil.copy2(_GOLDEN_CONTRACT_ROOT / name, root / name)
+    config = tmp_path / "analysis_config.json"
+    runtime = tmp_path / "producer_runtime.json"
+    shutil.copy2(ANALYSIS_ROOT / "analysis_config.json", config)
+    shutil.copy2(ANALYSIS_ROOT / "producer_runtime.json", runtime)
+    return root, config, runtime, tmp_path / "golden-bundle"
+
+
+def _run_golden_seal(
+    root: Path,
+    config: Path,
+    runtime: Path,
+    output: Path,
+    *extra: str,
+) -> subprocess.CompletedProcess[str]:
+    return _run_tool(
+        "seal_golden_bundle.py",
+        "--contract-root",
+        str(root),
+        "--analysis-config",
+        str(config),
+        "--runtime-manifest",
+        str(runtime),
+        "--output-dir",
+        str(output),
+        *extra,
+    )
+
+
+def test_golden_bundle_independent_oracle_freezes_ids_outputs_and_inputs() -> None:
+    criteria_id, bundle_id, criteria_fields, bundle_fields, outputs = (
+        _golden_independent_oracle()
+    )
+
+    assert criteria_id == _GOLDEN_CRITERIA_ID
+    assert bundle_id == _GOLDEN_BUNDLE_ID
+    assert len(criteria_fields) == 8
+    assert len(bundle_fields) == 19
+    assert {
+        name: (len(payload), hashlib.sha256(payload).hexdigest())
+        for name, payload in outputs.items()
+    } == _GOLDEN_OUTPUT_LITERALS
+    for root, literals in (
+        (_GOLDEN_CONTRACT_ROOT / "golden-expectation", _GOLDEN_EXPECTATION_LITERALS),
+        (_GOLDEN_CONTRACT_ROOT / "golden-source", _GOLDEN_SOURCE_LITERALS),
+        (_GOLDEN_CONTRACT_ROOT, _GOLDEN_SCHEMA_LITERALS),
+    ):
+        assert {
+            name: (len((root / name).read_bytes()), hashlib.sha256((root / name).read_bytes()).hexdigest())
+            for name in literals
+        } == literals
+    assert (
+        len((ANALYSIS_ROOT / "analysis_config.json").read_bytes()),
+        hashlib.sha256((ANALYSIS_ROOT / "analysis_config.json").read_bytes()).hexdigest(),
+    ) == _GOLDEN_ANALYSIS_CONFIG_LITERAL
+    assert (
+        len((ANALYSIS_ROOT / "producer_runtime.json").read_bytes()),
+        hashlib.sha256((ANALYSIS_ROOT / "producer_runtime.json").read_bytes()).hexdigest(),
+    ) == _GOLDEN_RUNTIME_LITERAL
+
+
+def test_checked_in_golden_bundle_is_the_exact_independent_seal() -> None:
+    output_root = _GOLDEN_CONTRACT_ROOT / "golden-bundle"
+    _criteria_id, _bundle_id, _criteria_fields, _bundle_fields, expected = (
+        _golden_independent_oracle()
+    )
+
+    assert {path.name for path in output_root.iterdir()} == set(_GOLDEN_OUTPUT_NAMES)
+    assert {
+        name: (output_root / name).read_bytes() for name in _GOLDEN_OUTPUT_NAMES
+    } == expected
+    assert {
+        name: (
+            len((output_root / name).read_bytes()),
+            hashlib.sha256((output_root / name).read_bytes()).hexdigest(),
+        )
+        for name in _GOLDEN_OUTPUT_NAMES
+    } == _GOLDEN_OUTPUT_LITERALS
+
+
+def test_reviewed_templates_freeze_exact_token_names_and_occurrences() -> None:
+    expectation = _GOLDEN_CONTRACT_ROOT / "golden-expectation"
+    expected_counts = {
+        "criteria_projection.jsonl": {},
+        "equipment_operating_ranges.template.json": {"CRITERIA_ID": 1},
+        "quality_risk_intervals.template.json": {"CRITERIA_ID": 1},
+        "replay_events.template.csv": {"BUNDLE_ID": 95, "CRITERIA_ID": 95},
+        "analysis_summary.template.json": {"BUNDLE_ID": 1, "CRITERIA_ID": 1},
+        "expected_alerts.json": {
+            name: 1
+            for name in (
+                "ARTIFACT_ANALYSIS_CONFIG_SHA256",
+                "ARTIFACT_ANALYSIS_SUMMARY_SHA256",
+                "ARTIFACT_EQUIPMENT_OPERATING_RANGES_SHA256",
+                "ARTIFACT_PRODUCER_RUNTIME_SHA256",
+                "ARTIFACT_QUALITY_RISK_INTERVALS_SHA256",
+                "ARTIFACT_REPLAY_EVENTS_SHA256",
+                "BUNDLE_ID",
+                "CRITERIA_ID",
+                "PRODUCER_RUNTIME_SHA256",
+                "SCHEMA_ANALYSIS_CONFIG_SHA256",
+                "SCHEMA_ANALYSIS_SUMMARY_SHA256",
+                "SCHEMA_BUNDLE_MANIFEST_SHA256",
+                "SCHEMA_EQUIPMENT_OPERATING_RANGES_SHA256",
+                "SCHEMA_PRODUCER_RUNTIME_SHA256",
+                "SCHEMA_QUALITY_RISK_INTERVALS_SHA256",
+                "SCHEMA_REPLAY_EVENTS_SHA256",
+                "SOURCE_AP_SHA256",
+                "SOURCE_FUR_HR_SHA256",
+                "SOURCE_SM_CC_SHA256",
+            )
+        },
+    }
+
+    for name, expected in expected_counts.items():
+        tokens = [
+            match.group(1).decode("ascii")
+            for match in re.finditer(
+                rb"@([A-Z0-9_]+)@", (expectation / name).read_bytes()
+            )
+        ]
+        actual = {token: tokens.count(token) for token in set(tokens)}
+        assert actual == expected
+
+
+def test_golden_bundle_seal_cli_is_exact_stdlib_and_producer_independent() -> None:
+    source = _GOLDEN_SEAL_TOOL.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = {
+        alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "equipment_quality" not in source
+    assert imports <= set(sys.stdlib_module_names) | {"__future__"}
+    assert "allow_abbrev=False" in source
+
+
+def test_golden_bundle_seal_matches_independent_oracle_and_reuses(
+    tmp_path: Path,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    _criteria_id, bundle_id, _criteria_fields, _bundle_fields, expected = (
+        _golden_independent_oracle(root, config, runtime)
+    )
+
+    first = _run_golden_seal(root, config, runtime, output)
+    second = _run_golden_seal(root, config, runtime, output)
+
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == f"created {bundle_id}\n"
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == f"reused {bundle_id}\n"
+    assert second.stderr == ""
+    assert tuple(sorted(path.name for path in output.iterdir())) == tuple(
+        sorted(_GOLDEN_OUTPUT_NAMES)
+    )
+    assert {name: (output / name).read_bytes() for name in _GOLDEN_OUTPUT_NAMES} == expected
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE((output / name).stat().st_mode) == 0o600 for name in _GOLDEN_OUTPUT_NAMES)
+
+
+def test_golden_bundle_seal_outputs_are_structural_and_reversible(
+    tmp_path: Path,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    criteria_id, bundle_id, criteria_fields, bundle_fields, expected = (
+        _golden_independent_oracle(root, config, runtime)
+    )
+    result = _run_golden_seal(root, config, runtime, output)
+    assert result.returncode == 0, result.stderr
+
+    for name in (
+        "analysis_config.json",
+        "producer_runtime.json",
+        "equipment_operating_ranges.json",
+        "quality_risk_intervals.json",
+        "analysis_summary.json",
+        "bundle_manifest.json",
+        "expected_alerts.json",
+    ):
+        payload = expected[name]
+        assert isinstance(json.loads(payload), dict)
+        assert payload.startswith(b"{") and payload.endswith(b"}\n")
+        assert b"\r" not in payload and b"\n" not in payload[:-1]
+        assert not re.search(rb"@[A-Z0-9_]+@", payload)
+    for name in (
+        "producer_runtime.json",
+        "equipment_operating_ranges.json",
+        "bundle_manifest.json",
+        "expected_alerts.json",
+    ):
+        assert expected[name] == _canonical_json_bytes(json.loads(expected[name]))
+    replay = expected["replay_events.csv"].decode("utf-8")
+    rows = list(csv.DictReader(io.StringIO(replay, newline="")))
+    assert len(rows) == 95
+    assert {row["bundle_id"] for row in rows} == {bundle_id}
+    assert {row["criteria_id"] for row in rows} == {criteria_id}
+    alerts = json.loads(expected["expected_alerts.json"])
+    assert alerts["alerts"] == []
+    assert alerts["expectedReplayEventCount"] == 95
+    manifest = json.loads(expected["bundle_manifest.json"])
+    assert manifest["criteriaIdentity"] == criteria_fields
+    assert manifest["identity"] == bundle_fields
+    assert manifest["artifacts"] == [
+        {
+            "role": role,
+            "schemaVersion": version,
+            "sha256": _golden_digest(expected[name]),
+            "sizeBytes": len(expected[name]),
+        }
+        for role, name, version in _GOLDEN_ARTIFACT_ROLES
+    ]
+
+    expectation = root / "golden-expectation"
+    reverse_specs = {
+        "equipment_operating_ranges.json": (
+            "equipment_operating_ranges.template.json",
+            ((criteria_id, "@CRITERIA_ID@"),),
+        ),
+        "quality_risk_intervals.json": (
+            "quality_risk_intervals.template.json",
+            ((criteria_id, "@CRITERIA_ID@"),),
+        ),
+        "replay_events.csv": (
+            "replay_events.template.csv",
+            ((bundle_id, "@BUNDLE_ID@"), (criteria_id, "@CRITERIA_ID@")),
+        ),
+        "analysis_summary.json": (
+            "analysis_summary.template.json",
+            ((bundle_id, "@BUNDLE_ID@"), (criteria_id, "@CRITERIA_ID@")),
+        ),
+    }
+    for output_name, (template_name, substitutions) in reverse_specs.items():
+        recovered = expected[output_name]
+        for value, token in substitutions:
+            recovered = recovered.replace(value.encode("ascii"), token.encode("ascii"))
+        assert recovered == (expectation / template_name).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("group", "name"),
+    [
+        *(("expectation", name) for name in _GOLDEN_EXPECTATION_LITERALS),
+        *(("source", name) for name in _GOLDEN_SOURCE_LITERALS),
+        *(("schema", name) for name in _GOLDEN_SCHEMA_LITERALS),
+        ("config", "analysis_config.json"),
+        ("runtime", "producer_runtime.json"),
+    ],
+)
+def test_golden_bundle_seal_rejects_every_pinned_input_drift(
+    tmp_path: Path,
+    group: str,
+    name: str,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    targets = {
+        "expectation": root / "golden-expectation" / name,
+        "source": root / "golden-source" / name,
+        "schema": root / name,
+        "config": config,
+        "runtime": runtime,
+    }
+    target = targets[group]
+    target.write_bytes(target.read_bytes() + b"X")
+
+    result = _run_golden_seal(root, config, runtime, output)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert re.search("size|sha256|pinned|authenticated", result.stderr, re.I)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("group", ["golden-expectation", "golden-source"])
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_golden_bundle_seal_rejects_semantic_inventory_drift(
+    tmp_path: Path,
+    group: str,
+    change: str,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    directory = root / group
+    if change == "missing":
+        next(path for path in directory.iterdir() if path.is_file()).unlink()
+    else:
+        (directory / "unreviewed.txt").write_bytes(b"extra\n")
+
+    result = _run_golden_seal(root, config, runtime, output)
+
+    assert result.returncode == 2
+    assert "inventory" in result.stderr.lower()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("template_name", "mutation"),
+    [
+        ("equipment_operating_ranges.template.json", "unknown"),
+        ("equipment_operating_ranges.template.json", "missing"),
+        ("equipment_operating_ranges.template.json", "duplicate"),
+        ("replay_events.template.csv", "unknown"),
+        ("expected_alerts.json", "missing"),
+        ("expected_alerts.json", "duplicate"),
+    ],
+)
+def test_golden_bundle_seal_rejects_token_boundary_mutations(
+    tmp_path: Path,
+    template_name: str,
+    mutation: str,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    target = root / "golden-expectation" / template_name
+    payload = target.read_bytes()
+    tokens = re.findall(rb"@[A-Z0-9_]+@", payload)
+    assert tokens
+    if mutation == "unknown":
+        payload = payload.replace(tokens[0], b"@UNREVIEWED_TOKEN@", 1)
+    elif mutation == "missing":
+        payload = payload.replace(tokens[0], b"", 1)
+    else:
+        payload = payload + tokens[0]
+    target.write_bytes(payload)
+
+    result = _run_golden_seal(root, config, runtime, output)
+
+    assert result.returncode == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "argument_index",
+    [1, 3, 5, 7],
+)
+def test_golden_bundle_seal_rejects_relative_and_control_paths(
+    tmp_path: Path,
+    argument_index: int,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    arguments = [
+        "--contract-root", str(root),
+        "--analysis-config", str(config),
+        "--runtime-manifest", str(runtime),
+        "--output-dir", str(output),
+    ]
+    arguments[argument_index] = "relative\npath"
+    result = _run_tool("seal_golden_bundle.py", *arguments, cwd=tmp_path)
+    assert result.returncode == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("exact", "abbreviation"),
+    [
+        ("--contract-root", "--contract"),
+        ("--analysis-config", "--analysis"),
+        ("--runtime-manifest", "--runtime"),
+        ("--output-dir", "--output"),
+    ],
+)
+def test_golden_bundle_seal_rejects_flag_abbreviations(
+    tmp_path: Path,
+    exact: str,
+    abbreviation: str,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    arguments = [
+        "--contract-root", str(root),
+        "--analysis-config", str(config),
+        "--runtime-manifest", str(runtime),
+        "--output-dir", str(output),
+    ]
+    arguments[arguments.index(exact)] = abbreviation
+    result = _run_tool("seal_golden_bundle.py", *arguments)
+    assert result.returncode == 2
+    assert not output.exists()
+
+
+def test_golden_bundle_seal_rejects_collision_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    output.mkdir()
+    sentinel = output / "external.txt"
+    sentinel.write_bytes(b"external\n")
+
+    result = _run_golden_seal(root, config, runtime, output)
+
+    assert result.returncode == 2
+    assert sentinel.read_bytes() == b"external\n"
+    assert {path.name for path in output.iterdir()} == {"external.txt"}
+
+
+def test_golden_bundle_seal_is_umask_independent(tmp_path: Path) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    old_umask = os.umask(0o777)
+    try:
+        result = _run_golden_seal(root, config, runtime, output)
+    finally:
+        os.umask(old_umask)
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert {
+        stat.S_IMODE((output / name).stat().st_mode) for name in _GOLDEN_OUTPUT_NAMES
+    } == {0o600}
+
+
+def _golden_seal_namespace() -> dict[str, object]:
+    return runpy.run_path(str(_GOLDEN_SEAL_TOOL), run_name="golden_seal_test")
+
+
+@pytest.mark.parametrize("alias_role", ["contract", "config", "runtime", "output-parent"])
+def test_golden_bundle_seal_rejects_symlink_components(
+    tmp_path: Path,
+    alias_role: str,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    if alias_role == "contract":
+        alias = tmp_path / "contract-alias"
+        alias.symlink_to(root, target_is_directory=True)
+        root = alias
+    elif alias_role == "config":
+        alias = tmp_path / "config-alias.json"
+        alias.symlink_to(config)
+        config = alias
+    elif alias_role == "runtime":
+        alias = tmp_path / "runtime-alias.json"
+        alias.symlink_to(runtime)
+        runtime = alias
+    else:
+        physical = tmp_path / "physical-output-parent"
+        physical.mkdir()
+        alias = tmp_path / "output-parent-alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        output = alias / "golden-bundle"
+
+    result = _run_golden_seal(root, config, runtime, output)
+
+    assert result.returncode == 2
+    assert "symlink" in result.stderr.lower()
+    assert not output.exists()
+
+
+def test_golden_bundle_seal_rejects_special_input_without_blocking(
+    tmp_path: Path,
+) -> None:
+    root, _config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    fifo = tmp_path / "analysis-config.fifo"
+    os.mkfifo(fifo)
+    command = [
+        sys.executable,
+        str(_GOLDEN_SEAL_TOOL),
+        "--contract-root",
+        str(root),
+        "--analysis-config",
+        str(fifo),
+        "--runtime-manifest",
+        str(runtime),
+        "--output-dir",
+        str(output),
+    ]
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 2
+    assert "regular" in result.stderr.lower()
+    assert not output.exists()
+
+
+def test_golden_bundle_seal_reauthenticates_all_inputs_at_commit_point(
+    tmp_path: Path,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_run"].__globals__
+    original_capture = function_globals["_capture_inputs"]
+    calls = 0
+
+    def capture_then_mutate(*arguments: object) -> object:
+        nonlocal calls
+        calls += 1
+        captured = original_capture(*arguments)
+        if calls == 1:
+            target = root / "golden-expectation/criteria_projection.jsonl"
+            target.write_bytes(target.read_bytes() + b"changed\n")
+        return captured
+
+    function_globals["_capture_inputs"] = capture_then_mutate
+
+    with pytest.raises(namespace["GoldenSealError"], match="pinned|changed|authenticated"):
+        namespace["_run"](root, config, runtime, output)
+
+    assert calls == 2
+    assert not output.exists()
+    assert list(tmp_path.glob(".sfep-golden-bundle-*"))
+
+
+def test_golden_bundle_publication_fault_leaves_only_unclaimed_scratch(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_publish_bundle"].__globals__
+    output = tmp_path / "golden-bundle"
+    expected = _golden_independent_oracle()[-1]
+    original_write = function_globals["_write_file"]
+    calls = 0
+
+    def fail_second_write(
+        path: Path,
+        payload: bytes,
+        *arguments: object,
+        **keywords: object,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise namespace["GoldenSealError"]("injected publication fault")
+        original_write(path, payload, *arguments, **keywords)
+
+    function_globals["_write_file"] = fail_second_write
+
+    with pytest.raises(namespace["GoldenSealError"], match="injected"):
+        namespace["_publish_bundle"](output, expected, lambda: None)
+
+    assert not output.exists()
+    scratch = list(tmp_path.glob(".sfep-golden-bundle-*"))
+    assert len(scratch) == 1
+    assert scratch[0].is_dir()
+
+
+def test_golden_bundle_publication_race_never_deletes_competing_target(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_publish_bundle"].__globals__
+    output = tmp_path / "golden-bundle"
+    expected = _golden_independent_oracle()[-1]
+    sentinel = b"external winner\n"
+
+    def competing_install(*_arguments: object) -> None:
+        output.mkdir()
+        (output / "external.txt").write_bytes(sentinel)
+        raise OSError(17, "File exists", str(output))
+
+    function_globals["_atomic_install_exclusive"] = competing_install
+
+    with pytest.raises(
+        namespace["GoldenSealError"], match="inventory|differs|atomic|unclaimed"
+    ):
+        namespace["_publish_bundle"](output, expected, lambda: None)
+
+    assert (output / "external.txt").read_bytes() == sentinel
+    assert {path.name for path in output.iterdir()} == {"external.txt"}
+    assert list(tmp_path.glob(".sfep-golden-bundle-*"))
+
+
+def test_golden_bundle_publication_never_uses_pathname_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_publish_bundle"].__globals__
+    output = tmp_path / "golden-bundle"
+    expected = _golden_independent_oracle()[-1]
+
+    def forbidden_unlink(*_arguments: object, **_keywords: object) -> None:
+        raise AssertionError("pathname deletion is forbidden")
+
+    monkeypatch.setattr(function_globals["os"], "unlink", forbidden_unlink)
+
+    assert namespace["_publish_bundle"](output, expected, lambda: None) == "created"
+    assert {path.name for path in output.iterdir()} == set(_GOLDEN_OUTPUT_NAMES)
+
+
+def test_golden_bundle_publication_rejects_scratch_inode_replacement_before_write(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_publish_bundle"].__globals__
+    output = tmp_path / "golden-bundle"
+    expected = _golden_independent_oracle()[-1]
+    external = tmp_path / "external-directory"
+    external.mkdir()
+    external_inode = external.stat().st_ino
+    original_write = function_globals["_write_file"]
+    replaced_path: Path | None = None
+
+    def replace_before_first_write(
+        path: Path,
+        payload: bytes,
+        *arguments: object,
+        **keywords: object,
+    ) -> None:
+        nonlocal replaced_path
+        if replaced_path is None:
+            scratch = path.parent
+            displaced = tmp_path / "displaced-owned-scratch"
+            scratch.rename(displaced)
+            external.rename(scratch)
+            replaced_path = scratch
+        original_write(path, payload, *arguments, **keywords)
+
+    function_globals["_write_file"] = replace_before_first_write
+
+    with pytest.raises(namespace["GoldenSealError"], match="scratch|identity|replaced"):
+        namespace["_publish_bundle"](output, expected, lambda: None)
+
+    assert not output.exists()
+    assert replaced_path is not None
+    assert replaced_path.is_dir()
+    assert replaced_path.stat().st_ino == external_inode
+
+
+def test_golden_bundle_final_capture_jointly_rechecks_an_already_read_input(
+    tmp_path: Path,
+) -> None:
+    root, config, runtime, output = _copy_golden_seal_inputs(tmp_path)
+    namespace = _golden_seal_namespace()
+    function_globals = namespace["_run"].__globals__
+    original_capture = function_globals["_capture_inputs"]
+    original_read = function_globals["_read_regular"]
+    capture_calls = 0
+    final_capture_active = False
+    mutated = False
+
+    def capture_with_phase(*arguments: object) -> object:
+        nonlocal capture_calls, final_capture_active
+        capture_calls += 1
+        final_capture_active = capture_calls == 2
+        try:
+            return original_capture(*arguments)
+        finally:
+            final_capture_active = False
+
+    def mutate_after_read(path: Path, label: str) -> object:
+        nonlocal mutated
+        captured = original_read(path, label)
+        if final_capture_active and label == "analysis config" and not mutated:
+            config.write_bytes(config.read_bytes() + b"changed-after-read\n")
+            mutated = True
+        return captured
+
+    function_globals["_capture_inputs"] = capture_with_phase
+    function_globals["_read_regular"] = mutate_after_read
+
+    with pytest.raises(namespace["GoldenSealError"], match="pinned|changed|joint|authenticated"):
+        namespace["_run"](root, config, runtime, output)
+
+    assert mutated
+    assert capture_calls == 2
+    assert not output.exists()
