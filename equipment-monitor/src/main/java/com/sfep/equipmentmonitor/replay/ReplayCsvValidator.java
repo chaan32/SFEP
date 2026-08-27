@@ -166,7 +166,7 @@ public final class ReplayCsvValidator {
         return new ReplayMetadata(count, firstEvent, lastEvent);
     }
 
-    private static ObjectNode rowNode(CSVRecord record) {
+    static ObjectNode rowNode(CSVRecord record) {
         ObjectNode row = JsonNodeFactory.instance.objectNode();
         row.put("schema_version", record.get(0));
         row.put("bundle_id", record.get(1));
@@ -211,7 +211,7 @@ public final class ReplayCsvValidator {
         }
     }
 
-    private static ReplayEvent bind(JsonNode row) {
+    static ReplayEvent bind(JsonNode row) {
         return new ReplayEvent(
                 text(row, "schema_version"),
                 text(row, "bundle_id"),

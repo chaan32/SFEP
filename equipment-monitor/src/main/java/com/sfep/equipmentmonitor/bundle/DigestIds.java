@@ -32,6 +32,15 @@ public final class DigestIds {
         }
     }
 
+    /** SHA-256 of canonical object JSON without an ID namespace wrapper. */
+    public static String canonicalSha256Uri(JsonNode object) {
+        return Digests.sha256Uri(canonicalJsonBytes(object));
+    }
+
+    public static byte[] canonicalJsonBytes(JsonNode object) {
+        return CanonicalJson.encodeObject(object);
+    }
+
     private static JsonNode canonicalize(JsonNode node) {
         if (node.isObject()) {
             ObjectNode result = JsonNodeFactory.instance.objectNode();

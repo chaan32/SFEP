@@ -2,7 +2,9 @@ package com.sfep.equipmentmonitor.replay;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
-record ReplayEvent(
+import java.util.Objects;
+
+public record ReplayEvent(
         String schemaVersion,
         String bundleId,
         String criteriaId,
@@ -22,4 +24,26 @@ record ReplayEvent(
         String hrCoilId,
         String apProdId,
         JsonNode values) {
+    public ReplayEvent {
+        Objects.requireNonNull(schemaVersion, "schemaVersion");
+        Objects.requireNonNull(bundleId, "bundleId");
+        Objects.requireNonNull(criteriaId, "criteriaId");
+        Objects.requireNonNull(eventId, "eventId");
+        Objects.requireNonNull(replayDate, "replayDate");
+        Objects.requireNonNull(batchKind, "batchKind");
+        Objects.requireNonNull(batchId, "batchId");
+        Objects.requireNonNull(batchStep, "batchStep");
+        Objects.requireNonNull(timePrecision, "timePrecision");
+        Objects.requireNonNull(materialKey, "materialKey");
+        Objects.requireNonNull(equipmentType, "equipmentType");
+        Objects.requireNonNull(equipmentId, "equipmentId");
+        Objects.requireNonNull(chargeId, "chargeId");
+        Objects.requireNonNull(slabNo, "slabNo");
+        values = Objects.requireNonNull(values, "values").deepCopy();
+    }
+
+    @Override
+    public JsonNode values() {
+        return values.deepCopy();
+    }
 }
