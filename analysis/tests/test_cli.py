@@ -155,6 +155,72 @@ def test_cli_argument_errors_return_two_without_traceback(arguments, capsys) -> 
     assert captured.err.strip()
 
 
+@pytest.mark.parametrize(
+    ("exact_flag", "abbreviation"),
+    [
+        ("--config", "--conf"),
+        ("--runtime-manifest", "--runtime-m"),
+        ("--data-dir", "--data"),
+        ("--output-dir", "--output"),
+    ],
+)
+def test_cli_rejects_every_undocumented_long_flag_prefix_before_pipeline(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    exact_flag,
+    abbreviation,
+) -> None:
+    """Argparse abbreviation must not silently expand the reviewed CLI surface."""
+    paths = _valid_path_arguments(tmp_path)
+    arguments = _argv(paths)
+    arguments[arguments.index(exact_flag)] = abbreviation
+    pipeline_calls: list[tuple[object, ...]] = []
+
+    def forbidden_pipeline(*args):
+        pipeline_calls.append(args)
+        return paths["output"] / "unexpected-bundle"
+
+    monkeypatch.setattr(cli, "run_analysis", forbidden_pipeline)
+
+    code = cli.main(arguments)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert pipeline_calls == []
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert captured.err.strip()
+    _assert_output_unpublished(paths["output"])
+
+
+def test_cli_exact_long_flags_still_invoke_pipeline_once(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Disabling abbreviations must preserve the four exact public long flags."""
+    paths = _valid_path_arguments(tmp_path)
+    final = paths["output"] / ("sha256:" + "a" * 64)
+    pipeline_calls: list[tuple[object, ...]] = []
+
+    def pipeline(*args):
+        pipeline_calls.append(args)
+        return final
+
+    monkeypatch.setattr(cli, "run_analysis", pipeline)
+
+    code = cli.main(_argv(paths))
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert pipeline_calls == [
+        (paths["config"], paths["runtime"], paths["data"], paths["output"])
+    ]
+    assert captured.out == f"{final}\n"
+    assert captured.err == ""
+
+
 def test_cli_rejects_all_relative_paths_before_side_effects(tmp_path, capsys) -> None:
     """Accepting a relative path would make bundle inputs depend on the cwd."""
     output = tmp_path / "out"
@@ -192,6 +258,68 @@ def test_cli_treats_embedded_nul_as_a_path_shape_error(tmp_path, capsys) -> None
     assert "config" in captured.err.lower()
     assert "Traceback" not in captured.err
     _assert_output_unpublished(paths["output"])
+
+
+@pytest.mark.parametrize(
+    "invalid_component",
+    ["\0invalid", "\ud800invalid", ".."],
+    ids=["embedded-nul", "unencodable-surrogate", "parent-segment"],
+)
+def test_cli_lexically_rejects_invalid_missing_output_suffix_before_content(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    invalid_component,
+) -> None:
+    """A missing ancestor must not hide malformed components later in output path."""
+    paths = _valid_path_arguments(tmp_path)
+    missing_ancestor = tmp_path / "absent-output-ancestor"
+    paths["output"] = missing_ancestor / invalid_component / "bundle-output"
+    content_calls: list[Path] = []
+
+    def forbidden_runtime(path):
+        content_calls.append(path)
+        raise AssertionError("runtime verification ran before output syntax validation")
+
+    monkeypatch.setattr(cli, "verify_runtime", forbidden_runtime)
+
+    code = cli.main(_argv(paths))
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert content_calls == []
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert "output" in captured.err.lower()
+    assert not missing_ancestor.exists()
+
+
+def test_output_preflight_never_lstats_below_first_valid_missing_ancestor(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Lexical suffix validation must not probe filesystem children that cannot exist."""
+    paths = _valid_path_arguments(tmp_path)
+    missing_ancestor = tmp_path / "valid-missing-ancestor"
+    paths["output"] = missing_ancestor / "nested" / "bundle-output"
+    _install_stubbed_pipeline(monkeypatch, paths["output"])
+    original_lstat = cli.os.lstat
+    inspected: list[Path] = []
+
+    def recording_lstat(path):
+        inspected.append(Path(path))
+        return original_lstat(path)
+
+    monkeypatch.setattr(cli.os, "lstat", recording_lstat)
+
+    final = cli.run_analysis(
+        paths["config"], paths["runtime"], paths["data"], paths["output"]
+    )
+
+    assert final == paths["output"] / "bundle-id"
+    assert missing_ancestor in inspected
+    assert missing_ancestor / "nested" not in inspected
+    assert paths["output"] not in inspected
 
 
 @pytest.mark.parametrize("relative_role", ["config", "runtime", "data", "output"])

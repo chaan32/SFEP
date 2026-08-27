@@ -66,6 +66,13 @@ def _path(path: Path, label: str) -> Path:
         raise _PathShapeError(f"{label} path is invalid") from error
     if not candidate.is_absolute():
         raise _PathShapeError(f"{label} path must be absolute")
+    raw_path = os.fspath(candidate)
+    if "\0" in raw_path:
+        raise _PathShapeError(f"{label} path is invalid")
+    try:
+        os.fsencode(raw_path)
+    except UnicodeError as error:
+        raise _PathShapeError(f"{label} path is invalid") from error
     if ".." in candidate.parts:
         raise _PathShapeError(f"{label} path must not contain '..'")
     return candidate
@@ -135,6 +142,7 @@ def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(
         prog="sfep-equipment-quality",
         description="Publish one authenticated equipment-quality Bundle.",
+        allow_abbrev=False,
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--runtime-manifest", required=True, type=Path)
