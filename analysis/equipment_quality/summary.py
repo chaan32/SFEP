@@ -933,6 +933,8 @@ def _range_lineage(
                 *quantile_dependencies,
             },
         }
+        if not context:
+            trace["ranges[].context"] = set(group_dependencies)
         for name in context:
             path = "ranges[].context." + str(name)
             trace[path] = {
@@ -1270,6 +1272,13 @@ def _concrete_quality_lineage(
                 if split_name == "discovery"
                 else "config.qualityRisk.minimumConfirmationDefects"
             )
+            bootstrap_seed_dependencies = {
+                "config.bootstrap.minimumValidReplicates",
+                "config.bootstrap.replicates",
+                "identity.criteria_id",
+                "quality_risk_intervals.rules[].ruleId",
+                "replay_events.charge_id",
+            }
             support_dependencies = set(population_dependencies)
             if executed:
                 if (
@@ -1314,6 +1323,11 @@ def _concrete_quality_lineage(
                         *context_axes,
                     }
                 )
+            if (
+                split_name == "discovery"
+                and metric["reasonCode"] == "TOO_FEW_VALID_BOOTSTRAPS"
+            ):
+                reason_dependencies.update(bootstrap_seed_dependencies)
             record("rules[]." + split_name + ".reasonCode", reason_dependencies)
             if executed:
                 statistical_inputs = {
@@ -1370,12 +1384,9 @@ def _concrete_quality_lineage(
                 if executed:
                     rr_ci_dependencies.update(
                         {
-                            "config.bootstrap.minimumValidReplicates",
-                            "config.bootstrap.replicates",
                             "config.qualityRisk.minimumCautionDefects",
-                            "identity.criteria_id",
-                            "replay_events.charge_id",
                             "quality_risk_intervals.rules[].discovery.relativeRisk",
+                            *bootstrap_seed_dependencies,
                         }
                     )
             else:

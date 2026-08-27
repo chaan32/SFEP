@@ -43,6 +43,7 @@ from factories.artifacts import (
     StatefulMapping,
     bundle_request,
     definitions_with_stage_change,
+    empty_context_range_summary_request,
     golden_split_and_definitions,
     golden_summary_request,
     expected_golden_summary_bytes,
@@ -54,7 +55,11 @@ from factories.artifacts import (
     mutate_mature_label,
     nonempty_range_summary_request,
 )
-from factories.quality import identified_split_and_catalog, strong_repeated_fixture
+from factories.quality import (
+    identified_split_and_catalog,
+    strong_repeated_fixture,
+    too_few_bootstraps_fixture,
+)
 
 
 def test_literal_criteria_identity_has_exact_eight_fields_and_id() -> None:
@@ -385,6 +390,26 @@ def test_lineage_inventory_omits_absent_dynamic_count_leaves() -> None:
     )
 
 
+def test_empty_range_context_is_a_real_derived_group_leaf() -> None:
+    summary = build_summary(empty_context_range_summary_request())
+    lineage = next(
+        item
+        for item in summary["lineage"]["fields"]
+        if item["artifactRole"] == "equipment_operating_ranges"
+        and item["outputField"] == "ranges[].context"
+    )
+
+    assert lineage["conversion"] == "DERIVE_RANGE_GROUP"
+    assert lineage["dependencies"] == [
+        "config.operatingRanges.minimumSupport",
+        "config.rangeContextHierarchies[].equipmentType",
+        "config.rangeContextHierarchies[].levels[][]",
+        "fur_hr.f_ext_date",
+        "fur_hr.rm4_temp",
+        "population.REFERENCE",
+    ]
+
+
 def test_strong_repeated_rule_lineage_records_the_executed_statistical_branch() -> None:
     config = golden_summary_request().analysis_config
     split, catalog = identified_split_and_catalog(strong_repeated_fixture())
@@ -487,6 +512,88 @@ def test_strong_repeated_rule_lineage_records_the_executed_statistical_branch() 
         "config.qualityRisk.riskDifference.danger",
     }.issubset(set(trace["rules[].grade"]))
     assert "replay_events.charge_id" in reachable("rules[].grade")
+    bootstrap_inputs = {
+        "config.bootstrap.minimumValidReplicates",
+        "config.bootstrap.replicates",
+        "identity.criteria_id",
+        "quality_risk_intervals.rules[].ruleId",
+        "replay_events.charge_id",
+    }
+    for path in (
+        "rules[].discovery.relativeRiskCiLower",
+        "rules[].discovery.relativeRiskCiUpper",
+    ):
+        assert bootstrap_inputs.issubset(set(trace[path]))
+    assert bootstrap_inputs.isdisjoint(
+        set(trace["rules[].discovery.reasonCode"])
+    )
+
+
+def test_too_few_bootstraps_lineage_records_only_the_executed_failure_path() -> None:
+    config = replace(
+        golden_summary_request().analysis_config,
+        bootstrap={"replicates": 10, "minimumValidReplicates": 1900},
+    )
+    split, catalog = identified_split_and_catalog(too_few_bootstraps_fixture())
+    result = build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        LITERAL_CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    failed = next(
+        item
+        for item in result.records
+        if tuple(item["fieldNames"]) == ("slab_grind",)
+        and tuple(item["predicate"]["allOf"][0]["values"]) == ("RISK",)
+    )
+    skipped = next(
+        item
+        for item in result.records
+        if tuple(item["fieldNames"]) == ("steel_usage",)
+    )
+    assert failed["discovery"]["reasonCode"] == "TOO_FEW_VALID_BOOTSTRAPS"
+    assert skipped["discovery"]["reasonCode"] == "NO_INFORMATIVE_STRATA"
+
+    traces = summary_module._concrete_quality_lineage(result, config)
+    failed_trace = traces[failed["ruleId"]]
+    skipped_trace = traces[skipped["ruleId"]]
+    bootstrap_seed_inputs = {
+        "config.bootstrap.minimumValidReplicates",
+        "config.bootstrap.replicates",
+        "identity.criteria_id",
+        "quality_risk_intervals.rules[].ruleId",
+        "replay_events.charge_id",
+    }
+    failure_reason_dependencies = set(
+        failed_trace["rules[].discovery.reasonCode"]
+    )
+    assert bootstrap_seed_inputs.issubset(failure_reason_dependencies)
+    assert {
+        "population.DISCOVERY",
+        "replay_events.values_json.judge",
+        "replay_events.values_json.slab_grind",
+        "replay_events.values_json.sm_plant",
+        "replay_events.values_json.steel_grade",
+        "replay_events.values_json.steel_usage",
+    }.issubset(failure_reason_dependencies)
+    assert (
+        "quality_risk_intervals.rules[].discovery.relativeRisk"
+        not in failure_reason_dependencies
+    )
+    for path in (
+        "rules[].discovery.relativeRiskCiLower",
+        "rules[].discovery.relativeRiskCiUpper",
+    ):
+        assert bootstrap_seed_inputs.issubset(set(failed_trace[path]))
+        assert (
+            "quality_risk_intervals.rules[].discovery.relativeRisk"
+            in failed_trace[path]
+        )
+    assert bootstrap_seed_inputs.isdisjoint(
+        set(skipped_trace["rules[].discovery.reasonCode"])
+    )
 
 
 def test_summary_lineage_graph_is_closed_sorted_unique_and_acyclic() -> None:

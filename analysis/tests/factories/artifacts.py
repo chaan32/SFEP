@@ -419,6 +419,47 @@ def nonempty_range_summary_request() -> SummaryBuildRequest:
     )
 
 
+def empty_context_range_summary_request() -> SummaryBuildRequest:
+    """Return one valid RM4 fallback range whose context object is empty."""
+    request = golden_summary_request()
+    row = request.split.reference_rows.iloc[0]
+    contributor = next(
+        material
+        for material in request.material_catalog
+        if (
+            material.charge_id,
+            material.slab_no,
+            material.hr_coil_id,
+        )
+        == (row["charge_id"], row["slab_no"], row["hr_coil_id"])
+    )
+    rule_id = "sha256:" + "c" * 64
+    ranges = OperatingRangesResult(
+        (
+            {
+                "ruleId": rule_id,
+                "field": "rm4_temp",
+                "fieldRole": "DIRECT_OPERATION",
+                "firstAvailableStage": "RM4_RECORDED",
+                "equipmentType": "RM4",
+                "equipmentId": "RM4_PROCESS",
+                "contextLevel": 3,
+                "context": {},
+                "support": 1,
+                "median": 850.0,
+                "p01": None,
+                "p05": 845.0,
+                "p95": 855.0,
+                "p99": None,
+                "lowerTailEnabled": False,
+                "upperTailEnabled": False,
+            },
+        ),
+        (OperatingRangeSidecar(rule_id, (contributor.material_key,)),),
+    )
+    return replace(request, operating_ranges=ranges)
+
+
 def expected_golden_summary_bytes(request: SummaryBuildRequest) -> bytes:
     template = (
         CONTRACT_ROOT / "golden-expectation" / "analysis_summary.template.json"
