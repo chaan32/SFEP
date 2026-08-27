@@ -299,6 +299,8 @@ installed-code-tree digest는 wheel의 RECORD 대상 중 실제 `purelib`·`plat
 
 논리 producer `equipment-quality`는 설치 distribution `sfep-equipment-quality`에만 대응한다. `packages[]`의 허용 inventory는 UTF-8 순서의 `attrs,jsonschema,jsonschema-specifications,numpy,pandas,python-dateutil,pytz,referencing,rpds-py,six,typing-extensions,tzdata` 정확히 12개이며, direct=true는 `jsonschema,numpy,pandas` 세 개뿐이다. producer distribution은 `packages[]`와 분리한다. 새 runtime venv에서 bootstrap 도구로 허용하면서 package inventory에서 제외하는 distribution은 manifest의 `pipVersion`으로 별도 검증하는 `pip` 하나뿐이다. setuptools, wheel, build, pytest 및 그 밖의 미신고 distribution은 production runtime에서 거부한다. 이름 비교는 PEP 503 정규형을 사용하고 중복·누락·추가 이름을 모두 거부한다.
 
+설치 metadata만 맞고 실제 import가 다른 경로에서 shadow되는 상태도 거부한다. 검증기는 RECORD로 확인한 distribution과 현재 import origin을 `attrs→attr,attrs`, `jsonschema→jsonschema`, `jsonschema-specifications→jsonschema_specifications`, `numpy→numpy`, `pandas→pandas`, `python-dateutil→dateutil`, `pytz→pytz`, `referencing→referencing`, `rpds-py→rpds`, `six→six`, `typing-extensions→typing_extensions`, `tzdata→tzdata`, `sfep-equipment-quality→equipment_quality`로 exact-match하고 이미 적재된 해당 root의 모든 module origin도 같은 RECORD tree 안에 있어야 한다. `PYTHONHASHSEED`는 시작 뒤 변경 가능한 환경 문자열만 비교하지 않는다. CPython 3.12.10 seed 0에서 `sfep-runtime-hash-seed/v1`, `equipment-quality/3.12.10` 두 문자열의 `str.__hash__()`가 각각 `-4218979432691865272`, `1379760580859628941`인지를 함께 확인한다.
+
 재현 명령은 다음 순서로 고정한다.
 
 ```text
