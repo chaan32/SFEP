@@ -1,5 +1,7 @@
 package com.sfep.equipmentmonitor.replay;
 
+import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -8,11 +10,15 @@ import java.util.concurrent.TimeUnit;
 
 /** Drives a one-pass replay cursor on one background thread. */
 public final class ReplayController implements AutoCloseable {
+    private static final int MAX_STATUS_HISTORY = 128;
+
     private enum Request {
         RUN,
         STEP,
+        NEXT_DATE,
         PAUSE,
         STOP,
+        FAIL,
         CLOSE
     }
 
@@ -27,7 +33,12 @@ public final class ReplayController implements AutoCloseable {
     private boolean paused = true;
     private ReplaySpeed speed = ReplaySpeed.X1;
     private long unitsDelivered;
+    private String currentReplayDate;
+    private String dateBoundaryOrigin;
     private String errorMessage;
+    private ReplayFailureContext failureContext;
+    private final ArrayDeque<ReplayStatus> statusHistory =
+            new ArrayDeque<>(List.of(ReplayStatus.STOPPED));
     private boolean workerScheduled;
     private boolean closed;
     private ReplayUnit pending;
@@ -56,7 +67,8 @@ public final class ReplayController implements AutoCloseable {
         synchronized (monitor) {
             ensureCanAdvance();
             request = Request.RUN;
-            status = ReplayStatus.RUNNING;
+            dateBoundaryOrigin = null;
+            transitionTo(ReplayStatus.RUNNING);
             paused = false;
             scheduleWorker();
         }
@@ -88,7 +100,8 @@ public final class ReplayController implements AutoCloseable {
                 request = Request.STOP;
             } else if (status == ReplayStatus.PAUSED) {
                 request = Request.STOP;
-                status = ReplayStatus.STOPPED;
+                dateBoundaryOrigin = null;
+                transitionTo(ReplayStatus.STOPPED);
                 paused = true;
             }
         }
@@ -101,7 +114,26 @@ public final class ReplayController implements AutoCloseable {
                 throw new IllegalStateException("cannot step while replay is running");
             }
             request = Request.STEP;
-            status = ReplayStatus.RUNNING;
+            dateBoundaryOrigin = null;
+            transitionTo(ReplayStatus.RUNNING);
+            paused = false;
+            scheduleWorker();
+        }
+    }
+
+    /**
+     * Advances without playback delay to the first unit of the following replay date.
+     * Before the first unit has been delivered, this positions the replay at that first unit.
+     */
+    public void advanceToNextDate() {
+        synchronized (monitor) {
+            ensureCanAdvance();
+            if (status == ReplayStatus.RUNNING) {
+                throw new IllegalStateException("cannot move dates while replay is running");
+            }
+            dateBoundaryOrigin = currentReplayDate;
+            request = Request.NEXT_DATE;
+            transitionTo(ReplayStatus.RUNNING);
             paused = false;
             scheduleWorker();
         }
@@ -116,8 +148,17 @@ public final class ReplayController implements AutoCloseable {
 
     public ReplayControllerState state() {
         synchronized (monitor) {
-            return new ReplayControllerState(status, paused, speed, unitsDelivered, errorMessage);
+            return new ReplayControllerState(
+                    status, paused, speed, unitsDelivered, currentReplayDate,
+                    failureContext, List.copyOf(statusHistory), errorMessage);
         }
+    }
+
+    /** Stops replay after a UI-side application failure and preserves the affected unit. */
+    public void reportFailure(ReplayUnit unit, Throwable error) {
+        Objects.requireNonNull(unit, "unit");
+        Objects.requireNonNull(error, "error");
+        fail(error, unit);
     }
 
     private void scheduleWorker() {
@@ -130,7 +171,7 @@ public final class ReplayController implements AutoCloseable {
     private void runWorker() {
         while (true) {
             synchronized (monitor) {
-                if (closed || (request != Request.RUN && request != Request.STEP)) {
+                if (closed || !advancing(request)) {
                     finishBoundaryRequest();
                     return;
                 }
@@ -145,17 +186,18 @@ public final class ReplayController implements AutoCloseable {
                 try {
                     next = Objects.requireNonNull(cursor.nextUnit(), "cursor returned null");
                 } catch (Throwable error) {
-                    fail(error);
+                    fail(error, null);
                     return;
                 }
             }
             if (next.isEmpty()) {
                 synchronized (monitor) {
-                    if (closed || (request != Request.RUN && request != Request.STEP)) {
+                    if (closed || !advancing(request)) {
                         finishBoundaryRequest();
                     } else {
                         request = Request.PAUSE;
-                        status = ReplayStatus.COMPLETED;
+                        dateBoundaryOrigin = null;
+                        transitionTo(ReplayStatus.COMPLETED);
                         paused = true;
                         workerScheduled = false;
                         monitor.notifyAll();
@@ -166,7 +208,7 @@ public final class ReplayController implements AutoCloseable {
 
             ReplayUnit unit = next.orElseThrow();
             synchronized (monitor) {
-                if (closed || (request != Request.RUN && request != Request.STEP)) {
+                if (closed || !advancing(request)) {
                     if (!closed) {
                         pending = unit;
                     }
@@ -178,7 +220,7 @@ public final class ReplayController implements AutoCloseable {
             try {
                 consumer.accept(unit);
             } catch (Throwable error) {
-                fail(error);
+                fail(error, unit);
                 return;
             }
 
@@ -190,10 +232,12 @@ public final class ReplayController implements AutoCloseable {
                     return;
                 }
                 unitsDelivered++;
-                if (request == Request.RUN || request == Request.STEP) {
+                currentReplayDate = unit.replayDate();
+                if (advancing(request)) {
                     if (cursor.exhausted()) {
                         request = Request.PAUSE;
-                        status = ReplayStatus.COMPLETED;
+                        dateBoundaryOrigin = null;
+                        transitionTo(ReplayStatus.COMPLETED);
                         paused = true;
                         workerScheduled = false;
                         monitor.notifyAll();
@@ -203,11 +247,20 @@ public final class ReplayController implements AutoCloseable {
                 if (request == Request.STEP) {
                     request = Request.PAUSE;
                 }
-                if (request != Request.RUN) {
+                if (request == Request.NEXT_DATE
+                        && (dateBoundaryOrigin == null
+                        || !dateBoundaryOrigin.equals(unit.replayDate()))) {
+                    request = Request.PAUSE;
+                }
+                if (!advancing(request)) {
                     finishBoundaryRequest();
                     return;
                 }
-                delaySpeed = speed;
+                delaySpeed = request == Request.RUN ? speed : null;
+            }
+
+            if (delaySpeed == null) {
+                continue;
             }
 
             try {
@@ -221,10 +274,10 @@ public final class ReplayController implements AutoCloseable {
                         return;
                     }
                 }
-                fail(error);
+                fail(error, unit);
                 return;
             } catch (Throwable error) {
-                fail(error);
+                fail(error, unit);
                 return;
             }
         }
@@ -232,33 +285,39 @@ public final class ReplayController implements AutoCloseable {
 
     private void finishBoundaryRequest() {
         if (closed || request == Request.CLOSE) {
-            status = ReplayStatus.CLOSED;
+            transitionTo(ReplayStatus.CLOSED);
             paused = true;
         } else if (request == Request.STOP) {
-            status = ReplayStatus.STOPPED;
+            transitionTo(ReplayStatus.STOPPED);
             paused = true;
         } else if (request == Request.PAUSE) {
-            status = ReplayStatus.PAUSED;
+            transitionTo(ReplayStatus.PAUSED);
+            paused = true;
+        } else if (request == Request.FAIL) {
+            transitionTo(ReplayStatus.ERROR);
             paused = true;
         }
+        dateBoundaryOrigin = null;
         workerScheduled = false;
         monitor.notifyAll();
     }
 
-    private void fail(Throwable error) {
+    private void fail(Throwable error, ReplayUnit unit) {
         synchronized (monitor) {
             if (closed) {
-                workerScheduled = false;
-                monitor.notifyAll();
                 return;
             }
-            request = Request.PAUSE;
-            status = ReplayStatus.ERROR;
+            request = Request.FAIL;
+            dateBoundaryOrigin = null;
+            transitionTo(ReplayStatus.ERROR);
             paused = true;
+            failureContext = unit == null ? null : ReplayFailureContext.from(unit);
             errorMessage = error.getMessage() == null
                     ? error.getClass().getName()
                     : error.getClass().getName() + ": " + error.getMessage();
-            workerScheduled = false;
+            if (Thread.currentThread() == workerThread) {
+                workerScheduled = false;
+            }
             monitor.notifyAll();
         }
     }
@@ -276,6 +335,21 @@ public final class ReplayController implements AutoCloseable {
         }
     }
 
+    private static boolean advancing(Request request) {
+        return request == Request.RUN || request == Request.STEP || request == Request.NEXT_DATE;
+    }
+
+    private void transitionTo(ReplayStatus next) {
+        if (status == next) {
+            return;
+        }
+        status = next;
+        statusHistory.addLast(next);
+        if (statusHistory.size() > MAX_STATUS_HISTORY) {
+            statusHistory.removeFirst();
+        }
+    }
+
     @Override
     public void close() {
         boolean waitForWorker;
@@ -285,7 +359,7 @@ public final class ReplayController implements AutoCloseable {
             }
             closed = true;
             request = Request.CLOSE;
-            status = ReplayStatus.CLOSED;
+            transitionTo(ReplayStatus.CLOSED);
             paused = true;
             monitor.notifyAll();
             waitForWorker = Thread.currentThread() != workerThread;

@@ -96,13 +96,101 @@ public final class BundleLoader {
                 summary.dateRange().path("from").textValue(),
                 summary.dateRange().path("to").textValue(),
                 summary.splitCounts().path("holdout").path("total").longValue());
+        LoadedBundle.ManagementProjection management = managementProjection(
+                manifest,
+                descriptors,
+                summary);
         return new LoadedBundle(
                 manifest.bundleId(),
                 manifest.criteriaId(),
                 projection,
+                management,
                 ranges.ranges(),
                 rules.rules(),
                 replay);
+    }
+
+    private static LoadedBundle.ManagementProjection managementProjection(
+            BundleManifest manifest,
+            Map<ArtifactRole, ArtifactDescriptor> descriptors,
+            AnalysisSummaryDto summary) {
+        EnumMap<LoadedBundle.SourceRole, String> sourceHashes =
+                new EnumMap<>(LoadedBundle.SourceRole.class);
+        for (LoadedBundle.SourceRole role : LoadedBundle.SourceRole.values()) {
+            String hash = manifest.identity().get(role.identityKey());
+            if (hash == null) {
+                throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", role.identityKey());
+            }
+            sourceHashes.put(role, hash);
+        }
+
+        EnumMap<ArtifactRole, String> artifactHashes = new EnumMap<>(ArtifactRole.class);
+        for (ArtifactRole role : ArtifactRole.values()) {
+            ArtifactDescriptor descriptor = descriptors.get(role);
+            if (descriptor == null) {
+                throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", role.manifestRole());
+            }
+            artifactHashes.put(role, descriptor.sha256());
+        }
+
+        EnumMap<LoadedBundle.QuarantineReason, Long> quarantineCounts = enumCounts(
+                summary.quarantineCounts(),
+                LoadedBundle.QuarantineReason.class,
+                "quarantineCounts");
+        EnumMap<LoadedBundle.LabelCensoringReason, Long> labelCensoringCounts = enumCounts(
+                summary.labelCensoringCounts(),
+                LoadedBundle.LabelCensoringReason.class,
+                "labelCensoringCounts");
+        LoadedBundle.ChargePurgeCounts chargePurgeCounts = new LoadedBundle.ChargePurgeCounts(
+                purgeCount(summary.chargePurgeCounts(), "outer"),
+                purgeCount(summary.chargePurgeCounts(), "inner"));
+        return new LoadedBundle.ManagementProjection(
+                sourceHashes,
+                artifactHashes,
+                quarantineCounts,
+                labelCensoringCounts,
+                chargePurgeCounts);
+    }
+
+    private static <E extends Enum<E>> EnumMap<E, Long> enumCounts(
+            JsonNode counts,
+            Class<E> reasonType,
+            String field) {
+        if (counts == null || !counts.isObject()) {
+            throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", field);
+        }
+        EnumMap<E, Long> result = new EnumMap<>(reasonType);
+        for (E reason : reasonType.getEnumConstants()) {
+            JsonNode count = counts.get(reason.name());
+            if (count != null) {
+                result.put(reason, exactCount(count, field + "." + reason.name()));
+            }
+        }
+        return result;
+    }
+
+    private static LoadedBundle.PurgeCount purgeCount(JsonNode counts, String split) {
+        if (counts == null || !counts.isObject()) {
+            throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", "chargePurgeCounts");
+        }
+        JsonNode splitCounts = counts.get(split);
+        if (splitCounts == null || !splitCounts.isObject()) {
+            throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", "chargePurgeCounts." + split);
+        }
+        return new LoadedBundle.PurgeCount(
+                exactCount(splitCounts.get("chargeCount"), "chargePurgeCounts." + split + ".chargeCount"),
+                exactCount(splitCounts.get("rowCount"), "chargePurgeCounts." + split + ".rowCount"));
+    }
+
+    private static long exactCount(JsonNode count, String field) {
+        if (count == null || !count.isIntegralNumber() || !count.canConvertToLong()) {
+            throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", field);
+        }
+        long value = count.longValue();
+        if (value < 0) {
+            throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", field);
+        }
+        return value;
     }
 
     private void verifySchemaDigests(UntrustedManifestClaims manifest) {

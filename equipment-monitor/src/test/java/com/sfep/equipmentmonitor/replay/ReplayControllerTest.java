@@ -44,6 +44,63 @@ class ReplayControllerTest {
     }
 
     @Test
+    void advanceToNextDateStopsOnTheFirstUnitOfTheFollowingDate() {
+        StubCursor cursor = new StubCursor(
+                unit("B1", "S1", "2025-01-01"),
+                unit("B2", "S2", "2025-01-01"),
+                unit("B3", "S3", "2025-01-02"),
+                unit("B4", "S4", "2025-01-02"));
+        List<ReplayUnit> delivered = new ArrayList<>();
+
+        try (ReplayController controller = new ReplayController(cursor, delivered::add, speed -> { })) {
+            controller.step();
+            awaitState(controller, ReplayStatus.PAUSED, 1);
+
+            controller.advanceToNextDate();
+            awaitState(controller, ReplayStatus.PAUSED, 3);
+
+            assertThat(delivered).extracting(ReplayUnit::batchId)
+                    .containsExactly("B1", "B2", "B3");
+            assertThat(controller.state().currentReplayDate()).isEqualTo("2025-01-02");
+        }
+    }
+
+    @Test
+    void advanceToNextDateFromTheBeginningStopsAtTheFirstAvailableUnit() {
+        StubCursor cursor = new StubCursor(
+                unit("B1", "S1", "2025-01-01"),
+                unit("B2", "S2", "2025-01-01"));
+        List<ReplayUnit> delivered = new ArrayList<>();
+
+        try (ReplayController controller = new ReplayController(cursor, delivered::add, speed -> { })) {
+            controller.advanceToNextDate();
+            awaitState(controller, ReplayStatus.PAUSED, 1);
+
+            assertThat(delivered).extracting(ReplayUnit::batchId).containsExactly("B1");
+            assertThat(controller.state().currentReplayDate()).isEqualTo("2025-01-01");
+        }
+    }
+
+    @Test
+    void advanceToNextDateCompletesWhenNoFollowingDateExists() {
+        StubCursor cursor = new StubCursor(
+                unit("B1", "S1", "2025-01-01"),
+                unit("B2", "S2", "2025-01-01"));
+        List<ReplayUnit> delivered = new ArrayList<>();
+
+        try (ReplayController controller = new ReplayController(cursor, delivered::add, speed -> { })) {
+            controller.step();
+            awaitState(controller, ReplayStatus.PAUSED, 1);
+
+            controller.advanceToNextDate();
+            awaitState(controller, ReplayStatus.COMPLETED, 2);
+
+            assertThat(delivered).extracting(ReplayUnit::batchId).containsExactly("B1", "B2");
+            assertThat(controller.state().currentReplayDate()).isEqualTo("2025-01-01");
+        }
+    }
+
+    @Test
     void pauseWhileCursorIsReadingDoesNotLeakThePendingUnitToTheConsumer() throws Exception {
         BlockingCursor cursor = new BlockingCursor(unit("B1", "S1"));
         List<ReplayUnit> delivered = new ArrayList<>();
@@ -134,10 +191,62 @@ class ReplayControllerTest {
 
         assertThat(controller.state().paused()).isTrue();
         assertThat(controller.state().errorMessage()).contains("boom");
+        assertThat(controller.state().failureContext()).isEqualTo(
+                new ReplayFailureContext(
+                        "B1", "S1", "2025-01-01", 1, List.of("material-B1")));
+        assertThat(controller.state().statusHistory()).containsExactly(
+                ReplayStatus.STOPPED, ReplayStatus.RUNNING, ReplayStatus.ERROR);
         controller.close();
         assertThat(cursor.closed).isTrue();
         assertThat(controller.state().status()).isEqualTo(ReplayStatus.CLOSED);
         assertThatThrownBy(controller::start).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void externallyReportedUiFailureStopsReplayAndRetainsItsUnitContext() {
+        StubCursor cursor = new StubCursor(unit("B1", "S1"), unit("B2", "S2"));
+        ReplayController controller = new ReplayController(cursor, ignored -> { }, speed -> { });
+
+        controller.reportFailure(unit("UI", "SCREEN"), new IllegalStateException("render failed"));
+
+        assertThat(controller.state().status()).isEqualTo(ReplayStatus.ERROR);
+        assertThat(controller.state().paused()).isTrue();
+        assertThat(controller.state().errorMessage()).contains("render failed");
+        assertThat(controller.state().failureContext()).extracting(
+                ReplayFailureContext::batchId,
+                ReplayFailureContext::batchStep,
+                ReplayFailureContext::materialKeys)
+                .containsExactly("UI", "SCREEN", List.of("material-UI"));
+        assertThat(controller.state().statusHistory()).containsExactly(
+                ReplayStatus.STOPPED, ReplayStatus.ERROR);
+
+        controller.close();
+        assertThat(controller.state().statusHistory()).containsExactly(
+                ReplayStatus.STOPPED, ReplayStatus.ERROR, ReplayStatus.CLOSED);
+    }
+
+    @Test
+    void uiFailureReportedDuringDeliveryRemainsErrorAtTheWorkerBoundary() throws Exception {
+        ReplayUnit affected = unit("B1", "S1");
+        StubCursor cursor = new StubCursor(affected, unit("B2", "S2"));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        try (ReplayController controller = new ReplayController(cursor, ignored -> {
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+        }, speed -> { })) {
+            controller.start();
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            controller.reportFailure(affected, new IllegalStateException("EDT failed"));
+            release.countDown();
+
+            awaitState(controller, ReplayStatus.ERROR, 1);
+            assertThat(controller.state().statusHistory()).containsExactly(
+                    ReplayStatus.STOPPED, ReplayStatus.RUNNING, ReplayStatus.ERROR);
+            assertThat(controller.state().failureContext().batchId()).isEqualTo("B1");
+        }
     }
 
     private static void awaitState(ReplayController controller, ReplayStatus status, long delivered) {
@@ -148,13 +257,17 @@ class ReplayControllerTest {
     }
 
     private static ReplayUnit unit(String batchId, String step) {
+        return unit(batchId, step, "2025-01-01");
+    }
+
+    private static ReplayUnit unit(String batchId, String step, String replayDate) {
         ReplayEvent event = new ReplayEvent(
                 "sfep-replay-events/v1", "bundle", "criteria", "event-" + batchId,
-                "2025-01-01", 1, "FURNACE_HOUR", batchId, "equipment-" + batchId,
+                replayDate, 1, "FURNACE_HOUR", batchId, "equipment-" + batchId,
                 step, "HOUR_BUCKET", "material-" + batchId, "FURNACE", "1호기",
                 "charge", "slab", null, null, JsonNodeFactory.instance.objectNode());
         return new ReplayUnit(
-                batchId, step, "2025-01-01", 1, "FURNACE_HOUR", "HOUR_BUCKET",
+                batchId, step, replayDate, 1, "FURNACE_HOUR", "HOUR_BUCKET",
                 List.of(event), false);
     }
 
