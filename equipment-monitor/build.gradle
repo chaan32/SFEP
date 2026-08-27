@@ -1,0 +1,99 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.15'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.sfep'
+version = '0.1.0-SNAPSHOT'
+
+springBoot {
+    mainClass = 'com.sfep.equipmentmonitor.EquipmentMonitorDesktopApplication'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'org.apache.commons:commons-csv:1.14.1'
+    implementation 'com.networknt:json-schema-validator:2.0.4'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+def repositoryRoot = layout.projectDirectory.dir('..')
+def contractRoot = repositoryRoot.dir('contracts/equipment-monitor/v1')
+def normativeSchemas = [
+        'analysis_config.schema.json',
+        'analysis_summary.schema.json',
+        'bundle_manifest.schema.json',
+        'equipment_operating_ranges.schema.json',
+        'producer_runtime.schema.json',
+        'quality_risk_intervals.schema.json',
+        'replay_event_row.schema.json'
+]
+
+tasks.named('processResources') {
+    from(contractRoot) {
+        include normativeSchemas
+        into 'contracts/equipment-monitor/v1'
+    }
+}
+
+tasks.register('verifyNormativeSchemas') {
+    dependsOn tasks.named('processResources')
+    inputs.files(normativeSchemas.collect { contractRoot.file(it) })
+    inputs.files(normativeSchemas.collect {
+        layout.buildDirectory.file("resources/main/contracts/equipment-monitor/v1/${it}")
+    })
+    doLast {
+        normativeSchemas.each { name ->
+            byte[] source = contractRoot.file(name).asFile.bytes
+            byte[] embedded = layout.buildDirectory
+                    .file("resources/main/contracts/equipment-monitor/v1/${name}")
+                    .get().asFile.bytes
+            if (!Arrays.equals(source, embedded)) {
+                throw new GradleException("Normative schema byte drift: ${name}")
+            }
+        }
+    }
+}
+
+tasks.named('classes') {
+    dependsOn tasks.named('verifyNormativeSchemas')
+}
+
+tasks.register('verifyRuntimeShape') {
+    doLast {
+        def forbidden = [
+                'spring-boot-starter-web', 'spring-web', 'spring-webmvc',
+                'spring-data-jpa', 'hibernate-core', 'kafka-clients',
+                'spring-kafka', 'spring-data-redis', 'lettuce-core', 'jedis'
+        ] as Set
+        def found = configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts
+                .collect { it.moduleVersion.id.name }
+                .findAll { forbidden.contains(it) }
+        if (!found.isEmpty()) {
+            throw new GradleException("Forbidden runtime dependencies: ${found.sort()}")
+        }
+    }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')
+    systemProperty 'sfep.repo-root', repositoryRoot.asFile.absolutePath
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')
+}
