@@ -696,6 +696,164 @@ def test_build_rolls_back_a_directory_when_reopening_it_fails(
     assert not created_parent.exists()
 
 
+@pytest.mark.parametrize("operation", ("stat", "dup"))
+def test_build_rolls_back_or_avoids_creation_when_ownership_capture_fails(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    created_parent = tmp_path / "created-parent"
+    work_root = created_parent / "created-work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    injected = False
+
+    if operation == "stat":
+        real_operation = os.stat
+
+        def failing_operation(
+            path: os.PathLike[str] | str | bytes | int,
+            *arguments: object,
+            **keywords: object,
+        ) -> os.stat_result:
+            nonlocal injected
+            if path == "created-parent":
+                injected = True
+                raise OSError("injected ownership stat failure")
+            return real_operation(path, *arguments, **keywords)
+
+    else:
+        real_operation = os.dup
+
+        def failing_operation(
+            descriptor: int,
+            *arguments: object,
+            **keywords: object,
+        ) -> int:
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise OSError("injected parent descriptor duplication failure")
+            return real_operation(descriptor, *arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], operation, failing_operation)
+
+    with pytest.raises((error_type, OSError)):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert injected
+    with pytest.raises(FileNotFoundError):
+        os.lstat(created_parent)
+
+
+@pytest.mark.parametrize("directory_name", ("wheel-a", "wheel-b"))
+@pytest.mark.parametrize("reopen_result", ("failure", "replacement"))
+def test_build_publication_never_removes_a_replacement_directory_before_reopen(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_name: str,
+    reopen_result: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = tmp_path / "work"
+    detached = tmp_path / f"{directory_name}-detached-original"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_open = os.open
+    external_identity: tuple[int, int] | None = None
+
+    def replacing_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal external_identity
+        if external_identity is None and path == directory_name:
+            target = work_root / directory_name
+            target.rename(detached)
+            target.mkdir()
+            result = os.lstat(target)
+            external_identity = result.st_dev, result.st_ino
+            if reopen_result == "failure":
+                raise PermissionError("injected output directory reopen failure")
+        return real_open(path, flags, *arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], "open", replacing_open)
+
+    expected_message = "reopen" if reopen_result == "failure" else "changed before reopen"
+    with pytest.raises(error_type, match=expected_message):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert external_identity is not None
+    current = os.lstat(work_root / directory_name)
+    assert (current.st_dev, current.st_ino) == external_identity
+    assert detached.is_dir()
+
+
+@pytest.mark.parametrize("phase", ("work-root", "publication"))
+def test_build_closes_a_reopened_directory_if_descriptor_authentication_fails(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = tmp_path / "created-parent" / "work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    target_name = "created-parent" if phase == "work-root" else "wheel-a"
+    real_open = os.open
+    real_fstat = os.fstat
+    real_close = os.close
+    target_descriptor: int | None = None
+    closed = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal target_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if target_descriptor is None and path == target_name:
+            target_descriptor = descriptor
+        return descriptor
+
+    def failing_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == target_descriptor:
+            raise OSError("injected directory descriptor authentication failure")
+        return real_fstat(descriptor)
+
+    def recording_close(descriptor: int) -> None:
+        nonlocal closed
+        if descriptor == target_descriptor:
+            closed = True
+        real_close(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "fstat", failing_fstat)
+    monkeypatch.setattr(module_globals["os"], "close", recording_close)
+
+    try:
+        with pytest.raises((error_type, OSError), match="authentication|changed"):
+            module_globals["_run"](source, build_python, work_root)
+        assert target_descriptor is not None
+        assert closed
+    finally:
+        if target_descriptor is not None and not closed:
+            real_close(target_descriptor)
+
+
 def test_build_uses_safe_interpreter_cwd_and_allowlisted_environment(
     tmp_path: Path,
     build_python: Path,

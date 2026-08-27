@@ -42,6 +42,7 @@ _Fingerprint = tuple[int, int, int, int, int, int]
 _DirectoryInventory = tuple[_Fingerprint, dict[str, _Fingerprint]]
 _DirectoryPin = tuple[Path, Path, tuple[int, int]]
 _CreatedDirectory = tuple[int, str, tuple[int, int]]
+_PublishedDirectory = tuple[_CreatedDirectory, int | None, int | None]
 _SourceAttestation = tuple[
     tuple[int, int, int],
     dict[str, _Fingerprint],
@@ -146,6 +147,53 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return common == first or common == second
 
 
+def _create_tracked_directory(
+    parent_descriptor: int,
+    name: str,
+    label: str,
+    *,
+    allow_existing: bool,
+) -> _CreatedDirectory | None:
+    try:
+        cleanup_parent = os.dup(parent_descriptor)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} parent cannot be retained") from error
+    try:
+        os.mkdir(name, mode=0o755, dir_fd=parent_descriptor)
+    except FileExistsError:
+        os.close(cleanup_parent)
+        if allow_existing:
+            return None
+        raise ProducerBuildError(f"{label} already exists")
+    except Exception:
+        os.close(cleanup_parent)
+        raise
+
+    creation: _CreatedDirectory | None = None
+    try:
+        initial = os.lstat(name, dir_fd=parent_descriptor)
+        creation = cleanup_parent, name, _identity(initial)
+        if not stat.S_ISDIR(initial.st_mode):
+            raise ProducerBuildError(f"{label} was not created as a directory")
+        authenticated = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(authenticated.st_mode)
+            or _identity(authenticated) != creation[2]
+        ):
+            raise ProducerBuildError(f"{label} changed during creation")
+        return creation
+    except Exception:
+        if creation is None:
+            os.close(cleanup_parent)
+        else:
+            _rollback_created_directories([creation])
+        raise
+
+
 def _prepare_work_root(
     path: Path,
     source_root: Path,
@@ -184,24 +232,15 @@ def _prepare_work_root(
                     dir_fd=descriptor,
                 )
             except FileNotFoundError:
-                try:
-                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                creation = _create_tracked_directory(
+                    descriptor,
+                    part,
+                    "work root component",
+                    allow_existing=True,
+                )
+                if creation is not None:
                     created_here = True
-                except FileExistsError:
-                    pass
-                if created_here:
-                    created_result = os.stat(
-                        part,
-                        dir_fd=descriptor,
-                        follow_symlinks=False,
-                    )
-                    if not stat.S_ISDIR(created_result.st_mode):
-                        raise ProducerBuildError(
-                            "created work root component is not a directory"
-                        )
-                    created.append(
-                        (os.dup(descriptor), part, _identity(created_result))
-                    )
+                    created.append(creation)
                 try:
                     next_descriptor = os.open(
                         part,
@@ -216,7 +255,13 @@ def _prepare_work_root(
                 raise ProducerBuildError(
                     "work root cannot be opened safely as a non-symlink directory"
                 ) from error
-            opened = os.fstat(next_descriptor)
+            try:
+                opened = os.fstat(next_descriptor)
+            except OSError as error:
+                os.close(next_descriptor)
+                raise ProducerBuildError(
+                    "work root directory descriptor authentication failed"
+                ) from error
             if not stat.S_ISDIR(opened.st_mode):
                 os.close(next_descriptor)
                 raise ProducerBuildError("work root path contains a non-directory")
@@ -269,10 +314,9 @@ def _rollback_created_directories(
 ) -> None:
     for parent_descriptor, name, expected_identity in reversed(created):
         try:
-            current = os.stat(
+            current = os.lstat(
                 name,
                 dir_fd=parent_descriptor,
-                follow_symlinks=False,
             )
             if (
                 stat.S_ISDIR(current.st_mode)
@@ -875,10 +919,11 @@ def _authenticate_open_file(
 
 def _cleanup_published_pair(
     work_descriptor: int,
-    created: list[tuple[str, int, int | None]],
+    created: list[_PublishedDirectory],
 ) -> None:
-    for directory_name, directory_descriptor, file_descriptor in reversed(created):
-        if file_descriptor is not None:
+    for creation, directory_descriptor, file_descriptor in reversed(created):
+        parent_descriptor, directory_name, expected_identity = creation
+        if file_descriptor is not None and directory_descriptor is not None:
             try:
                 current_file = os.stat(
                     _PRODUCER_FILENAME,
@@ -896,17 +941,18 @@ def _cleanup_published_pair(
                 pass
             os.close(file_descriptor)
         try:
-            current = os.stat(
+            current = os.lstat(
                 directory_name,
-                dir_fd=work_descriptor,
-                follow_symlinks=False,
+                dir_fd=parent_descriptor,
             )
-            opened = os.fstat(directory_descriptor)
-            if _identity(current) == _identity(opened):
-                os.rmdir(directory_name, dir_fd=work_descriptor)
+            if _identity(current) == expected_identity:
+                os.rmdir(directory_name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
         except OSError:
             pass
-        os.close(directory_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        os.close(parent_descriptor)
     try:
         os.fsync(work_descriptor)
     except OSError:
@@ -923,7 +969,7 @@ def _publish_pair(
 ) -> None:
     _recheck_work_root(work_descriptor, work_pin, empty_inventory)
     _recheck_source_attestation(source_root, source_attestation)
-    created: list[tuple[str, int, int | None]] = []
+    created: list[_PublishedDirectory] = []
     expected_files: dict[str, _Fingerprint] = {}
     flags = (
         os.O_RDONLY
@@ -933,24 +979,41 @@ def _publish_pair(
     )
     try:
         for directory_name in ("wheel-a", "wheel-b"):
-            os.mkdir(directory_name, mode=0o755, dir_fd=work_descriptor)
+            creation = _create_tracked_directory(
+                work_descriptor,
+                directory_name,
+                f"{directory_name} output directory",
+                allow_existing=False,
+            )
+            if creation is None:
+                raise ProducerBuildError("producer output directory was not created")
+            created.append((creation, None, None))
             try:
                 directory_descriptor = os.open(
                     directory_name,
                     flags,
                     dir_fd=work_descriptor,
                 )
-            except Exception:
-                os.rmdir(directory_name, dir_fd=work_descriptor)
-                raise
-            created.append((directory_name, directory_descriptor, None))
+            except OSError as error:
+                raise ProducerBuildError(
+                    f"{directory_name} output directory cannot be reopened safely"
+                ) from error
+            created[-1] = (creation, directory_descriptor, None)
+            opened_directory = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(opened_directory.st_mode)
+                or _identity(opened_directory) != creation[2]
+            ):
+                raise ProducerBuildError(
+                    f"{directory_name} output directory changed before reopen"
+                )
             os.fchmod(directory_descriptor, 0o755)
             file_descriptor, expected_file = _write_frozen_file_at(
                 directory_descriptor,
                 _PRODUCER_FILENAME,
                 wheel,
             )
-            created[-1] = (directory_name, directory_descriptor, file_descriptor)
+            created[-1] = (creation, directory_descriptor, file_descriptor)
             expected_files[directory_name] = expected_file
             _directory, entries = _directory_inventory_fd(
                 directory_descriptor,
@@ -964,12 +1027,17 @@ def _publish_pair(
         _work, work_entries = _directory_inventory_fd(work_descriptor, "work root")
         if set(work_entries) != {"wheel-a", "wheel-b"}:
             raise ProducerBuildError("work root inventory changed during publication")
-        for directory_name, directory_descriptor, file_descriptor in created:
-            if file_descriptor is None:
+        for creation, directory_descriptor, file_descriptor in created:
+            _parent_descriptor, directory_name, expected_identity = creation
+            if directory_descriptor is None or file_descriptor is None:
                 raise ProducerBuildError("producer output file was not pinned")
             opened = os.fstat(directory_descriptor)
             entry = work_entries[directory_name]
-            if entry[2] != stat.S_IFDIR or entry[:2] != _identity(opened):
+            if (
+                entry[2] != stat.S_IFDIR
+                or entry[:2] != expected_identity
+                or _identity(opened) != expected_identity
+            ):
                 raise ProducerBuildError(
                     "producer output directory identity changed during publication"
                 )
@@ -1001,10 +1069,12 @@ def _publish_pair(
     except Exception:
         _cleanup_published_pair(work_descriptor, created)
         raise
-    for _directory_name, directory_descriptor, file_descriptor in created:
+    for creation, directory_descriptor, file_descriptor in created:
         if file_descriptor is not None:
             os.close(file_descriptor)
-        os.close(directory_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        os.close(creation[0])
 
 
 def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, str, int]:
