@@ -990,6 +990,39 @@ def _commit_owned_outputs(owned: dict[str, _OwnedOutput]) -> None:
                 _close_owned_for_commit(output, attribute)
 
 
+def _reauthenticate_owned_outputs_for_commit(
+    owned: dict[str, _OwnedOutput],
+    wheel: bytes,
+) -> None:
+    for name in ("wheel-a", "wheel-b"):
+        try:
+            output = owned[name]
+        except KeyError as error:
+            raise ProducerBuildError("producer wheel pair is incomplete") from error
+        descriptor = output.primary_descriptor
+        if descriptor is None or output.primary_close_attempted:
+            descriptor = output.cleanup_descriptor
+            if descriptor is None or output.cleanup_close_attempted:
+                raise ProducerBuildError(
+                    f"{name} producer wheel has no retained authentication handle"
+                )
+        expected = output.expected_fingerprint
+        owner_identity = output.owner_identity
+        if expected is None or owner_identity is None:
+            raise ProducerBuildError(
+                f"{name} producer wheel authentication state is incomplete"
+            )
+        authenticated = _authenticate_open_file(
+            descriptor,
+            wheel,
+            f"{name} producer wheel",
+        )
+        if authenticated != expected or authenticated[:2] != owner_identity:
+            raise ProducerBuildError(
+                f"{name} producer wheel changed before commit"
+            )
+
+
 def _publish_pair(
     work_descriptor: int,
     work_pin: _DirectoryPin,
@@ -1103,8 +1136,18 @@ def _publish_pair(
             expected_files,
         )
         _recheck_source_attestation(source_root, source_attestation)
-        # COMMIT POINT: every byte/path/source/durability check is complete.
-        # Descriptor-close failures after this point cannot revoke publication.
+        _reauthenticate_owned_outputs_for_commit(owned, wheel)
+        _recheck_prepared_root(
+            work_descriptor,
+            work_pin,
+            outputs,
+            expected_files,
+        )
+        # At final source-check return, the prior path/byte observations were
+        # valid. These exact retained-byte/fingerprint and prepared-inventory
+        # checks prove a simultaneous valid interval at that instant; later
+        # concurrent drift is independently seal-detectable.
+        # COMMIT POINT: no fallible action precedes the state transition below.
         committed = True
         _commit_owned_outputs(owned)
     except BaseException:

@@ -2257,6 +2257,275 @@ def test_build_rechecks_the_authenticated_source_before_publishing(
     assert list((work_root / "wheel-b").iterdir()) == []
 
 
+@pytest.mark.parametrize("mutated_directory", ("wheel-a", "wheel-b"))
+def test_build_reauthenticates_both_outputs_after_the_last_source_check(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutated_directory: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    payload = b"identical test wheel"
+    module_globals["_build_once"] = lambda *_arguments: payload
+    real_open = os.open
+    real_fsync = os.fsync
+    real_recheck_source = module_globals["_recheck_source_attestation"]
+    work_descriptor: int | None = None
+    final_work_sync = False
+    mutated = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal work_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            work_descriptor = descriptor
+        return descriptor
+
+    def recording_fsync(descriptor: int) -> None:
+        nonlocal final_work_sync
+        real_fsync(descriptor)
+        if (
+            work_descriptor is not None
+            and descriptor == work_descriptor
+            and all(
+                (work_root / name / PRODUCER_FILENAME).exists()
+                for name in ("wheel-a", "wheel-b")
+            )
+        ):
+            final_work_sync = True
+
+    def mutating_final_source_check(
+        path: Path,
+        attestation: object,
+    ) -> None:
+        nonlocal mutated
+        real_recheck_source(path, attestation)
+        if final_work_sync and not mutated:
+            target = work_root / mutated_directory / PRODUCER_FILENAME
+            target.write_bytes(b"X" + payload[1:])
+            mutated = True
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "fsync", recording_fsync)
+    module_globals["_recheck_source_attestation"] = mutating_final_source_check
+
+    with pytest.raises(error_type, match="changed|authentication|publication"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert mutated
+    for directory in ("wheel-a", "wheel-b"):
+        assert (work_root / directory / PRODUCER_FILENAME).read_bytes() == b""
+
+
+def test_build_final_commit_orders_source_then_both_retained_output_authentications(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    payload = b"identical test wheel"
+    module_globals["_build_once"] = lambda *_arguments: payload
+    real_recheck_source = module_globals["_recheck_source_attestation"]
+    real_authenticate = module_globals["_authenticate_open_file"]
+    events: list[tuple[str, str | None]] = []
+
+    def recording_source_check(path: Path, attestation: object) -> None:
+        real_recheck_source(path, attestation)
+        events.append(("source", None))
+
+    def recording_output_authentication(
+        descriptor: int,
+        expected: bytes,
+        label: str,
+    ) -> object:
+        authenticated = real_authenticate(descriptor, expected, label)
+        events.append(("output", label))
+        return authenticated
+
+    module_globals["_recheck_source_attestation"] = recording_source_check
+    module_globals["_authenticate_open_file"] = recording_output_authentication
+
+    module_globals["_run"](source, build_python, work_root)
+
+    assert events[-3:] == [
+        ("source", None),
+        ("output", "wheel-a producer wheel"),
+        ("output", "wheel-b producer wheel"),
+    ]
+
+
+@pytest.mark.parametrize("mutated_directory", ("wheel-a", "wheel-b"))
+def test_build_rejects_output_mutation_during_the_final_prepared_inventory(
+    tmp_path: Path,
+    build_python: Path,
+    mutated_directory: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    payload = b"identical test wheel"
+    module_globals["_build_once"] = lambda *_arguments: payload
+    real_reauthenticate = module_globals[
+        "_reauthenticate_owned_outputs_for_commit"
+    ]
+    real_inventory = module_globals["_directory_inventory_fd"]
+    final_bytes_verified = False
+    mutated = False
+
+    def recording_reauthentication(
+        owned: object,
+        expected: bytes,
+    ) -> None:
+        nonlocal final_bytes_verified
+        real_reauthenticate(owned, expected)
+        final_bytes_verified = True
+
+    def mutating_inventory(
+        descriptor: int,
+        label: str,
+    ) -> object:
+        nonlocal mutated
+        if (
+            final_bytes_verified
+            and label == f"prepared {mutated_directory} output directory"
+            and not mutated
+        ):
+            target = work_root / mutated_directory / PRODUCER_FILENAME
+            target.write_bytes(b"X" + payload[1:])
+            mutated = True
+        return real_inventory(descriptor, label)
+
+    module_globals[
+        "_reauthenticate_owned_outputs_for_commit"
+    ] = recording_reauthentication
+    module_globals["_directory_inventory_fd"] = mutating_inventory
+
+    with pytest.raises(error_type, match="inventory|changed|publication"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert mutated
+    for directory in ("wheel-a", "wheel-b"):
+        assert (work_root / directory / PRODUCER_FILENAME).read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("source-during-output-auth", "wheel-a-during-wheel-b-inventory"),
+)
+def test_build_linearization_drift_is_rejected_by_the_later_seal(
+    tmp_path: Path,
+    build_python: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    drift: str,
+) -> None:
+    source = _copy_seal_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    wheel = producer_wheel_pair[0].read_bytes()
+    module_globals["_build_once"] = lambda *_arguments: wheel
+    real_authenticate = module_globals["_authenticate_open_file"]
+    real_reauthenticate = module_globals[
+        "_reauthenticate_owned_outputs_for_commit"
+    ]
+    real_inventory = module_globals["_directory_inventory_fd"]
+    target = source / "equipment_quality/__init__.py"
+    wheel_a_authentications = 0
+    final_bytes_verified = False
+    mutated = False
+
+    def mutating_final_output_authentication(
+        descriptor: int,
+        expected: bytes,
+        label: str,
+    ) -> object:
+        nonlocal wheel_a_authentications, mutated
+        authenticated = real_authenticate(descriptor, expected, label)
+        if (
+            drift == "source-during-output-auth"
+            and label == "wheel-a producer wheel"
+        ):
+            wheel_a_authentications += 1
+            if wheel_a_authentications == 2:
+                target.write_bytes(target.read_bytes() + b"# post-linearization drift\n")
+                mutated = True
+        return authenticated
+
+    def recording_reauthentication(
+        owned: object,
+        expected: bytes,
+    ) -> None:
+        nonlocal final_bytes_verified
+        real_reauthenticate(owned, expected)
+        final_bytes_verified = True
+
+    def mutating_final_inventory(
+        descriptor: int,
+        label: str,
+    ) -> object:
+        nonlocal mutated
+        if (
+            drift == "wheel-a-during-wheel-b-inventory"
+            and final_bytes_verified
+            and label == "prepared wheel-b output directory"
+            and not mutated
+        ):
+            output = work_root / "wheel-a" / PRODUCER_FILENAME
+            output.write_bytes(b"X" + wheel[1:])
+            mutated = True
+        return real_inventory(descriptor, label)
+
+    module_globals["_authenticate_open_file"] = mutating_final_output_authentication
+    module_globals[
+        "_reauthenticate_owned_outputs_for_commit"
+    ] = recording_reauthentication
+    module_globals["_directory_inventory_fd"] = mutating_final_inventory
+
+    # Exact earlier and later observations overlap before either injected drift,
+    # so build may linearize there; the seal must reject the now-current state.
+    module_globals["_run"](source, build_python, work_root)
+
+    assert mutated
+    wheel_a = work_root / "wheel-a" / PRODUCER_FILENAME
+    wheel_b = work_root / "wheel-b" / PRODUCER_FILENAME
+    if drift == "source-during-output-auth":
+        assert wheel_a.read_bytes() == wheel_b.read_bytes() == wheel
+    else:
+        assert wheel_a.read_bytes() != wheel
+        assert wheel_b.read_bytes() == wheel
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    producer_lock = tmp_path / "producer.lock"
+    sealed = _run_tool(
+        "seal_producer_build.py",
+        "--source-root",
+        str(source),
+        "--wheel-dir-a",
+        str(work_root / "wheel-a"),
+        "--wheel-dir-b",
+        str(work_root / "wheel-b"),
+        "--wheelhouse",
+        str(wheelhouse),
+        "--producer-lock",
+        str(producer_lock),
+    )
+    assert sealed.returncode == 2
+    assert not producer_lock.exists()
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+
+
 def test_build_rejects_replaced_output_instead_of_adopting_its_fingerprint(
     tmp_path: Path,
     build_python: Path,
