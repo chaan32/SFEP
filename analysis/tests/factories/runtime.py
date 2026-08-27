@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping
 
 from equipment_quality.deterministic import canonical_json_bytes
-from equipment_quality.runtime_verify import RuntimeEnvironment
+from equipment_quality.runtime_verify import RuntimeEnvironment, RuntimeImportOrigin
 
 
 PACKAGE_SPECS = (
@@ -36,6 +36,23 @@ PRODUCER_VERSION = "1.0.0"
 PIP_VERSION = "25.1.1"
 SOURCE_DATE_EPOCH = "1735689600"
 PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
+HASH_SEED_PROBES = (-4218979432691865272, 1379760580859628941)
+IMPORT_ROOTS = {
+    "attrs": ("attr", "attrs"),
+    "jsonschema": ("jsonschema",),
+    "jsonschema-specifications": ("jsonschema_specifications",),
+    "numpy": ("numpy",),
+    "pandas": ("pandas",),
+    "python-dateutil": ("dateutil",),
+    "pytz": ("pytz",),
+    "referencing": ("referencing",),
+    "rpds-py": ("rpds",),
+    "six": ("six",),
+    "typing-extensions": ("typing_extensions",),
+    "tzdata": ("tzdata",),
+    PRODUCER_NAME: ("equipment_quality",),
+}
+MODULE_IMPORT_ROOTS = frozenset({"six", "typing_extensions"})
 
 
 def sha256_uri(data: bytes) -> str:
@@ -62,6 +79,7 @@ class FakeDistribution(Distribution):
         *,
         payload_files: Mapping[str, bytes] | None = None,
         direct_url_bytes: bytes = b'{"url":"file:///build/source"}\n',
+        import_roots: tuple[str, ...] | None = None,
     ) -> None:
         self.root = root
         self._name = name
@@ -70,10 +88,17 @@ class FakeDistribution(Distribution):
         self._record_read_count = 0
         stem = _distribution_stem(name)
         self.dist_info = f"{stem}-{version}.dist-info"
+        roots = (stem,) if import_roots is None else import_roots
+        root_files = {
+            (
+                f"{root}.py"
+                if root in MODULE_IMPORT_ROOTS
+                else f"{root}/__init__.py"
+            ): f"# installed {name} {version}\nVALUE = {name!r}\n".encode("utf-8")
+            for root in roots
+        }
         default_files = {
-            f"{stem}/__init__.py": (
-                f"# installed {name} {version}\nVALUE = {name!r}\n"
-            ).encode("utf-8"),
+            **root_files,
             f"{self.dist_info}/METADATA": (
                 f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n\n"
             ).encode("utf-8"),
@@ -315,12 +340,22 @@ def build_runtime_fixture(
 
     distributions: dict[str, FakeDistribution] = {}
     for name, version, _direct in PACKAGE_SPECS:
+        payload_files = None
+        if name == "numpy":
+            payload_files = {
+                "numpy/_core/__init__.py": b"# installed numpy core\n",
+                "numpy/_core/_multiarray_umath.cpython-312-darwin.so": (
+                    b"fixture extension module"
+                ),
+            }
         distributions[name] = FakeDistribution(
             runtime_root / "distributions" / _distribution_stem(name)
             / "lib/python3.12/site-packages",
             name,
             version,
+            payload_files=payload_files,
             direct_url_bytes=direct_url_bytes,
+            import_roots=IMPORT_ROOTS[name],
         )
     distributions["pip"] = FakeDistribution(
         runtime_root / "distributions/pip/lib/python3.12/site-packages",
@@ -337,6 +372,7 @@ def build_runtime_fixture(
             PROVENANCE_PATH: canonical_json_bytes(provenance),
         },
         direct_url_bytes=direct_url_bytes,
+        import_roots=IMPORT_ROOTS[PRODUCER_NAME],
     )
 
     packages: list[dict[str, object]] = []
@@ -399,6 +435,56 @@ def build_runtime_fixture(
             "floatPolicy": "IEEE754_BINARY64_FINITE",
         },
     }
+    resolved_imports: list[RuntimeImportOrigin] = []
+    loaded_imports: list[RuntimeImportOrigin] = []
+    for distribution_name, roots in IMPORT_ROOTS.items():
+        distribution = distributions[distribution_name]
+        for root_name in roots:
+            is_module = root_name in MODULE_IMPORT_ROOTS
+            origin = distribution.locate_file(
+                f"{root_name}.py" if is_module else f"{root_name}/__init__.py"
+            )
+            package_locations = (
+                () if is_module else (distribution.locate_file(root_name),)
+            )
+            resolved_imports.append(RuntimeImportOrigin(
+                name=root_name,
+                origin=origin,
+                module_file=None,
+                package_locations=package_locations,
+                module_package_locations=(),
+                loader_module="_frozen_importlib_external",
+            ))
+            loaded_imports.append(RuntimeImportOrigin(
+                name=root_name,
+                origin=origin,
+                module_file=origin,
+                package_locations=package_locations,
+                module_package_locations=package_locations,
+                loader_module="_frozen_importlib_external",
+            ))
+    numpy_distribution = distributions["numpy"]
+    numpy_extension = numpy_distribution.locate_file(
+        "numpy/_core/_multiarray_umath.cpython-312-darwin.so"
+    )
+    loaded_imports.extend((
+        RuntimeImportOrigin(
+            name="numpy._core._multiarray_umath",
+            origin=numpy_extension,
+            module_file=numpy_extension,
+            package_locations=(),
+            module_package_locations=(),
+            loader_module="_frozen_importlib_external",
+        ),
+        RuntimeImportOrigin(
+            name="six.moves",
+            origin=None,
+            module_file=None,
+            package_locations=(),
+            module_package_locations=(),
+            loader_module="six",
+        ),
+    ))
     environment = RuntimeEnvironment(
         executable=executable,
         platform_system="Darwin",
@@ -413,6 +499,9 @@ def build_runtime_fixture(
         python_hash_seed="0",
         timezone="Asia/Seoul",
         distributions=tuple(reversed(tuple(distributions.values()))),
+        python_hash_probes=HASH_SEED_PROBES,
+        resolved_imports=tuple(sorted(resolved_imports, key=lambda item: item.name)),
+        loaded_imports=tuple(sorted(loaded_imports, key=lambda item: item.name)),
     )
     manifest_path = root / "producer_runtime.json"
     fixture = RuntimeFixture(

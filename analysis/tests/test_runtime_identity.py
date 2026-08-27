@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import importlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import sys
 from types import MappingProxyType
+from types import ModuleType
 
 import pytest
 
 from factories.runtime import (
+    HASH_SEED_PROBES,
+    IMPORT_ROOTS,
     PACKAGE_SPECS,
     PIP_VERSION,
     PRODUCER_NAME,
@@ -29,6 +33,7 @@ from factories.runtime import (
 from equipment_quality.deterministic import canonical_json_bytes
 from equipment_quality.runtime_verify import (
     RuntimeIdentityError,
+    RuntimeImportOrigin,
     installed_code_tree,
     verify_runtime,
 )
@@ -40,6 +45,7 @@ def test_runtime_verifier_public_api_is_present() -> None:
 
     runtime_verify = importlib.import_module(module_name)
     assert issubclass(runtime_verify.RuntimeIdentityError, RuntimeError)
+    assert runtime_verify.RuntimeImportOrigin.__dataclass_params__.frozen
     assert runtime_verify.RuntimeEnvironment.__dataclass_params__.frozen
     assert runtime_verify.RuntimeIdentity.__dataclass_params__.frozen
     assert callable(runtime_verify.installed_code_tree)
@@ -64,6 +70,18 @@ def _package_manifest(
         package
         for package in packages
         if isinstance(package, dict) and package["name"] == name
+    )
+
+
+def _replace_import(
+    imports: tuple[RuntimeImportOrigin, ...],
+    name: str,
+    **changes: object,
+) -> tuple[RuntimeImportOrigin, ...]:
+    assert sum(item.name == name for item in imports) == 1
+    return tuple(
+        replace(item, **changes) if item.name == name else item
+        for item in imports
     )
 
 
@@ -158,8 +176,17 @@ def test_installed_code_tree_matches_independent_exact_line_vector(
     stem = "attrs"
     metadata_path = f"{distribution.dist_info}/METADATA"
     package_path = f"{stem}/__init__.py"
+    legacy_package_path = "attr/__init__.py"
     expected_lines = sorted(
         (
+            legacy_package_path.encode("utf-8")
+            + b"=sha256:"
+            + hashlib.sha256(
+                distribution.locate_file(legacy_package_path).read_bytes()
+            )
+            .hexdigest()
+            .encode("ascii")
+            + b"\n",
             package_path.encode("utf-8")
             + b"=sha256:"
             + hashlib.sha256(distribution.locate_file(package_path).read_bytes())
@@ -247,6 +274,151 @@ def test_generated_bin_record_rejects_a_symlinked_parent(
     real_directory = bin_directory.with_name("bin-real")
     bin_directory.rename(real_directory)
     bin_directory.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+@pytest.mark.parametrize(
+    "codepoint",
+    (*range(32), 127),
+    ids=lambda value: f"U+{value:04X}",
+)
+def test_record_paths_reject_every_c0_boundary_and_del_character(
+    runtime_fixture: RuntimeFixture,
+    codepoint: int,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    unsafe_path = f"attrs/control{chr(codepoint)}.py"
+    if "\x00" in unsafe_path:
+        distribution.add_row(unsafe_path, "", "")
+    else:
+        distribution.replace_file(unsafe_path, b"unsafe path payload\n")
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+def test_record_path_control_rejection_prevents_independent_preimage_collision(
+    tmp_path: Path,
+) -> None:
+    attack = FakeDistribution(
+        tmp_path / "attack/lib/python3.12/site-packages",
+        "attrs",
+        "25.3.0",
+    )
+    normal = FakeDistribution(
+        tmp_path / "normal/lib/python3.12/site-packages",
+        "attrs",
+        "25.3.0",
+    )
+    first_bytes = b"first collision line\n"
+    second_bytes = b"second collision line\n"
+    first_hex = hashlib.sha256(first_bytes).hexdigest()
+    attack.replace_file(
+        f"attrs/a=sha256:{first_hex}\nattrs/b",
+        second_bytes,
+    )
+    normal.replace_file("attrs/a", first_bytes)
+    normal.replace_file("attrs/b", second_bytes)
+
+    assert independent_tree_preimage(attack) == independent_tree_preimage(normal)
+    assert installed_code_tree(normal) == independent_installed_code_tree(normal)
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(attack)
+
+
+@pytest.mark.parametrize(
+    "unsupported_path",
+    [
+        "../../bin/attrs",
+        "../../../../bin/attrs",
+        "../../../bin/tools/attrs",
+        "../../../bin/../attrs",
+    ],
+)
+def test_generated_script_exclusion_requires_exact_darwin_venv_shape(
+    runtime_fixture: RuntimeFixture,
+    unsupported_path: str,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    distribution.replace_file(unsupported_path, b"#!/bin/sh\n")
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+def test_generated_script_exclusion_rejects_a_directory_target(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    script_path = "../../../bin/attrs"
+    distribution.remove_record_path(script_path, unlink=True)
+    distribution.locate_file(script_path).mkdir()
+    distribution.add_row(script_path, "", "")
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+def test_record_locate_file_must_equal_the_checked_base_path_mapping(
+    runtime_fixture: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    raw_path = "attrs/__init__.py"
+    expected = distribution.locate_file(raw_path)
+    arbitrary = runtime_fixture.root / "adapter-selected.py"
+    arbitrary.write_bytes(expected.read_bytes())
+    original_locate = distribution.locate_file
+
+    def relocated(path: str | PurePosixPath) -> Path:
+        if str(path) == raw_path:
+            return arbitrary
+        return original_locate(path)
+
+    monkeypatch.setattr(distribution, "locate_file", relocated)
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+def test_record_locate_file_rejects_symlink_intermediate_lexical_alias(
+    runtime_fixture: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    raw_path = "attrs/__init__.py"
+    expected = distribution.locate_file(raw_path)
+    outside = runtime_fixture.root / "outside"
+    arbitrary = outside / raw_path
+    arbitrary.parent.mkdir(parents=True)
+    arbitrary.write_bytes(expected.read_bytes())
+    intermediate = outside / "child"
+    intermediate.mkdir()
+    adapter_link = distribution.root / "adapter-link"
+    adapter_link.symlink_to(intermediate, target_is_directory=True)
+    original_locate = distribution.locate_file
+
+    def relocated(path: str | PurePosixPath) -> Path:
+        if str(path) == raw_path:
+            return adapter_link / ".." / raw_path
+        return original_locate(path)
+
+    monkeypatch.setattr(distribution, "locate_file", relocated)
+
+    with pytest.raises(RuntimeIdentityError):
+        installed_code_tree(distribution)
+
+
+def test_record_change_after_distribution_read_is_rejected(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    rows = distribution.rows()
+    distribution.set_record_read_callback(
+        lambda: distribution.replace_rows(reversed(rows))
+    )
 
     with pytest.raises(RuntimeIdentityError):
         installed_code_tree(distribution)
@@ -451,6 +623,327 @@ def test_runtime_rejects_platform_python_and_environment_policy_mutations(
 
     with pytest.raises(RuntimeIdentityError):
         _verify(runtime_fixture)
+
+
+@pytest.mark.parametrize(
+    "probes",
+    [
+        (HASH_SEED_PROBES[0] + 1, HASH_SEED_PROBES[1]),
+        (HASH_SEED_PROBES[0], HASH_SEED_PROBES[1] + 1),
+        tuple(reversed(HASH_SEED_PROBES)),
+    ],
+)
+def test_runtime_authenticates_active_hash_seed_with_pinned_probes(
+    runtime_fixture: RuntimeFixture,
+    probes: tuple[int, int],
+) -> None:
+    assert runtime_fixture.environment.python_hash_seed == "0"
+    runtime_fixture.replace_environment(python_hash_probes=probes)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_import_root_map_is_exact_and_extension_and_synthetic_modules_bind(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    expected_roots = {
+        root
+        for distribution_roots in IMPORT_ROOTS.values()
+        for root in distribution_roots
+    }
+
+    identity = _verify(runtime_fixture)
+
+    assert identity.manifest_bytes == runtime_fixture.manifest_path.read_bytes()
+    assert {item.name for item in runtime_fixture.environment.resolved_imports} == (
+        expected_roots
+    )
+    loaded = {item.name: item for item in runtime_fixture.environment.loaded_imports}
+    assert loaded["numpy._core._multiarray_umath"].origin.name.endswith(".so")
+    assert loaded["six.moves"].origin is None
+    assert loaded["six.moves"].loader_module == "six"
+
+
+@pytest.mark.parametrize("snapshot_field", ["resolved_imports", "loaded_imports"])
+def test_runtime_import_snapshots_are_frozen_unique_and_ordered(
+    runtime_fixture: RuntimeFixture,
+    snapshot_field: str,
+) -> None:
+    snapshot = getattr(runtime_fixture.environment, snapshot_field)
+    assert isinstance(snapshot, tuple)
+    runtime_fixture.replace_environment(**{snapshot_field: tuple(reversed(snapshot))})
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "name", "changes"),
+    [
+        (
+            "resolved_imports",
+            "attrs",
+            {"origin": Path("/tmp/source-shadow/attrs/__init__.py")},
+        ),
+        (
+            "loaded_imports",
+            "jsonschema",
+            {
+                "origin": Path("/tmp/pythonpath-shadow/jsonschema/__init__.py"),
+                "module_file": Path("/tmp/pythonpath-shadow/jsonschema/__init__.py"),
+            },
+        ),
+    ],
+)
+def test_runtime_rejects_resolved_and_loaded_source_tree_shadows(
+    runtime_fixture: RuntimeFixture,
+    snapshot_field: str,
+    name: str,
+    changes: dict[str, object],
+) -> None:
+    snapshot = getattr(runtime_fixture.environment, snapshot_field)
+    runtime_fixture.replace_environment(
+        **{snapshot_field: _replace_import(snapshot, name, **changes)}
+    )
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_import_origin_symlink_intermediate_lexical_alias(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    expected = distribution.locate_file("attrs/__init__.py")
+    outside = runtime_fixture.root / "import-outside"
+    arbitrary = outside / "attrs/__init__.py"
+    arbitrary.parent.mkdir(parents=True)
+    arbitrary.write_bytes(expected.read_bytes())
+    intermediate = outside / "child"
+    intermediate.mkdir()
+    adapter_link = distribution.root / "import-link"
+    adapter_link.symlink_to(intermediate, target_is_directory=True)
+    aliased_origin = adapter_link / ".." / "attrs/__init__.py"
+    resolved = _replace_import(
+        runtime_fixture.environment.resolved_imports,
+        "attrs",
+        origin=aliased_origin,
+        package_locations=(aliased_origin.parent,),
+    )
+    runtime_fixture.replace_environment(resolved_imports=resolved)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_import_origin_backed_by_the_wrong_distribution(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    wrong_origin = runtime_fixture.distributions["attrs"].locate_file(
+        "attrs/__init__.py"
+    )
+    snapshot = _replace_import(
+        runtime_fixture.environment.resolved_imports,
+        "jsonschema",
+        origin=wrong_origin,
+        package_locations=(wrong_origin.parent,),
+    )
+    runtime_fixture.replace_environment(resolved_imports=snapshot)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_record_backed_non_module_origin(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["jsonschema"]
+    metadata_origin = distribution.locate_file(f"{distribution.dist_info}/METADATA")
+    snapshot = _replace_import(
+        runtime_fixture.environment.resolved_imports,
+        "jsonschema",
+        origin=metadata_origin,
+        package_locations=(),
+    )
+    runtime_fixture.replace_environment(resolved_imports=snapshot)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_package_initializer_without_its_package_location(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    snapshot = _replace_import(
+        runtime_fixture.environment.resolved_imports,
+        "jsonschema",
+        package_locations=(),
+    )
+    runtime_fixture.replace_environment(resolved_imports=snapshot)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_module_file_disagreement_and_unbacked_package_location(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    original_loaded = runtime_fixture.environment.loaded_imports
+    shadow = runtime_fixture.root / "shadow/jsonschema/__init__.py"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_bytes(b"shadow\n")
+    loaded = _replace_import(
+        runtime_fixture.environment.loaded_imports,
+        "jsonschema",
+        module_file=shadow,
+    )
+    runtime_fixture.replace_environment(loaded_imports=loaded)
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+    resolved = _replace_import(
+        runtime_fixture.environment.resolved_imports,
+        "jsonschema",
+        package_locations=(shadow.parent,),
+    )
+    runtime_fixture.replace_environment(
+        resolved_imports=resolved,
+        loaded_imports=original_loaded,
+    )
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_loaded_module_path_that_disagrees_with_its_spec(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    shadow = runtime_fixture.root / "shadow/jsonschema"
+    shadow.mkdir(parents=True)
+    loaded = _replace_import(
+        runtime_fixture.environment.loaded_imports,
+        "jsonschema",
+        module_package_locations=(shadow,),
+    )
+    runtime_fixture.replace_environment(loaded_imports=loaded)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_loaded_module_file_symlink_intermediate_lexical_alias(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    expected = distribution.locate_file("attrs/__init__.py")
+    outside = runtime_fixture.root / "module-file-outside"
+    arbitrary = outside / "attrs/__init__.py"
+    arbitrary.parent.mkdir(parents=True)
+    arbitrary.write_bytes(expected.read_bytes())
+    intermediate = outside / "child"
+    intermediate.mkdir()
+    adapter_link = distribution.root / "module-file-link"
+    adapter_link.symlink_to(intermediate, target_is_directory=True)
+    aliased_file = adapter_link / ".." / "attrs/__init__.py"
+    loaded = _replace_import(
+        runtime_fixture.environment.loaded_imports,
+        "attrs",
+        module_file=aliased_file,
+    )
+    runtime_fixture.replace_environment(loaded_imports=loaded)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+@pytest.mark.parametrize(
+    ("name", "changes"),
+    [
+        (
+            "attrs",
+            {
+                "origin": None,
+                "module_file": None,
+                "loader_module": "_frozen_importlib_external",
+            },
+        ),
+        ("six.moves", {"loader_module": "importlib"}),
+    ],
+)
+def test_runtime_rejects_namespace_roots_and_unbacked_synthetic_loaders(
+    runtime_fixture: RuntimeFixture,
+    name: str,
+    changes: dict[str, object],
+) -> None:
+    field = "resolved_imports" if name == "attrs" else "loaded_imports"
+    snapshot = getattr(runtime_fixture.environment, field)
+    runtime_fixture.replace_environment(
+        **{field: _replace_import(snapshot, name, **changes)}
+    )
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_runtime_rejects_originless_child_namespace_with_a_package_loader(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    injected = RuntimeImportOrigin(
+        name="jsonschema.namespace",
+        origin=None,
+        module_file=None,
+        package_locations=(),
+        module_package_locations=(),
+        loader_module="jsonschema",
+    )
+    loaded = tuple(sorted(
+        (*runtime_fixture.environment.loaded_imports, injected),
+        key=lambda item: item.name,
+    ))
+    runtime_fixture.replace_environment(loaded_imports=loaded)
+
+    with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+def test_production_import_capture_records_resolutions_and_all_loaded_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_verify = importlib.import_module("equipment_quality.runtime_verify")
+    probe = ModuleType("attrs.review_probe")
+    probe_origin = tmp_path / "attrs/review_probe.py"
+    probe.__file__ = str(probe_origin)
+    probe.__spec__ = importlib.machinery.ModuleSpec(
+        probe.__name__,
+        loader=None,
+        origin=str(probe_origin),
+    )
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+
+    resolved, loaded = runtime_verify._capture_import_state()
+
+    assert {item.name for item in resolved} == {
+        root for roots in IMPORT_ROOTS.values() for root in roots
+    }
+    assert any(item.name == probe.__name__ for item in loaded)
+
+
+def test_production_import_capture_records_the_active_loaded_module_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_verify = importlib.import_module("equipment_quality.runtime_verify")
+    module = sys.modules["jsonschema"]
+    shadow = tmp_path / "pythonpath-shadow/jsonschema"
+    shadow.mkdir(parents=True)
+    monkeypatch.setattr(module, "__path__", [str(shadow)])
+
+    _resolved, loaded = runtime_verify._capture_import_state()
+    captured = next(item for item in loaded if item.name == "jsonschema")
+
+    assert captured.module_package_locations == (shadow,)
+    assert captured.module_package_locations != captured.package_locations
 
 
 def test_runtime_hashes_realpath_interpreter_bytes(
