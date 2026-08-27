@@ -8,10 +8,12 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 from pathlib import Path, PurePosixPath
 import sys
 from types import MappingProxyType
 from types import ModuleType
+from typing import get_type_hints
 
 import pytest
 
@@ -50,6 +52,19 @@ def test_runtime_verifier_public_api_is_present() -> None:
     assert runtime_verify.RuntimeIdentity.__dataclass_params__.frozen
     assert callable(runtime_verify.installed_code_tree)
     assert callable(runtime_verify.verify_runtime)
+
+
+def test_runtime_environment_captures_exact_frozen_bytecode_policy() -> None:
+    runtime_verify = importlib.import_module("equipment_quality.runtime_verify")
+
+    assert get_type_hints(runtime_verify.RuntimeEnvironment)[
+        "python_dont_write_bytecode"
+    ] is bool
+    snapshot = runtime_verify._capture_environment()
+    assert type(snapshot.python_dont_write_bytecode) is bool
+    assert snapshot.python_dont_write_bytecode is sys.dont_write_bytecode
+    with pytest.raises(FrozenInstanceError):
+        snapshot.python_dont_write_bytecode = False  # type: ignore[misc]
 
 
 @pytest.fixture
@@ -255,6 +270,10 @@ def test_pip_generated_unhashed_bytecode_record_rows_are_excluded(
 ) -> None:
     distribution = runtime_fixture.distributions["attrs"]
     original = installed_code_tree(distribution)
+    distribution.replace_file(
+        "attrs/__pycache__/generated.cpython-312.pyc",
+        b"generated cache",
+    )
     rows = distribution.rows()
     generated = next(
         row for row in rows if "__pycache__" in row[0] and row[0].endswith(".pyc")
@@ -263,6 +282,166 @@ def test_pip_generated_unhashed_bytecode_record_rows_are_excluded(
     distribution.replace_rows(rows)
 
     assert installed_code_tree(distribution) == original
+
+
+@pytest.mark.parametrize(
+    "distribution_name",
+    tuple(name for name, _version, _direct in PACKAGE_SPECS)
+    + ("pip", PRODUCER_NAME),
+)
+def test_runtime_rejects_unrecorded_bytecode_in_every_distribution_root(
+    runtime_fixture: RuntimeFixture,
+    distribution_name: str,
+) -> None:
+    distribution = runtime_fixture.distributions[distribution_name]
+    target = distribution.locate_file("post-seal-injected.pyc")
+    payload = f"poison:{distribution_name}\n".encode("utf-8")
+    distribution.replace_file(
+        "post-seal-injected.pyc",
+        payload,
+        refresh_record=False,
+    )
+
+    with pytest.raises(RuntimeIdentityError, match="bytecode|cache"):
+        _verify(runtime_fixture)
+
+    assert target.is_file()
+    assert target.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "record_style"),
+    [
+        ("pip/recorded.pyc", "hashed"),
+        ("pip/recorded.pyo", "unhashed"),
+    ],
+)
+def test_runtime_rejects_recorded_hashed_and_unhashed_bytecode(
+    runtime_fixture: RuntimeFixture,
+    relative_path: str,
+    record_style: str,
+) -> None:
+    distribution = runtime_fixture.distributions["pip"]
+    payload = b"recorded bytecode must not survive sealing\n"
+    distribution.replace_file(
+        relative_path,
+        payload,
+        refresh_record=record_style == "hashed",
+    )
+    if record_style == "unhashed":
+        distribution.add_row(relative_path, "", "")
+
+    with pytest.raises(RuntimeIdentityError, match="bytecode|cache"):
+        _verify(runtime_fixture)
+
+    assert distribution.locate_file(relative_path).read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    "entry_kind",
+    [
+        "cache-file",
+        "cache-directory",
+        "cache-symlink",
+        "bytecode-symlink",
+        "bytecode-directory",
+        "bytecode-fifo",
+    ],
+)
+def test_runtime_rejects_unsafe_cache_entries_without_following_or_mutating(
+    runtime_fixture: RuntimeFixture,
+    entry_kind: str,
+) -> None:
+    distribution = runtime_fixture.distributions["pip"]
+    external = runtime_fixture.root / "outside-cache-target"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_bytes(b"outside must remain untouched\n")
+
+    if entry_kind == "cache-file":
+        target = distribution.locate_file("__pycache__")
+        target.write_bytes(b"not a directory\n")
+    elif entry_kind == "cache-directory":
+        target = distribution.locate_file("__pycache__")
+        target.mkdir()
+    elif entry_kind == "cache-symlink":
+        target = distribution.locate_file("__pycache__")
+        target.symlink_to(external, target_is_directory=True)
+    elif entry_kind == "bytecode-symlink":
+        target = distribution.locate_file("unsafe.pyc")
+        target.symlink_to(sentinel)
+    elif entry_kind == "bytecode-directory":
+        target = distribution.locate_file("unsafe.pyo")
+        target.mkdir()
+    else:
+        target = distribution.locate_file("unsafe.pyo")
+        os.mkfifo(target)
+    before_mode = target.lstat().st_mode
+    before_link = os.readlink(target) if target.is_symlink() else None
+
+    with pytest.raises(RuntimeIdentityError, match="bytecode|cache"):
+        _verify(runtime_fixture)
+
+    assert target.lstat().st_mode == before_mode
+    if before_link is not None:
+        assert os.readlink(target) == before_link
+    assert sentinel.read_bytes() == b"outside must remain untouched\n"
+
+
+def test_runtime_rejects_bytecode_created_after_the_initial_scan(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["attrs"]
+    relative_path = "attrs/__pycache__/late.cpython-312.pyc"
+    payload = b"created while RECORD verification is active\n"
+    target = distribution.locate_file(relative_path)
+    distribution.set_record_read_callback(
+        lambda: distribution.replace_file(
+            relative_path,
+            payload,
+            refresh_record=False,
+        )
+    )
+
+    with pytest.raises(RuntimeIdentityError, match="bytecode|cache"):
+        _verify(runtime_fixture)
+
+    assert target.read_bytes() == payload
+
+
+def test_runtime_rejects_distribution_root_with_symlinked_intermediate_component(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    distribution = runtime_fixture.distributions["pip"]
+    real_root = distribution.root
+    alias = runtime_fixture.root / "distribution-root-alias"
+    alias.symlink_to(real_root.parent, target_is_directory=True)
+    distribution.root = alias / real_root.name
+    before_link = os.readlink(alias)
+
+    with pytest.raises(RuntimeIdentityError, match="symlink"):
+        _verify(runtime_fixture)
+
+    assert os.readlink(alias) == before_link
+
+
+def test_runtime_rejects_distribution_root_identity_change_during_verification(
+    runtime_fixture: RuntimeFixture,
+) -> None:
+    pip_distribution = runtime_fixture.distributions["pip"]
+    alternate = FakeDistribution(
+        runtime_fixture.root / "alternate/lib/python3.12/site-packages",
+        "pip",
+        PIP_VERSION,
+    )
+    runtime_fixture.distributions["attrs"].set_record_read_callback(
+        lambda: setattr(pip_distribution, "root", alternate.root)
+    )
+
+    with pytest.raises(RuntimeIdentityError, match="root|identity"):
+        _verify(runtime_fixture)
+
+    assert pip_distribution.root == alternate.root
 
 
 def test_generated_bin_record_rejects_a_symlinked_parent(
@@ -622,6 +801,21 @@ def test_runtime_rejects_platform_python_and_environment_policy_mutations(
     runtime_fixture.replace_environment(**{field: changed})
 
     with pytest.raises(RuntimeIdentityError):
+        _verify(runtime_fixture)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [False, 0, 1, "true", None],
+    ids=["false", "zero", "one", "text", "none"],
+)
+def test_runtime_rejects_false_and_non_bool_bytecode_policy(
+    runtime_fixture: RuntimeFixture,
+    policy: object,
+) -> None:
+    runtime_fixture.replace_environment(python_dont_write_bytecode=policy)
+
+    with pytest.raises(RuntimeIdentityError, match="bytecode"):
         _verify(runtime_fixture)
 
 

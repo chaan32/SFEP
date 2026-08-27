@@ -122,6 +122,7 @@ class RuntimeEnvironment:
     python_soabi: str
     python_hash_seed: str | None
     timezone: str | None
+    python_dont_write_bytecode: bool
     distributions: tuple[Distribution, ...]
     python_hash_probes: tuple[int, int]
     resolved_imports: tuple[RuntimeImportOrigin, ...]
@@ -144,6 +145,21 @@ class _VerifiedTree:
     captured_file: bytes | None
     record_files: Mapping[str, tuple[str, str]]
     record_directories: Mapping[str, tuple[str, str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _DistributionRoot:
+    path: Path
+    lexical: str
+    physical: str
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DistributionRoots:
+    inventory: tuple[tuple[str, str, str, int, int], ...]
+    unique: tuple[_DistributionRoot, ...]
 
 
 def _identity_error(message: str, error: Exception | None = None) -> RuntimeIdentityError:
@@ -772,6 +788,7 @@ def _capture_environment() -> RuntimeEnvironment:
         python_soabi=soabi,
         python_hash_seed=os.environ.get("PYTHONHASHSEED"),
         timezone=os.environ.get("TZ"),
+        python_dont_write_bytecode=sys.dont_write_bytecode,
         distributions=tuple(importlib_metadata.distributions()),
         python_hash_probes=tuple(str.__hash__(value) for value in _HASH_PROBE_INPUTS),
         resolved_imports=resolved_imports,
@@ -811,6 +828,187 @@ def _installed_distributions(
     if frozenset(observed) != _EXPECTED_DISTRIBUTIONS:
         raise _identity_error("installed distribution inventory is not exact")
     return observed
+
+
+def _open_non_symlink_directory(path: Path) -> int:
+    _lexical_path_key(path)
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not directory_flag or not no_follow_flag:
+        raise _identity_error(
+            "runtime cannot enforce non-symlink distribution roots"
+        )
+    flags |= directory_flag | no_follow_flag
+    descriptor = -1
+    try:
+        descriptor = os.open(absolute.anchor, flags)
+        for component in absolute.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _identity_error(
+            "runtime distribution root ancestry is inaccessible or symlinked",
+            error,
+        )
+    return descriptor
+
+
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    try:
+        descriptor_stat = os.fstat(descriptor)
+    except OSError as error:
+        raise _identity_error("runtime distribution root is inaccessible", error)
+    if not stat.S_ISDIR(descriptor_stat.st_mode):
+        raise _identity_error("runtime distribution root must be a directory")
+    return descriptor_stat.st_dev, descriptor_stat.st_ino
+
+
+def _capture_distribution_root(path: Path) -> _DistributionRoot:
+    lexical = _lexical_path_key(path)
+    physical_before = _physical_path_key(path)
+    descriptor = _open_non_symlink_directory(path)
+    try:
+        before_identity = _directory_identity(descriptor)
+    finally:
+        os.close(descriptor)
+    physical_after = _physical_path_key(path)
+    descriptor = _open_non_symlink_directory(path)
+    try:
+        after_identity = _directory_identity(descriptor)
+    finally:
+        os.close(descriptor)
+    if physical_after != physical_before or after_identity != before_identity:
+        raise _identity_error(
+            "runtime distribution root identity changed while capturing"
+        )
+    device, inode = after_identity
+    return _DistributionRoot(
+        path,
+        lexical,
+        physical_after,
+        device,
+        inode,
+    )
+
+
+def _distribution_installation_roots(
+    installed: Mapping[str, Distribution],
+) -> _DistributionRoots:
+    inventory: list[tuple[str, str, str, int, int]] = []
+    roots: dict[tuple[str, str], _DistributionRoot] = {}
+    for name in sorted(installed, key=lambda value: value.encode("utf-8")):
+        distribution = installed[name]
+        try:
+            root = Path(distribution.locate_file(PurePosixPath(".")))
+        except Exception as error:
+            raise _identity_error(
+                "runtime distribution root is unavailable for cache verification",
+                error,
+            )
+        root_value = _capture_distribution_root(root)
+        inventory.append((
+            name,
+            root_value.lexical,
+            root_value.physical,
+            root_value.device,
+            root_value.inode,
+        ))
+        key = (root_value.lexical, root_value.physical)
+        previous = roots.setdefault(key, root_value)
+        if previous != root_value:
+            raise _identity_error("runtime distribution root identity is ambiguous")
+    return _DistributionRoots(
+        tuple(inventory),
+        tuple(
+            roots[key]
+            for key in sorted(
+                roots,
+                key=lambda pair: (
+                    pair[0].encode("utf-8"),
+                    pair[1].encode("utf-8"),
+                ),
+            )
+        ),
+    )
+
+
+def _is_bytecode_cache_name(name: str) -> bool:
+    normalised = name.casefold()
+    return normalised == "__pycache__" or normalised.endswith((".pyc", ".pyo"))
+
+
+def _fail_bytecode_cache_scan(error: OSError) -> None:
+    raise _identity_error(
+        "runtime distribution root could not be scanned for bytecode caches",
+        error,
+    )
+
+
+def _scan_distribution_root(root: _DistributionRoot) -> None:
+    descriptor = _open_non_symlink_directory(root.path)
+    try:
+        if _directory_identity(descriptor) != (root.device, root.inode):
+            raise _identity_error("runtime distribution root identity changed")
+        entries = os.fwalk(
+            ".",
+            topdown=True,
+            onerror=_fail_bytecode_cache_scan,
+            follow_symlinks=False,
+            dir_fd=descriptor,
+        )
+        for _directory, names, files, directory_descriptor in entries:
+            for name in (*names, *files):
+                if not _is_bytecode_cache_name(name):
+                    continue
+                try:
+                    os.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise _identity_error(
+                        "runtime bytecode/cache entry is inaccessible",
+                        error,
+                    )
+                raise _identity_error(
+                    "runtime distribution root contains a bytecode/cache entry"
+                )
+    except RuntimeIdentityError:
+        raise
+    except OSError as error:
+        raise _identity_error(
+            "runtime distribution root could not be scanned for bytecode caches",
+            error,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _reject_distribution_bytecode_caches(
+    installed: Mapping[str, Distribution],
+    expected_roots: _DistributionRoots | None = None,
+) -> _DistributionRoots:
+    roots = _distribution_installation_roots(installed)
+    if expected_roots is not None and roots != expected_roots:
+        raise _identity_error("runtime distribution root identity changed")
+    for root in roots.unique:
+        _scan_distribution_root(root)
+    final_roots = _distribution_installation_roots(installed)
+    if final_roots != roots or (
+        expected_roots is not None and final_roots != expected_roots
+    ):
+        raise _identity_error("runtime distribution root identity changed")
+    return final_roots
 
 
 def _verify_import_snapshot_shape(
@@ -1042,6 +1240,11 @@ def _verify_process_facts(
     manifest: Mapping[str, object],
     environment: RuntimeEnvironment,
 ) -> None:
+    if (
+        type(environment.python_dont_write_bytecode) is not bool
+        or environment.python_dont_write_bytecode is not True
+    ):
+        raise _identity_error("runtime bytecode writing is not disabled")
     platform_manifest = manifest["platform"]
     python_manifest = manifest["python"]
     policy_manifest = manifest["environmentPolicy"]
@@ -1135,6 +1338,7 @@ def _verify_runtime(
         raise _identity_error("runtime environment adapter is invalid")
     _verify_process_facts(parsed, snapshot)
     installed = _installed_distributions(snapshot)
+    distribution_roots = _reject_distribution_bytecode_caches(installed)
 
     pip_distribution = installed["pip"]
     _require_equal(pip_distribution.version, parsed["pipVersion"], "pip version")
@@ -1181,6 +1385,7 @@ def _verify_runtime(
     frozen_manifest = _deep_freeze(parsed)
     if not isinstance(frozen_manifest, Mapping):
         raise _identity_error("runtime manifest could not be frozen")
+    _reject_distribution_bytecode_caches(installed, distribution_roots)
     return RuntimeIdentity(
         manifest_bytes=bytes(manifest_bytes),
         manifest_sha256=sha256_uri(manifest_bytes),

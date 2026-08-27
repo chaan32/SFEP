@@ -31,7 +31,7 @@ _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
 _PRODUCER_FILENAME = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
 _PRODUCER_DISTRIBUTION = "sfep-equipment-quality"
 _PRODUCER_VERSION = "1.0.0"
-_PRODUCER_SHA256 = "b2e24deb79e5beeab218c7676d62ee0aede98a2d9d876b5f8d836cf7f7fc0ee0"
+_PRODUCER_SHA256 = "3fc320e5c249d69723102abf2b535232befd39ee10ac80fecf2ef8ce243531a0"
 _PIP_VERSION = "25.1.1"
 _PACKAGE_NAMES = (
     "attrs", "jsonschema", "jsonschema-specifications", "numpy", "pandas",
