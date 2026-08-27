@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import csv
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import runpy
 import shutil
 import stat
@@ -3486,3 +3487,1118 @@ def test_build_seal_bad_lock_parent_leaves_no_temp_or_output_residue(
     assert sorted(path.name for path in wheelhouse.iterdir()) == wheelhouse_before
     assert not producer_lock.exists()
     assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+# Task 9c: independent installed-runtime seal ---------------------------------
+
+RUNTIME_PACKAGE_NAMES = (
+    "attrs",
+    "jsonschema",
+    "jsonschema-specifications",
+    "numpy",
+    "pandas",
+    "python-dateutil",
+    "pytz",
+    "referencing",
+    "rpds-py",
+    "six",
+    "typing-extensions",
+    "tzdata",
+)
+RUNTIME_DIRECT_NAMES = frozenset({"jsonschema", "numpy", "pandas"})
+RUNTIME_HASH_PROBES = (-4218979432691865272, 1379760580859628941)
+RUNTIME_GENERATED_SCRIPTS = {
+    "jsonschema": {"jsonschema": "jsonschema.cli:main"},
+    "numpy": {
+        "f2py": "numpy.f2py.f2py2e:main",
+        "numpy-config": "numpy._configtool:main",
+    },
+    "pip": {
+        "pip": "pip._internal.cli.main:main",
+        "pip3": "pip._internal.cli.main:main",
+        "pip3.12": "pip._internal.cli.main:main",
+    },
+    "sfep-equipment-quality": {
+        "sfep-equipment-quality": "equipment_quality.cli:main"
+    },
+}
+
+
+def _runtime_console_wrapper(executable: Path, target: str) -> bytes:
+    module, function = target.split(":", 1)
+    return (
+        f"#!{executable}\n"
+        "# -*- coding: utf-8 -*-\n"
+        "import re\n"
+        "import sys\n"
+        f"from {module} import {function}\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        f"    sys.exit({function}())\n"
+    ).encode("utf-8")
+
+
+def _write_runtime_pyvenv_cfg(runtime: Path, executable: Path) -> None:
+    runtime.joinpath("pyvenv.cfg").write_text(
+        "home = " + str(executable.parent) + "\n"
+        "include-system-site-packages = false\n"
+        "version = 3.12.10\n"
+        "executable = " + str(executable) + "\n"
+        "command = test oracle\n",
+        encoding="utf-8",
+    )
+
+
+def _extract_runtime_wheel(wheel: Path, purelib: Path) -> None:
+    """Install the immutable wheel payload for a test-side RECORD oracle."""
+    with zipfile.ZipFile(io.BytesIO(wheel.read_bytes())) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            target = purelib.joinpath(*PurePosixPath(info.orig_filename).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(info))
+
+
+def _prepare_runtime_seal_fixture(root: Path) -> dict[str, object]:
+    venv = root / "runtime-venv"
+    purelib = venv / "lib/python3.12/site-packages"
+    purelib.mkdir(parents=True)
+    executable = venv / "bin/python"
+    executable.parent.mkdir()
+    shutil.copy2(Path(os.path.realpath(sys.executable)), executable)
+    _write_runtime_pyvenv_cfg(venv, executable)
+    runtime_specs = [
+        item for item in THIRD_PARTY_WHEELS if item[0] in RUNTIME_PACKAGE_NAMES
+    ]
+    pip_spec = next(item for item in THIRD_PARTY_WHEELS if item[0] == "pip")
+    for spec in (*runtime_specs, pip_spec):
+        _extract_runtime_wheel(WHEELHOUSE / spec[2], purelib)
+    _extract_runtime_wheel(WHEELHOUSE / PRODUCER_FILENAME, purelib)
+    for dist_info in sorted(purelib.glob("*.dist-info")):
+        metadata = (dist_info / "METADATA").read_text(encoding="utf-8")
+        distribution_name = next(
+            line.removeprefix("Name: ").strip().casefold().replace("_", "-")
+            for line in metadata.splitlines()
+            if line.startswith("Name: ")
+        )
+        record = dist_info / "RECORD"
+        rows = _record_rows(record.read_bytes())
+        additions = {
+            f"{dist_info.name}/INSTALLER": b"pip\n",
+            f"{dist_info.name}/REQUESTED": b"",
+        }
+        if distribution_name == "sfep-equipment-quality":
+            additions[f"{dist_info.name}/direct_url.json"] = (
+                b'{"url":"file://'
+                + str(root).encode("utf-8")
+                + b'/absolute-wheelhouse"}\n'
+            )
+        for relative, payload in additions.items():
+            target = purelib.joinpath(*PurePosixPath(relative).parts)
+            target.write_bytes(payload)
+            rows.insert(-1, [relative, _record_digest(payload), str(len(payload))])
+        for script_name, target_name in RUNTIME_GENERATED_SCRIPTS.get(
+            distribution_name, {}
+        ).items():
+            relative = f"../../../bin/{script_name}"
+            payload = _runtime_console_wrapper(executable, target_name)
+            target = venv / "bin" / script_name
+            target.write_bytes(payload)
+            target.chmod(0o755)
+            rows.insert(-1, [relative, _record_digest(payload), str(len(payload))])
+        record.write_bytes(_render_record(rows))
+    probe = {
+        "schemaVersion": "sfep-runtime-probe/v1",
+        "prefix": str(venv),
+        "executable": str(executable),
+        "purelib": str(purelib),
+        "platlib": str(purelib),
+        "flags": {
+            "isolated": 1,
+            "noSite": 1,
+            "ignoreEnvironment": 1,
+            "safePath": True,
+        },
+        "platform": {
+            "system": "Darwin",
+            "machine": "arm64",
+            "macosProductVersion": "26.6.2",
+            "sysconfigPlatform": "macosx-11.0-arm64",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.10",
+            "build": "main Apr 10 2025 22:19:24",
+            "cacheTag": "cpython-312",
+            "soabi": "cpython-312-darwin",
+        },
+        "environment": {"pythonHashSeed": "0", "timezone": "Asia/Seoul"},
+        "hashProbes": list(RUNTIME_HASH_PROBES),
+    }
+    return {
+        "venv": venv,
+        "purelib": purelib,
+        "executable": executable,
+        "probe": probe,
+    }
+
+
+@pytest.fixture(scope="session")
+def runtime_seal_fixture(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    return _prepare_runtime_seal_fixture(
+        tmp_path_factory.mktemp("runtime-seal-independent")
+    )
+
+
+def _runtime_seal_namespace() -> dict[str, object]:
+    return runpy.run_path(str(TOOLS_ROOT / "seal_runtime.py"))
+
+
+def _run_runtime_seal_in_process(
+    runtime_fixture: dict[str, object],
+    output: Path,
+    *,
+    source_root: Path = ANALYSIS_ROOT,
+    producer_wheel_dir: Path = WHEELHOUSE,
+    producer_lock: Path | None = None,
+) -> bytes:
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_run"].__globals__
+    probe = copy.deepcopy(runtime_fixture["probe"])
+    module_globals["_probe_runtime"] = lambda *_arguments: probe
+    module_globals["_run"](
+        source_root,
+        producer_wheel_dir,
+        ANALYSIS_ROOT / "producer.lock" if producer_lock is None else producer_lock,
+        runtime_fixture["venv"],
+        output,
+    )
+    return output.read_bytes()
+
+
+def _independent_record_tree(purelib: Path, dist_info: Path) -> str:
+    rows = _record_rows((dist_info / "RECORD").read_bytes())
+    lines: list[tuple[bytes, bytes]] = []
+    for path, hash_field, _size in rows:
+        parts = PurePosixPath(path).parts
+        generated_script = (
+            len(parts) == 5 and parts[:4] == ("..", "..", "..", "bin")
+        )
+        excluded_metadata = (
+            len(parts) >= 2
+            and parts[-2].endswith(".dist-info")
+            and parts[-1] in {"RECORD", "INSTALLER", "direct_url.json", "REQUESTED"}
+        )
+        if (
+            generated_script
+            or "__pycache__" in parts
+            or path.endswith(".pyc")
+            or excluded_metadata
+        ):
+            continue
+        assert hash_field.startswith("sha256=")
+        target = purelib.joinpath(*parts)
+        encoded = path.encode("utf-8")
+        lines.append(
+            (
+                encoded,
+                encoded
+                + b"=sha256:"
+                + hashlib.sha256(target.read_bytes()).hexdigest().encode("ascii")
+                + b"\n",
+            )
+        )
+    preimage = b"".join(line for _path, line in sorted(lines, key=lambda item: item[0]))
+    return _sha256_uri(preimage)
+
+
+def _record_digest(payload: bytes) -> str:
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=")
+    return "sha256=" + encoded.decode("ascii")
+
+
+def _runtime_tool_error() -> type[Exception]:
+    namespace = _runtime_seal_namespace()
+    error = namespace["RuntimeSealError"]
+    assert isinstance(error, type) and issubclass(error, Exception)
+    return error
+
+
+def test_runtime_seal_offers_exact_cli_and_imports_only_stdlib(tmp_path: Path) -> None:
+    result = _run_tool("seal_runtime.py", "--help", cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "--source-root" in result.stdout
+    assert "--producer-wheel-dir" in result.stdout
+    assert "--producer-lock" in result.stdout
+    assert "--runtime-venv" in result.stdout
+    assert "--output" in result.stdout
+    tree = ast.parse((TOOLS_ROOT / "seal_runtime.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.add(node.module.partition(".")[0])
+    assert "equipment_quality" not in imported
+    assert imported <= sys.stdlib_module_names
+
+
+def test_runtime_seal_rejects_undocumented_cli_forms_before_work(
+    tmp_path: Path,
+) -> None:
+    exact = [
+        "--source-root",
+        str(tmp_path / "source"),
+        "--producer-wheel-dir",
+        str(tmp_path / "wheelhouse"),
+        "--producer-lock",
+        str(tmp_path / "producer.lock"),
+        "--runtime-venv",
+        str(tmp_path / "venv"),
+        "--output",
+        str(tmp_path / "runtime.json"),
+    ]
+    cases = (
+        ["--source", *exact[1:]],
+        [*exact, "unexpected"],
+        [*exact[:1], "relative", *exact[2:]],
+    )
+    for arguments in cases:
+        result = _run_tool("seal_runtime.py", *arguments, cwd=tmp_path)
+        assert result.returncode == 2
+        assert "Traceback" not in result.stderr
+        assert not (tmp_path / "runtime.json").exists()
+
+
+def test_runtime_seal_is_canonical_path_independent_and_schema_valid(
+    tmp_path: Path,
+    runtime_seal_fixture: dict[str, object],
+) -> None:
+    second_fixture = _prepare_runtime_seal_fixture(tmp_path / "path-distinct-install")
+    first = _run_runtime_seal_in_process(
+        runtime_seal_fixture, tmp_path / "first-runtime.json"
+    )
+    second = _run_runtime_seal_in_process(
+        second_fixture, tmp_path / "second-runtime.json"
+    )
+
+    assert first == second
+    manifest = json.loads(first)
+    assert first == _canonical_json_bytes(manifest)
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(
+        (ANALYSIS_ROOT / "equipment_quality/contracts/v1/producer_runtime.schema.json")
+        .read_bytes()
+    )
+    Draft202012Validator(schema).validate(manifest)
+    assert [item["name"] for item in manifest["packages"]] == list(
+        RUNTIME_PACKAGE_NAMES
+    )
+    assert [item["direct"] for item in manifest["packages"]] == [
+        name in RUNTIME_DIRECT_NAMES for name in RUNTIME_PACKAGE_NAMES
+    ]
+    assert manifest["pipVersion"] == "25.1.1"
+    assert manifest["producer"]["name"] == "equipment-quality"
+    assert manifest["producer"]["version"] == "1.0.0"
+    forbidden = {
+        str(ANALYSIS_ROOT).encode(),
+        str(WHEELHOUSE).encode(),
+        str(runtime_seal_fixture["venv"]).encode(),
+        str(second_fixture["venv"]).encode(),
+        str(tmp_path).encode(),
+    }
+    assert all(token not in first for token in forbidden)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "source",
+        "pyproject",
+        "bootstrap",
+        "build-requirements",
+        "requirements",
+        "wheelhouse-lock",
+        "producer-lock",
+        "third-party-wheel",
+        "producer-wheel",
+        "extra-wheel",
+        "missing-wheel",
+    ),
+)
+def test_runtime_seal_rejects_authenticated_input_drift(
+    tmp_path: Path,
+    runtime_seal_fixture: dict[str, object],
+    case: str,
+) -> None:
+    source = _copy_seal_source_root(tmp_path / "source")
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    shutil.copy2(WHEELHOUSE / PRODUCER_FILENAME, wheelhouse / PRODUCER_FILENAME)
+    producer_lock = tmp_path / "producer.lock"
+    shutil.copy2(ANALYSIS_ROOT / "producer.lock", producer_lock)
+    if case == "source":
+        target = source / "equipment_quality/__init__.py"
+        target.write_bytes(target.read_bytes() + b"# drift\n")
+    elif case == "pyproject":
+        target = source / "pyproject.toml"
+        target.write_bytes(target.read_bytes() + b"\n")
+    elif case in {"bootstrap", "build-requirements", "requirements"}:
+        filename = {
+            "bootstrap": "bootstrap.lock",
+            "build-requirements": "build-requirements.lock",
+            "requirements": "requirements.lock",
+        }[case]
+        target = source / filename
+        target.write_bytes(target.read_bytes().replace(b"sha256:", b"sha256:0", 1))
+    elif case == "wheelhouse-lock":
+        target = source / "wheelhouse.lock.json"
+        target.write_bytes(target.read_bytes().replace(b'"tag":', b'"tag" :', 1))
+    elif case == "producer-lock":
+        producer_lock.write_bytes(producer_lock.read_bytes().replace(b"sha256:", b"sha256:0"))
+    elif case == "third-party-wheel":
+        target = wheelhouse / THIRD_PARTY_WHEELS[0][2]
+        target.write_bytes(target.read_bytes() + b"drift")
+    elif case == "producer-wheel":
+        target = wheelhouse / PRODUCER_FILENAME
+        target.write_bytes(target.read_bytes() + b"drift")
+    elif case == "extra-wheel":
+        (wheelhouse / "extra-1.0.0-py3-none-any.whl").write_bytes(b"extra")
+    elif case == "missing-wheel":
+        (wheelhouse / THIRD_PARTY_WHEELS[0][2]).unlink()
+
+    with pytest.raises(RuntimeError):
+        _run_runtime_seal_in_process(
+            runtime_seal_fixture,
+            tmp_path / "runtime.json",
+            source_root=source,
+            producer_wheel_dir=wheelhouse,
+            producer_lock=producer_lock,
+        )
+    assert not (tmp_path / "runtime.json").exists()
+
+
+def _tiny_installed_distribution(root: Path) -> tuple[Path, Path, str]:
+    purelib = root / "venv/lib/python3.12/site-packages"
+    package = purelib / "demo/__init__.py"
+    metadata = purelib / "demo-1.0.dist-info/METADATA"
+    wheel = purelib / "demo-1.0.dist-info/WHEEL"
+    package.parent.mkdir(parents=True)
+    metadata.parent.mkdir(parents=True)
+    package.write_bytes(b"VALUE = 1\n")
+    metadata.write_bytes(b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n\n")
+    wheel.write_bytes(b"Wheel-Version: 1.0\nTag: py3-none-any\n\n")
+    rows = [
+        ["demo/__init__.py", _record_digest(package.read_bytes()), str(package.stat().st_size)],
+        ["demo-1.0.dist-info/METADATA", _record_digest(metadata.read_bytes()), str(metadata.stat().st_size)],
+        ["demo-1.0.dist-info/WHEEL", _record_digest(wheel.read_bytes()), str(wheel.stat().st_size)],
+        ["demo-1.0.dist-info/RECORD", "", ""],
+    ]
+    record = metadata.parent / "RECORD"
+    record.write_bytes(_render_record(rows))
+    expected = _independent_record_tree(purelib, metadata.parent)
+    return purelib, metadata.parent, expected
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "hash",
+        "size",
+        "duplicate",
+        "traversal",
+        "control",
+        "missing-hash",
+        "missing-self",
+        "symlink",
+        "hardlink",
+        "tree-drift",
+        "metadata-version",
+        "metadata-malformed",
+        "record-malformed",
+        "absolute",
+        "algorithm",
+    ),
+)
+def test_runtime_seal_rejects_record_and_installed_tree_mutations(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    purelib, dist_info, expected = _tiny_installed_distribution(tmp_path)
+    record = dist_info / "RECORD"
+    rows = _record_rows(record.read_bytes())
+    package = purelib / "demo/__init__.py"
+    if case == "hash":
+        rows[0][1] = "sha256=" + "A" * 43
+    elif case == "size":
+        rows[0][2] = str(int(rows[0][2]) + 1)
+    elif case == "duplicate":
+        rows.insert(1, list(rows[0]))
+    elif case == "traversal":
+        rows[0][0] = "../escape.py"
+    elif case == "control":
+        rows[0][0] = "demo/bad\x01.py"
+    elif case == "missing-hash":
+        rows[0][1:] = ["", ""]
+    elif case == "missing-self":
+        rows.pop()
+    elif case == "symlink":
+        external = tmp_path / "external.py"
+        external.write_bytes(package.read_bytes())
+        package.unlink()
+        package.symlink_to(external)
+    elif case == "hardlink":
+        alias = purelib / "demo/alias.py"
+        os.link(package, alias)
+        rows.insert(1, ["demo/alias.py", rows[0][1], rows[0][2]])
+    elif case == "tree-drift":
+        package.write_bytes(b"VALUE = 2\n")
+        rows[0][1] = _record_digest(package.read_bytes())
+        rows[0][2] = str(package.stat().st_size)
+    elif case == "metadata-version":
+        metadata = dist_info / "METADATA"
+        metadata.write_bytes(
+            metadata.read_bytes().replace(b"Version: 1.0", b"Version: 2.0")
+        )
+    elif case == "metadata-malformed":
+        (dist_info / "METADATA").write_bytes(b"Name\x00: demo\nVersion: 1.0\n")
+    elif case == "record-malformed":
+        record.write_bytes(b'"unterminated\n')
+    elif case == "absolute":
+        rows[0][0] = "/absolute.py"
+    elif case == "algorithm":
+        rows[0][1] = "md5=" + "A" * 43
+    if case != "record-malformed":
+        record.write_bytes(_render_record(rows))
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_verify_installed_distribution"].__globals__
+    error_type = namespace["RuntimeSealError"]
+
+    with pytest.raises(error_type):
+        module_globals["_verify_installed_distribution"](
+            purelib,
+            dist_info,
+            "demo",
+            "1.0",
+            expected,
+            None,
+            {},
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "field", "value"),
+    (
+        ("system", ("platform", "system"), "Linux"),
+        ("machine", ("platform", "machine"), "x86_64"),
+        ("version", ("python", "version"), "3.12.9"),
+        ("implementation", ("python", "implementation"), "PyPy"),
+        ("cache-tag", ("python", "cacheTag"), "cpython-311"),
+        ("soabi", ("python", "soabi"), "cpython-311-darwin"),
+        ("hash-seed", ("environment", "pythonHashSeed"), "1"),
+        ("timezone", ("environment", "timezone"), "UTC"),
+        ("hash-probes", ("hashProbes",), [0, 0]),
+    ),
+)
+def test_runtime_seal_rejects_wrong_runtime_probe_facts(
+    tmp_path: Path,
+    runtime_seal_fixture: dict[str, object],
+    case: str,
+    field: tuple[str, ...],
+    value: object,
+) -> None:
+    del case
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_run"].__globals__
+    probe = copy.deepcopy(runtime_seal_fixture["probe"])
+    target: object = probe
+    for member in field[:-1]:
+        assert isinstance(target, dict)
+        target = target[member]
+    assert isinstance(target, dict)
+    target[field[-1]] = value
+    module_globals["_probe_runtime"] = lambda *_arguments: probe
+
+    with pytest.raises(namespace["RuntimeSealError"]):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            WHEELHOUSE,
+            ANALYSIS_ROOT / "producer.lock",
+            runtime_seal_fixture["venv"],
+            tmp_path / "runtime.json",
+        )
+
+
+def test_runtime_seal_publication_is_no_clobber_and_umask_independent(
+    tmp_path: Path,
+) -> None:
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_publish_manifest"].__globals__
+    payload = _canonical_json_bytes({"sealed": True})
+    output = tmp_path / "runtime.json"
+    previous = os.umask(0o777)
+    try:
+        assert module_globals["_publish_manifest"](output, payload) == "created"
+    finally:
+        os.umask(previous)
+    assert output.read_bytes() == payload
+    assert stat.S_IMODE(os.lstat(output).st_mode) == 0o644
+    assert module_globals["_publish_manifest"](output, payload) == "reused"
+    output.write_bytes(b"external\n")
+    with pytest.raises(namespace["RuntimeSealError"]):
+        module_globals["_publish_manifest"](output, payload)
+    assert output.read_bytes() == b"external\n"
+    assert not list(tmp_path.glob(".sfep-runtime-*"))
+
+
+def test_runtime_seal_requires_the_exact_generated_console_script_relation(
+    tmp_path: Path,
+) -> None:
+    purelib, dist_info, expected = _tiny_installed_distribution(tmp_path)
+    script = tmp_path / "venv/bin/evil"
+    script.parent.mkdir()
+    script.write_bytes(b"#!/bin/sh\n")
+    rows = _record_rows((dist_info / "RECORD").read_bytes())
+    rows.insert(
+        -1,
+        [
+            "../../../bin/evil",
+            _record_digest(script.read_bytes()),
+            str(script.stat().st_size),
+        ],
+    )
+    (dist_info / "RECORD").write_bytes(_render_record(rows))
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_verify_installed_distribution"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="script|console"):
+        module_globals["_verify_installed_distribution"](
+            purelib,
+            dist_info,
+            "demo",
+            "1.0",
+            expected,
+            None,
+            {},
+            {},
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("missing", "extra", "duplicate", "build-leakage"),
+)
+def test_runtime_seal_requires_exact_installed_distribution_inventory(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    names = [*RUNTIME_PACKAGE_NAMES, "pip", "sfep-equipment-quality"]
+    if case == "missing":
+        names.remove("attrs")
+    elif case == "extra":
+        names.append("other-runtime")
+    elif case == "build-leakage":
+        names.append("setuptools")
+    for index, name in enumerate(names):
+        stem = name.replace("-", "_")
+        dist_info = purelib / f"{stem}-1.0-{index}.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_bytes(
+            f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.0\n\n".encode()
+        )
+    if case == "duplicate":
+        duplicate = purelib / "duplicate_attrs-1.0.dist-info"
+        duplicate.mkdir()
+        (duplicate / "METADATA").write_bytes(
+            b"Metadata-Version: 2.4\nName: attrs\nVersion: 1.0\n\n"
+        )
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_discover_distributions"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="inventory|duplicated|ambiguous"):
+        module_globals["_discover_distributions"](purelib, purelib)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "stderr-noise",
+        "malformed",
+        "oversized",
+        "extra-member",
+        "path-escape",
+        "interpreter-swap",
+        "timeout",
+    ),
+)
+def test_runtime_probe_fails_closed_on_process_and_payload_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    runtime = tmp_path / "venv"
+    executable = runtime / "bin/python"
+    purelib = runtime / "lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    purelib.mkdir(parents=True)
+    executable.write_bytes(b"interpreter")
+    _write_runtime_pyvenv_cfg(runtime, executable)
+    probe = {
+        "schemaVersion": "sfep-runtime-probe/v1",
+        "prefix": str(runtime),
+        "executable": str(executable),
+        "purelib": str(purelib),
+        "platlib": str(purelib),
+        "flags": {
+            "isolated": 1,
+            "noSite": 1,
+            "ignoreEnvironment": 1,
+            "safePath": True,
+        },
+        "platform": {
+            "system": "Darwin",
+            "machine": "arm64",
+            "macosProductVersion": "26.6.2",
+            "sysconfigPlatform": "macosx-11.0-arm64",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.10",
+            "build": "main Apr 10 2025 22:19:24",
+            "cacheTag": "cpython-312",
+            "soabi": "cpython-312-darwin",
+        },
+        "environment": {"pythonHashSeed": "0", "timezone": "Asia/Seoul"},
+        "hashProbes": list(RUNTIME_HASH_PROBES),
+    }
+    if case == "extra-member":
+        probe["extra"] = True
+    elif case == "path-escape":
+        probe["purelib"] = str(tmp_path / "escape")
+    stdout = _canonical_json_bytes(probe)
+    stderr = b""
+    if case == "stderr-noise":
+        stderr = b"noise\n"
+    elif case == "malformed":
+        stdout = b"not-json\n"
+    elif case == "oversized":
+        stdout = b"x" * (1024 * 1024 + 1)
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_probe_runtime"].__globals__
+    if case == "timeout":
+        def fake_run(*_args: object, **_kwargs: object) -> object:
+            raise subprocess.TimeoutExpired("python", 20)
+    else:
+        def fake_run(*_args: object, **_kwargs: object) -> object:
+            if case == "interpreter-swap":
+                executable.write_bytes(b"replacement interpreter")
+            return subprocess.CompletedProcess([], 0, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(module_globals["subprocess"], "run", fake_run)
+
+    with pytest.raises(namespace["RuntimeSealError"]):
+        value = module_globals["_probe_runtime"](runtime, executable)
+        module_globals["_validate_probe"](value, runtime, executable)
+
+
+@pytest.mark.parametrize("case", ("symlink-output", "write-fault", "parent-fsync"))
+def test_runtime_manifest_publication_faults_leave_no_valid_owned_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_publish_manifest"].__globals__
+    payload = _canonical_json_bytes({"sealed": True})
+    output = tmp_path / "runtime.json"
+    external = tmp_path / "external.json"
+    if case == "symlink-output":
+        external.write_bytes(b"external\n")
+        output.symlink_to(external)
+    elif case == "write-fault":
+        real_write = os.write
+        calls = 0
+
+        def failing_write(*arguments: object, **keywords: object) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("injected write fault")
+            return real_write(*arguments, **keywords)
+
+        monkeypatch.setattr(module_globals["os"], "write", failing_write)
+    else:
+        real_fsync = os.fsync
+        calls = 0
+
+        def failing_fsync(descriptor: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected parent fsync fault")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(module_globals["os"], "fsync", failing_fsync)
+
+    with pytest.raises((namespace["RuntimeSealError"], OSError)):
+        module_globals["_publish_manifest"](output, payload)
+
+    if case == "symlink-output":
+        assert output.is_symlink()
+        assert external.read_bytes() == b"external\n"
+    else:
+        assert output.is_file()
+        assert output.read_bytes() == b""
+    assert not list(tmp_path.glob(".sfep-runtime-*"))
+
+
+def test_runtime_seal_rejects_output_nested_in_authenticated_mutable_inputs(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    wheelhouse = source / ".wheelhouse"
+    runtime = tmp_path / "venv"
+    source.mkdir()
+    wheelhouse.mkdir()
+    runtime.mkdir()
+    producer_lock = source / "producer.lock"
+    producer_lock.write_bytes(b"lock\n")
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_validate_topology"].__globals__
+
+    for output in (
+        wheelhouse / "new.json",
+        runtime / "new.json",
+        source / "equipment_quality/new.json",
+    ):
+        output.parent.mkdir(exist_ok=True)
+        with pytest.raises(namespace["RuntimeSealError"], match="output|overlap|nested"):
+            module_globals["_validate_topology"](
+                source,
+                wheelhouse,
+                producer_lock,
+                runtime,
+                output,
+            )
+
+
+def test_runtime_probe_rejects_a_site_path_with_an_intermediate_symlink(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "venv"
+    external = tmp_path / "external-lib"
+    purelib = external / "python3.12/site-packages"
+    (runtime / "bin").mkdir(parents=True)
+    purelib.mkdir(parents=True)
+    (runtime / "lib").symlink_to(external, target_is_directory=True)
+    executable = runtime / "bin/python"
+    executable.write_bytes(b"interpreter")
+    _write_runtime_pyvenv_cfg(runtime, executable)
+    probe = {
+        "schemaVersion": "sfep-runtime-probe/v1",
+        "prefix": str(runtime),
+        "executable": str(executable),
+        "purelib": str(runtime / "lib/python3.12/site-packages"),
+        "platlib": str(runtime / "lib/python3.12/site-packages"),
+        "flags": {
+            "isolated": 1,
+            "noSite": 1,
+            "ignoreEnvironment": 1,
+            "safePath": True,
+        },
+        "platform": {
+            "system": "Darwin",
+            "machine": "arm64",
+            "macosProductVersion": "26.6.2",
+            "sysconfigPlatform": "macosx-11.0-arm64",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.10",
+            "build": "main Apr 10 2025 22:19:24",
+            "cacheTag": "cpython-312",
+            "soabi": "cpython-312-darwin",
+        },
+        "environment": {"pythonHashSeed": "0", "timezone": "Asia/Seoul"},
+        "hashProbes": list(RUNTIME_HASH_PROBES),
+    }
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_validate_probe"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="symlink|physical"):
+        module_globals["_validate_probe"](probe, runtime, executable)
+
+
+def test_runtime_manifest_reuse_rejects_noncanonical_mode(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "runtime.json"
+    payload = _canonical_json_bytes({"sealed": True})
+    output.write_bytes(payload)
+    output.chmod(0o600)
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_publish_manifest"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="mode|permission"):
+        module_globals["_publish_manifest"](output, payload)
+
+    assert output.read_bytes() == payload
+    assert stat.S_IMODE(os.lstat(output).st_mode) == 0o600
+
+
+def test_runtime_probe_uses_isolation_bounded_files_and_an_allowlisted_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "venv"
+    executable = runtime / "bin/python"
+    purelib = runtime / "lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    purelib.mkdir(parents=True)
+    executable.write_bytes(b"interpreter")
+    _write_runtime_pyvenv_cfg(runtime, executable)
+    payload = _canonical_json_bytes({
+        "schemaVersion": "sfep-runtime-probe/v1",
+        "prefix": str(runtime),
+        "executable": str(executable),
+        "purelib": str(purelib),
+        "platlib": str(purelib),
+        "flags": {
+            "isolated": 1,
+            "noSite": 1,
+            "ignoreEnvironment": 1,
+            "safePath": True,
+        },
+        "platform": {
+            "system": "Darwin",
+            "machine": "arm64",
+            "macosProductVersion": "26.6.2",
+            "sysconfigPlatform": "macosx-11.0-arm64",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.10",
+            "build": "main Apr 10 2025 22:19:24",
+            "cacheTag": "cpython-312",
+            "soabi": "cpython-312-darwin",
+        },
+        "environment": {"pythonHashSeed": "0", "timezone": "Asia/Seoul"},
+        "hashProbes": list(RUNTIME_HASH_PROBES),
+    })
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_probe_runtime"].__globals__
+    observed = False
+
+    def fake_run(command: list[str], **keywords: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal observed
+        assert command[0] == str(executable)
+        assert command[1:4] == ["-I", "-S", "-c"]
+        assert keywords["cwd"] == "/private/tmp"
+        assert keywords["env"] == {
+            "PYTHONHASHSEED": "0",
+            "TZ": "Asia/Seoul",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        assert keywords.get("capture_output") is None
+        stdout = keywords["stdout"]
+        stderr = keywords["stderr"]
+        assert hasattr(stdout, "write") and hasattr(stderr, "write")
+        stdout.write(payload)
+        observed = True
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(module_globals["subprocess"], "run", fake_run)
+
+    assert module_globals["_probe_runtime"](runtime, executable)["hashProbes"] == list(
+        RUNTIME_HASH_PROBES
+    )
+    assert observed
+
+
+def test_runtime_seal_rejects_all_bytecode_and_cache_paths_before_capture(
+    tmp_path: Path,
+) -> None:
+    purelib = tmp_path / "venv/lib/python3.12/site-packages"
+    cache = purelib / "sitecustomize/__pycache__/sitecustomize.cpython-312.pyc"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"executable bytecode")
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_site_inventory"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="bytecode|cache|pyc"):
+        module_globals["_site_inventory"]((purelib,))
+
+
+def test_runtime_seal_rejects_record_backed_bytecode_even_when_unhashed(
+    tmp_path: Path,
+) -> None:
+    purelib, dist_info, expected = _tiny_installed_distribution(tmp_path)
+    bytecode = purelib / "demo/__pycache__/__init__.cpython-312.pyc"
+    bytecode.parent.mkdir()
+    bytecode.write_bytes(b"record-backed executable bytecode")
+    rows = _record_rows((dist_info / "RECORD").read_bytes())
+    rows.insert(-1, ["demo/__pycache__/__init__.cpython-312.pyc", "", ""])
+    (dist_info / "RECORD").write_bytes(_render_record(rows))
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_verify_installed_distribution"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="bytecode|cache|pyc"):
+        module_globals["_verify_installed_distribution"](
+            purelib, dist_info, "demo", "1.0", expected, None, {}, {}
+        )
+
+
+@pytest.mark.parametrize("mutation", ("body", "mode"))
+def test_runtime_seal_authenticates_console_wrapper_body_and_mode(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    purelib, dist_info, expected = _tiny_installed_distribution(tmp_path)
+    script = tmp_path / "venv/bin/demo-cli"
+    script.parent.mkdir()
+    executable = tmp_path / "venv/bin/python"
+    executable.write_bytes(b"interpreter")
+    valid_payload = _runtime_console_wrapper(executable, "demo.cli:main")
+    script.write_bytes(valid_payload)
+    script.chmod(0o755)
+    rows = _record_rows((dist_info / "RECORD").read_bytes())
+    rows.insert(
+        -1,
+        [
+            "../../../bin/demo-cli",
+            _record_digest(valid_payload),
+            str(len(valid_payload)),
+        ],
+    )
+    (dist_info / "RECORD").write_bytes(_render_record(rows))
+    if mutation == "body":
+        mutated_payload = valid_payload.replace(b"demo.cli", b"evil.cli")
+        script.write_bytes(mutated_payload)
+        rows[-2][1] = _record_digest(mutated_payload)
+        rows[-2][2] = str(len(mutated_payload))
+        (dist_info / "RECORD").write_bytes(_render_record(rows))
+    else:
+        script.chmod(0o700)
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_verify_installed_distribution"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="wrapper|script"):
+        module_globals["_verify_installed_distribution"](
+            purelib,
+            dist_info,
+            "demo",
+            "1.0",
+            expected,
+            None,
+            {},
+            {"demo-cli": "demo.cli:main"},
+        )
+
+
+def test_runtime_output_overlap_uses_physical_intermediate_components(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    package = source / "equipment_quality"
+    physical_parent = package / "generated"
+    wheelhouse = source / ".wheelhouse"
+    runtime = tmp_path / "venv"
+    alias_parent = tmp_path / "alias-parent"
+    physical_parent.mkdir(parents=True)
+    wheelhouse.mkdir()
+    runtime.mkdir()
+    alias_parent.mkdir()
+    (alias_parent / "through").symlink_to(package, target_is_directory=True)
+    producer_lock = source / "producer.lock"
+    producer_lock.write_bytes(b"lock\n")
+    output = alias_parent / "through/generated/runtime.json"
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_validate_topology"].__globals__
+
+    with pytest.raises(namespace["RuntimeSealError"], match="symlink|physical|nested"):
+        module_globals["_validate_topology"](
+            source, wheelhouse, producer_lock, runtime, output
+        )
+
+
+def test_runtime_publication_never_unlinks_an_owned_or_replaceable_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_publish_manifest"].__globals__
+
+    def forbidden_unlink(*_arguments: object, **_keywords: object) -> None:
+        raise AssertionError("path unlink opens an identity-replacement race")
+
+    monkeypatch.setattr(module_globals["os"], "unlink", forbidden_unlink)
+    output = tmp_path / "runtime.json"
+    payload = _canonical_json_bytes({"sealed": True})
+
+    assert module_globals["_publish_manifest"](output, payload) == "created"
+
+    assert output.read_bytes() == payload
+    assert not list(tmp_path.glob(".sfep-runtime-*"))
+
+
+def test_runtime_publication_detects_final_name_replacement_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_publish_manifest"].__globals__
+    output = tmp_path / "runtime.json"
+    external_payload = b"external replacement\n"
+
+    def replace_published_name() -> None:
+        output.unlink()
+        output.write_bytes(external_payload)
+
+    with pytest.raises(namespace["RuntimeSealError"], match="changed|replaced|identity"):
+        module_globals["_publish_manifest"](
+            output,
+            _canonical_json_bytes({"sealed": True}),
+            post_publish=replace_published_name,
+        )
+
+    assert output.read_bytes() == external_payload
+    assert not list(tmp_path.glob(".sfep-runtime-*"))
+
+
+def test_runtime_seal_rolls_back_new_manifest_on_final_joint_reauthentication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    wheelhouse = tmp_path / "wheelhouse"
+    runtime = tmp_path / "venv"
+    for directory in (source, wheelhouse, runtime):
+        directory.mkdir()
+    producer_lock = source / "producer.lock"
+    producer_lock.write_bytes(b"lock\n")
+    output = tmp_path / "runtime.json"
+    first = _canonical_json_bytes({"capture": 1})
+    second = _canonical_json_bytes({"capture": 2})
+    captures = 0
+    namespace = _runtime_seal_namespace()
+    module_globals = namespace["_run"].__globals__
+
+    def changing_capture(*_arguments: object) -> bytes:
+        nonlocal captures
+        captures += 1
+        return first if captures < 3 else second
+
+    module_globals["_capture_manifest"] = changing_capture
+
+    with pytest.raises(namespace["RuntimeSealError"], match="changed|reauth"):
+        module_globals["_run"](
+            source, wheelhouse, producer_lock, runtime, output
+        )
+
+    assert captures == 3
+    assert output.is_file()
+    assert output.read_bytes() == b""
+    assert not list(tmp_path.glob(".sfep-runtime-*"))
