@@ -852,11 +852,22 @@ class SummaryBuildRequest:
             raise ValueError("definitions must be derived from the frozen analysis config")
         if type(self.criteria_identity) is not Identity or self.criteria_identity.version != "sfep-criteria-id/v1":
             raise TypeError("criteria_identity must be a criteria Identity")
+        from equipment_quality.criteria_projection import build_criteria_projection
+
+        criteria_fields = self.criteria_identity.fields
+        replayed_projection_digest = sha256_uri(
+            build_criteria_projection(split_snapshot, definition_snapshot)
+        )
+        if criteria_fields.get("criteria_projection_sha256") != (
+            replayed_projection_digest
+        ):
+            raise ValueError(
+                "criteria projection does not match the frozen split and definitions"
+            )
         if type(self.bundle_identity) is not Identity or self.bundle_identity.version != "sfep-bundle-id/v1":
             raise TypeError("bundle_identity must be a bundle Identity")
         if self.bundle_identity.fields.get("criteria_id") != self.criteria_identity.value:
             raise ValueError("bundle identity must bind the criteria identity")
-        criteria_fields = self.criteria_identity.fields
         bundle_fields = self.bundle_identity.fields
         if criteria_fields.get("as_of") != self.split.as_of.isoformat():
             raise ValueError("criteria identity as_of must match the split")

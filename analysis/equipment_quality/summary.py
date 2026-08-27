@@ -44,6 +44,46 @@ _STAGE_DATE = {
 }
 _IDENTIFIER_COLUMNS = {"charge_id", "slab_no", "hr_coil_id", "ap_prod_id"}
 _SOURCE_ORDER = ("sm_cc", "fur_hr", "ap")
+_INSUFFICIENT_QUALITY_REASONS = {
+    "LOW_SUPPORT",
+    "LOW_DEFECT_COUNT",
+    "NO_INFORMATIVE_STRATA",
+    "NO_VARIATION",
+    "NON_FINITE_ESTIMATE",
+    "ZERO_COMPARATOR_RISK",
+}
+_QUARANTINE_DEPENDENCIES = {
+    "MISSING_SM_CC_KEY": ("sm_cc.charge_id", "sm_cc.slab_no"),
+    "MISSING_FUR_HR_KEY": ("fur_hr.charge_id", "fur_hr.slab_no"),
+    "MISSING_AP_HR_COIL_ID": ("ap.hr_coil_id",),
+    "MISSING_FUR_HR_COIL_ID": ("fur_hr.hr_coil_id",),
+    "MISSING_AP_PROD_ID": ("ap.ap_prod_id",),
+    "DUPLICATE_SM_CC_KEY": ("sm_cc.charge_id", "sm_cc.slab_no"),
+    "DUPLICATE_FUR_HR_KEY": ("fur_hr.charge_id", "fur_hr.slab_no"),
+    "DUPLICATE_AP_KEY": ("ap.hr_coil_id",),
+    "DUPLICATE_FUR_HR_COIL_KEY": ("fur_hr.hr_coil_id",),
+    "DUPLICATE_AP_PROD_ID": ("ap.ap_prod_id",),
+    "INVALID_FUR_HR_DATE": ("fur_hr.hr_date",),
+    "IMPOSSIBLE_STAGE_DATE_ORDER": (
+        "ap.ap_date",
+        "fur_hr.f_ext_date",
+        "fur_hr.hr_date",
+        "sm_cc.cast_date",
+    ),
+    "UNLINKED_SM_CC": (
+        "fur_hr.charge_id",
+        "fur_hr.slab_no",
+        "sm_cc.charge_id",
+        "sm_cc.slab_no",
+    ),
+    "UNLINKED_FUR_HR": (
+        "fur_hr.charge_id",
+        "fur_hr.slab_no",
+        "sm_cc.charge_id",
+        "sm_cc.slab_no",
+    ),
+    "UNLINKED_AP": ("ap.hr_coil_id", "fur_hr.hr_coil_id"),
+}
 
 
 def _missing(value: object) -> bool:
@@ -640,367 +680,293 @@ def _material_lineage(catalog: Sequence[MaterialLineage]) -> list[dict[str, obje
     ]
 
 
-def _paths(text: str) -> tuple[str, ...]:
-    return tuple(text.strip().splitlines())
-
-
-_LINEAGE_PATHS = {
-    "bundle_manifest": _paths("""
-artifacts[].role
-artifacts[].schemaVersion
-artifacts[].sha256
-artifacts[].sizeBytes
-asOf
-bundleId
-criteriaId
-criteriaIdentity.analysis_config_sha256
-criteriaIdentity.as_of
-criteriaIdentity.criteria_projection_sha256
-criteriaIdentity.producer_runtime_sha256
-criteriaIdentity.schema.analysis_config.sha256
-criteriaIdentity.schema.equipment_operating_ranges.sha256
-criteriaIdentity.schema.producer_runtime.sha256
-criteriaIdentity.schema.quality_risk_intervals.sha256
-identity.analysis_config_sha256
-identity.criteria_id
-identity.producer_runtime_sha256
-identity.schema.analysis_config.sha256
-identity.schema.analysis_summary.sha256
-identity.schema.bundle_manifest.sha256
-identity.schema.equipment_operating_ranges.sha256
-identity.schema.producer_runtime.sha256
-identity.schema.quality_risk_intervals.sha256
-identity.schema.replay_events.sha256
-identity.source.ap.name
-identity.source.ap.sha256
-identity.source.ap.size_bytes
-identity.source.fur_hr.name
-identity.source.fur_hr.sha256
-identity.source.fur_hr.size_bytes
-identity.source.sm_cc.name
-identity.source.sm_cc.sha256
-identity.source.sm_cc.size_bytes
-labelMaturityDays
-schemaVersion
-timezone
-"""),
-    "analysis_config": _paths("""
-analysisConfigVersion
-bootstrap.minimumValidReplicates
-bootstrap.replicates
-evidenceFamilies[]
-fdrFamilies[]
-fields[].dataType
-fields[].dependencies[]
-fields[].equipmentType
-fields[].evidenceFamily
-fields[].featureRole
-fields[].field
-fields[].firstAvailableStage
-fields[].sourceColumn
-fields[].sourceRole
-fixedInteractions[][]
-labelMaturityDays
-operatingRanges.extremeLowerQuantile
-operatingRanges.extremeTailMinimumSupport
-operatingRanges.extremeUpperQuantile
-operatingRanges.minimumSupport
-operatingRanges.quantileMethod
-operatingRanges.typicalLowerQuantile
-operatingRanges.typicalUpperQuantile
-qualityRisk.bhQ.caution
-qualityRisk.bhQ.danger
-qualityRisk.confirmationRelativeRisk.cautionExclusive
-qualityRisk.confirmationRelativeRisk.danger
-qualityRisk.interactionBins
-qualityRisk.minimumCautionDefects
-qualityRisk.minimumConfirmationDefects
-qualityRisk.minimumConfirmationSupport
-qualityRisk.minimumDangerDefects
-qualityRisk.minimumDiscoverySupport
-qualityRisk.minimumInformativeStrata
-qualityRisk.numericBins
-qualityRisk.relativeRisk.caution
-qualityRisk.relativeRisk.danger
-qualityRisk.riskDifference.caution
-qualityRisk.riskDifference.danger
-qualityRisk.zeroCellCorrection
-rangeContextHierarchies[].equipmentType
-rangeContextHierarchies[].levels[][]
-riskAdjustmentHierarchies[].equipmentType
-riskAdjustmentHierarchies[].levels[][]
-schemaVersion
-splits.discoveryFraction
-splits.referenceFraction
-timezone
-wilsonZ
-"""),
-    "producer_runtime": _paths("""
-environmentPolicy.floatPolicy
-environmentPolicy.localeIndependentParsing
-environmentPolicy.pythonHashSeed
-environmentPolicy.timezone
-locks.bootstrap
-locks.buildRequirements
-locks.producer
-locks.pyproject
-locks.requirements
-locks.wheelhouse
-packages[].direct
-packages[].installedCodeTreeSha256
-packages[].name
-packages[].version
-packages[].wheelFilename
-packages[].wheelSha256
-packages[].wheelTag
-pipVersion
-platform.machine
-platform.macosProductVersion
-platform.sysconfigPlatform
-platform.system
-producer.installedCodeTreeSha256
-producer.name
-producer.sourceSha256
-producer.version
-producer.wheelFilename
-producer.wheelSha256
-python.build
-python.cacheTag
-python.executableSha256
-python.implementation
-python.soabi
-python.version
-schemaVersion
-"""),
-    "equipment_operating_ranges": ("asOf", "criteriaId", "schemaVersion"),
-    "quality_risk_intervals": _paths("""
-asOf
-criteriaId
-rules[].adjustmentFieldsDropped[]
-rules[].adjustmentKind
-rules[].adjustmentLevel
-rules[].analysisFamily
-rules[].applicationContext
-rules[].applicationScope
-rules[].confirmation.adjustedRate
-rules[].confirmation.comparatorAdjustedRate
-rules[].confirmation.crudeRate
-rules[].confirmation.crudeRateCiLower
-rules[].confirmation.crudeRateCiUpper
-rules[].confirmation.defects
-rules[].confirmation.pValue
-rules[].confirmation.qValue
-rules[].confirmation.reasonCode
-rules[].confirmation.relativeRisk
-rules[].confirmation.relativeRiskCiLower
-rules[].confirmation.relativeRiskCiUpper
-rules[].confirmation.riskDifference
-rules[].confirmation.support
-rules[].discovery.adjustedRate
-rules[].discovery.comparatorAdjustedRate
-rules[].discovery.crudeRate
-rules[].discovery.crudeRateCiLower
-rules[].discovery.crudeRateCiUpper
-rules[].discovery.defects
-rules[].discovery.pValue
-rules[].discovery.qValue
-rules[].discovery.reasonCode
-rules[].discovery.relativeRisk
-rules[].discovery.relativeRiskCiLower
-rules[].discovery.relativeRiskCiUpper
-rules[].discovery.riskDifference
-rules[].discovery.support
-rules[].displayMergeRuleIds[]
-rules[].earlyWarningEligible
-rules[].equipmentId
-rules[].equipmentType
-rules[].evidenceFamily
-rules[].fieldNames[]
-rules[].firstAvailableStage
-rules[].grade
-rules[].predicate.allOf[].field
-rules[].predicate.allOf[].lower
-rules[].predicate.allOf[].lowerInclusive
-rules[].predicate.allOf[].type
-rules[].predicate.allOf[].upper
-rules[].predicate.allOf[].upperInclusive
-rules[].predicate.allOf[].values[]
-rules[].ruleId
-schemaVersion
-"""),
-    "replay_events": _paths("""
-ap_prod_id
-batch_id
-batch_kind
-batch_step
-bundle_id
-charge_id
-criteria_id
-equipment_batch_id
-equipment_id
-equipment_type
-event_id
-hr_coil_id
-material_key
-replay_date
-replay_hour
-schema_version
-slab_no
-time_precision
-values_json.ap_date
-values_json.ap_line_speed
-values_json.ap_plant
-values_json.ap_shift
-values_json.ap_thick
-values_json.ap_width
-values_json.cast_date
-values_json.cc_gubun
-values_json.delta_ferrite
-values_json.f_bfg
-values_json.f_bfg_ratio
-values_json.f_cog
-values_json.f_cog_ratio
-values_json.f_ext_date
-values_json.f_ext_time
-values_json.f_heat_interval
-values_json.f_heat_temp
-values_json.f_jangip_gubun
-values_json.f_jangip_temp
-values_json.f_ldg
-values_json.f_ldg_ratio
-values_json.f_pre_interval
-values_json.f_pre_temp
-values_json.f_sock_interval
-values_json.f_sock_temp
-values_json.furnace_no
-values_json.hr_date
-values_json.hr_thick
-values_json.hr_width
-values_json.ingre_cr
-values_json.ingre_ni
-values_json.ingre_s
-values_json.judge
-values_json.mlac_ratio
-values_json.rm4_temp
-values_json.rm_pitch
-values_json.slab_grind
-values_json.slab_gubun
-values_json.slab_width
-values_json.sm_plant
-values_json.steel_grade
-values_json.steel_usage
-values_json.tundish_temp
-"""),
-    "analysis_summary": _paths("""
-asOf
-bundleId
-chargePurgeCounts.inner.chargeCount
-chargePurgeCounts.inner.rowCount
-chargePurgeCounts.outer.chargeCount
-chargePurgeCounts.outer.rowCount
-criteriaId
-dateRange.from
-dateRange.to
-driftMetrics[].dataType
-driftMetrics[].field
-driftMetrics[].holdout.levels
-driftMetrics[].holdout.levels[].count
-driftMetrics[].holdout.levels[].value
-driftMetrics[].holdout.median
-driftMetrics[].holdout.missingRate
-driftMetrics[].holdout.p05
-driftMetrics[].holdout.p95
-driftMetrics[].holdout.support
-driftMetrics[].reference.levels
-driftMetrics[].reference.levels[].count
-driftMetrics[].reference.levels[].value
-driftMetrics[].reference.median
-driftMetrics[].reference.missingRate
-driftMetrics[].reference.p05
-driftMetrics[].reference.p95
-driftMetrics[].reference.support
-evaluationMode
-holdoutMetrics[].alertGrade
-holdoutMetrics[].alertRate.lower
-holdoutMetrics[].alertRate.pointEstimate
-holdoutMetrics[].alertRate.reasonCode
-holdoutMetrics[].alertRate.upper
-holdoutMetrics[].alertRate.validReplicates
-holdoutMetrics[].baseDefectRate.lower
-holdoutMetrics[].baseDefectRate.pointEstimate
-holdoutMetrics[].baseDefectRate.reasonCode
-holdoutMetrics[].baseDefectRate.upper
-holdoutMetrics[].baseDefectRate.validReplicates
-holdoutMetrics[].falseAlertsPer100.lower
-holdoutMetrics[].falseAlertsPer100.pointEstimate
-holdoutMetrics[].falseAlertsPer100.reasonCode
-holdoutMetrics[].falseAlertsPer100.upper
-holdoutMetrics[].falseAlertsPer100.validReplicates
-holdoutMetrics[].falseNegative
-holdoutMetrics[].falsePositive
-holdoutMetrics[].lift.lower
-holdoutMetrics[].lift.pointEstimate
-holdoutMetrics[].lift.reasonCode
-holdoutMetrics[].lift.upper
-holdoutMetrics[].lift.validReplicates
-holdoutMetrics[].precision.lower
-holdoutMetrics[].precision.pointEstimate
-holdoutMetrics[].precision.reasonCode
-holdoutMetrics[].precision.upper
-holdoutMetrics[].precision.validReplicates
-holdoutMetrics[].recall.lower
-holdoutMetrics[].recall.pointEstimate
-holdoutMetrics[].recall.reasonCode
-holdoutMetrics[].recall.upper
-holdoutMetrics[].recall.validReplicates
-holdoutMetrics[].total
-holdoutMetrics[].trueNegative
-holdoutMetrics[].truePositive
-innerSplitDate
-labelCensoringCounts.AP_UNLINKED
-labelCensoringCounts.LABEL_NOT_YET_AVAILABLE
-quarantineCounts.DUPLICATE_AP_KEY
-quarantineCounts.UNLINKED_AP
-schemaVersion
-sourceColumnProfiles[].column
-sourceColumnProfiles[].dataType
-sourceColumnProfiles[].levels
-sourceColumnProfiles[].levels[].count
-sourceColumnProfiles[].levels[].value
-sourceColumnProfiles[].missing
-sourceColumnProfiles[].numeric
-sourceColumnProfiles[].numeric.median
-sourceColumnProfiles[].numeric.p05
-sourceColumnProfiles[].numeric.p95
-sourceColumnProfiles[].sourceRole
-sourceColumnProfiles[].total
-sourceColumnProfiles[].unique
-splitCounts.confirmation.dateFrom
-splitCounts.confirmation.dateTo
-splitCounts.confirmation.defects
-splitCounts.confirmation.nonDefects
-splitCounts.confirmation.total
-splitCounts.confirmation.unknownOrCensored
-splitCounts.discovery.dateFrom
-splitCounts.discovery.dateTo
-splitCounts.discovery.defects
-splitCounts.discovery.nonDefects
-splitCounts.discovery.total
-splitCounts.discovery.unknownOrCensored
-splitCounts.holdout.dateFrom
-splitCounts.holdout.dateTo
-splitCounts.holdout.defects
-splitCounts.holdout.nonDefects
-splitCounts.holdout.total
-splitCounts.holdout.unknownOrCensored
-splitCounts.reference.dateFrom
-splitCounts.reference.dateTo
-splitCounts.reference.defects
-splitCounts.reference.nonDefects
-splitCounts.reference.total
-splitCounts.reference.unknownOrCensored
-"""),
+_ARTIFACT_ROLES = (
+    "bundle_manifest",
+    "analysis_config",
+    "producer_runtime",
+    "equipment_operating_ranges",
+    "quality_risk_intervals",
+    "replay_events",
+    "analysis_summary",
+)
+_PUBLISHED_ARTIFACT_ROLES = _ARTIFACT_ROLES[1:]
+_ARTIFACT_SCHEMA_VERSIONS = {
+    "analysis_config": "sfep-analysis-config/v1",
+    "producer_runtime": "sfep-producer-runtime/v1",
+    "equipment_operating_ranges": "sfep-operating-ranges/v1",
+    "quality_risk_intervals": "sfep-quality-rules/v1",
+    "replay_events": "sfep-replay-events/v1",
+    "analysis_summary": "sfep-analysis-summary/v1",
 }
+
+
+def _normalized_leaf_paths(value: object, prefix: str = "") -> set[str]:
+    if isinstance(value, Mapping):
+        if not value:
+            return {prefix} if prefix else set()
+        result: set[str] = set()
+        for key, item in tuple(value.items()):
+            if type(key) is not str or not key:
+                raise ValueError("artifact leaf keys must be built-in non-empty strings")
+            child = key if not prefix else prefix + "." + key
+            result.update(_normalized_leaf_paths(item, child))
+        return result
+    if isinstance(value, (list, tuple)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_normalized_leaf_paths(item, prefix + "[]"))
+        return result
+    if not prefix:
+        raise ValueError("artifact leaf must have a normalized output path")
+    return {prefix}
+
+
+def _replay_event_payload(event: object) -> dict[str, object]:
+    return {
+        "schema_version": event.schema_version,
+        "bundle_id": event.bundle_id,
+        "criteria_id": event.criteria_id,
+        "event_id": event.event_id,
+        "replay_date": event.replay_date.isoformat(),
+        "replay_hour": event.replay_hour,
+        "batch_kind": event.batch_kind,
+        "batch_id": event.batch_id,
+        "equipment_batch_id": event.equipment_batch_id,
+        "batch_step": event.batch_step,
+        "time_precision": event.time_precision,
+        "material_key": event.material_key,
+        "equipment_type": event.equipment_type,
+        "equipment_id": event.equipment_id,
+        "charge_id": event.charge_id,
+        "slab_no": event.slab_no,
+        "hr_coil_id": event.hr_coil_id,
+        "ap_prod_id": event.ap_prod_id,
+        "values_json": event.values_json,
+    }
+
+
+def _artifact_lineage_paths(
+    request: SummaryBuildRequest,
+    summary_payload: Mapping[str, object],
+) -> dict[str, tuple[str, ...]]:
+    manifest = {
+        "artifacts": [
+            {
+                "role": role,
+                "schemaVersion": _ARTIFACT_SCHEMA_VERSIONS[role],
+                "sha256": "sha256:" + "0" * 64,
+                "sizeBytes": 0,
+            }
+            for role in _PUBLISHED_ARTIFACT_ROLES
+        ],
+        "asOf": request.split.as_of.isoformat(),
+        "bundleId": request.bundle_identity.value,
+        "criteriaId": request.criteria_identity.value,
+        "criteriaIdentity": request.criteria_identity.fields,
+        "identity": request.bundle_identity.fields,
+        "labelMaturityDays": request.analysis_config.label_maturity_days,
+        "schemaVersion": "sfep-equipment-bundle/v1",
+        "timezone": request.analysis_config.timezone,
+    }
+    payloads: dict[str, object] = {
+        "bundle_manifest": manifest,
+        "analysis_config": json.loads(request.analysis_config_bytes),
+        "producer_runtime": json.loads(request.producer_runtime_bytes),
+        "equipment_operating_ranges": {
+            "asOf": request.split.as_of.isoformat(),
+            "criteriaId": request.criteria_identity.value,
+            "ranges": request.operating_ranges.to_wire(),
+            "schemaVersion": "sfep-operating-ranges/v1",
+        },
+        "quality_risk_intervals": {
+            "asOf": request.split.as_of.isoformat(),
+            "criteriaId": request.criteria_identity.value,
+            "rules": request.quality_rules.to_wire(),
+            "schemaVersion": "sfep-quality-rules/v1",
+        },
+        "replay_events": [_replay_event_payload(event) for event in request.events],
+        "analysis_summary": summary_payload,
+    }
+    paths_by_role: dict[str, set[str]] = {}
+    for role in _ARTIFACT_ROLES:
+        if role == "replay_events":
+            paths: set[str] = set()
+            for event in payloads[role]:
+                paths.update(_normalized_leaf_paths(event))
+        else:
+            paths = _normalized_leaf_paths(payloads[role])
+        if role == "quality_risk_intervals":
+            nullable_values = "rules[].predicate.allOf[].values"
+            if nullable_values in paths:
+                paths.remove(nullable_values)
+                paths.add(nullable_values + "[]")
+        if role == "analysis_summary":
+            for empty_dynamic_counts in (
+                "labelCensoringCounts",
+                "quarantineCounts",
+            ):
+                paths.discard(empty_dynamic_counts)
+        paths_by_role[role] = paths
+    return {
+        role: tuple(sorted(paths_by_role[role], key=lambda value: value.encode("utf-8")))
+        for role in _ARTIFACT_ROLES
+    }
+
+
+def _range_lineage(
+    request: SummaryBuildRequest,
+) -> dict[str, list[str]]:
+    definitions = {item.name: item for item in request.definitions}
+    configured = {str(item["field"]): item for item in request.analysis_config.fields}
+
+    def source_nodes(field: str) -> set[str]:
+        name = field.removesuffix("_band")
+        metadata = configured.get(name)
+        if metadata is None:
+            raise ValueError("range input field is not configured")
+        if metadata["sourceRole"] is not None:
+            return {str(metadata["sourceRole"]) + "." + str(metadata["sourceColumn"])}
+        result: set[str] = set()
+        for dependency in metadata["dependencies"]:
+            result.update(source_nodes(str(dependency)))
+        if not result:
+            raise ValueError("derived range input has no source dependencies")
+        return result
+
+    def available_source_nodes(field: str) -> set[str]:
+        name = field.removesuffix("_band")
+        definition = definitions.get(name)
+        if definition is None:
+            raise ValueError("range input field has no feature definition")
+        result = source_nodes(name) | source_nodes(definition.event_date_column)
+        if field.endswith("_band"):
+            result.add("population.REFERENCE")
+        return result
+
+    concrete: list[dict[str, set[str]]] = []
+    for record, sidecar in zip(
+        request.operating_ranges.records,
+        request.operating_ranges.sidecars,
+        strict=True,
+    ):
+        if record["ruleId"] != sidecar.rule_id:
+            raise ValueError("range record and sidecar identity drift")
+        field = str(record["field"])
+        definition = definitions.get(field)
+        if definition is None:
+            raise ValueError("range record field is not configured")
+        field_nodes = available_source_nodes(field)
+        equipment_id_nodes: set[str] = set()
+        if definition.equipment_id_column is not None:
+            equipment_id_nodes.update(
+                available_source_nodes(definition.equipment_id_column)
+            )
+        context = record["context"]
+        if not isinstance(context, Mapping):
+            raise ValueError("range context must be a mapping")
+        context_dependencies: dict[str, set[str]] = {}
+        context_nodes: set[str] = set()
+        for name in context:
+            dependencies = available_source_nodes(str(name))
+            context_dependencies[str(name)] = dependencies
+            context_nodes.update(dependencies)
+        group_dependencies = {
+            "config.operatingRanges.minimumSupport",
+            "config.rangeContextHierarchies[].equipmentType",
+            "config.rangeContextHierarchies[].levels[][]",
+            "population.REFERENCE",
+            *field_nodes,
+            *equipment_id_nodes,
+            *context_nodes,
+        }
+        quantile_dependencies = set(group_dependencies)
+        trace: dict[str, set[str]] = {
+            "ranges[].field": {"config.fields[].field"},
+            "ranges[].fieldRole": {
+                "config.fields[].featureRole",
+            },
+            "ranges[].firstAvailableStage": {
+                "config.fields[].field",
+                "config.fields[].firstAvailableStage",
+            },
+            "ranges[].equipmentType": {
+                "config.fields[].equipmentType",
+                "config.fields[].field",
+            },
+            "ranges[].equipmentId": {
+                "config.fields[].equipmentType",
+                "config.fields[].featureRole",
+                "config.fields[].field",
+                *equipment_id_nodes,
+            },
+            "ranges[].contextLevel": group_dependencies,
+            "ranges[].support": group_dependencies,
+            "ranges[].median": quantile_dependencies,
+            "ranges[].p05": {
+                "config.operatingRanges.typicalLowerQuantile",
+                *quantile_dependencies,
+            },
+            "ranges[].p95": {
+                "config.operatingRanges.typicalUpperQuantile",
+                *quantile_dependencies,
+            },
+            "ranges[].p01": {
+                "config.operatingRanges.extremeLowerQuantile",
+                "config.operatingRanges.extremeTailMinimumSupport",
+                *quantile_dependencies,
+            },
+            "ranges[].p99": {
+                "config.operatingRanges.extremeUpperQuantile",
+                "config.operatingRanges.extremeTailMinimumSupport",
+                *quantile_dependencies,
+            },
+            "ranges[].lowerTailEnabled": {
+                "config.operatingRanges.extremeLowerQuantile",
+                "config.operatingRanges.extremeTailMinimumSupport",
+                "config.operatingRanges.typicalLowerQuantile",
+                *quantile_dependencies,
+            },
+            "ranges[].upperTailEnabled": {
+                "config.operatingRanges.extremeUpperQuantile",
+                "config.operatingRanges.extremeTailMinimumSupport",
+                "config.operatingRanges.typicalUpperQuantile",
+                *quantile_dependencies,
+            },
+        }
+        for name in context:
+            path = "ranges[].context." + str(name)
+            trace[path] = {
+                "config.operatingRanges.minimumSupport",
+                "config.rangeContextHierarchies[].equipmentType",
+                "config.rangeContextHierarchies[].levels[][]",
+                *context_dependencies[str(name)],
+            }
+        trace["ranges[].ruleId"] = {
+            "config.fields[].equipmentType",
+            "config.fields[].featureRole",
+            "config.fields[].field",
+            "config.fields[].firstAvailableStage",
+            "config.operatingRanges.extremeLowerQuantile",
+            "config.operatingRanges.extremeTailMinimumSupport",
+            "config.operatingRanges.extremeUpperQuantile",
+            "config.operatingRanges.minimumSupport",
+            "config.operatingRanges.typicalLowerQuantile",
+            "config.operatingRanges.typicalUpperQuantile",
+            "config.rangeContextHierarchies[].equipmentType",
+            "config.rangeContextHierarchies[].levels[][]",
+            *field_nodes,
+            *equipment_id_nodes,
+            *context_nodes,
+        }
+        concrete.append(trace)
+    normalized: dict[str, set[str]] = {}
+    for trace in concrete:
+        for path, dependencies in trace.items():
+            normalized.setdefault(path, set()).update(dependencies)
+    return {
+        path: sorted(dependencies, key=lambda value: value.encode("utf-8"))
+        for path, dependencies in normalized.items()
+    }
 
 
 def _quality_feature_node(field: str) -> str:
@@ -1008,9 +974,11 @@ def _quality_feature_node(field: str) -> str:
 
 
 def _concrete_quality_lineage(
-    rules: Sequence[Mapping[str, object]],
+    rules: QualityRulesResult,
     config: AnalysisConfig,
 ) -> dict[str, dict[str, list[str]]]:
+    if type(rules) is not QualityRulesResult:
+        raise TypeError("quality lineage requires a rich QualityRulesResult")
     definitions = {str(item["field"]): item for item in config.fields}
     predicate_paths = {
         "quality_risk_intervals.rules[].predicate.allOf[]." + suffix
@@ -1068,7 +1036,7 @@ def _concrete_quality_lineage(
         )
     }
     result: dict[str, dict[str, list[str]]] = {}
-    for rule in rules:
+    for rule, sidecar in zip(rules.records, rules.sidecars, strict=True):
         family = str(rule["analysisFamily"])
         field_names = tuple(str(value) for value in rule["fieldNames"])
         axes = {_quality_feature_node(field) for field in field_names}
@@ -1200,25 +1168,10 @@ def _concrete_quality_lineage(
         equipment_type = str(rule["equipmentType"])
         if equipment_type not in config.risk_adjustment_hierarchies:
             raise ValueError("quality rule equipment type has no adjustment hierarchy")
-        dropped = set(rule["adjustmentFieldsDropped"])
-        candidate_stage = STAGE_RANK[str(rule["firstAvailableStage"])]
-        attempted: set[str] = set()
-        last_level = int(rule["adjustmentLevel"])
-        hierarchy = config.risk_adjustment_hierarchies[equipment_type]
-        for configured_fields in hierarchy[: last_level + 1]:
-            for context_field in configured_fields:
-                name = str(context_field)
-                base = name.removesuffix("_band") if name.endswith("_band") else name
-                definition = definitions.get(base)
-                if name in dropped or base in dropped:
-                    continue
-                if (
-                    definition is not None
-                    and STAGE_RANK[str(definition["firstAvailableStage"])]
-                    > candidate_stage
-                ):
-                    continue
-                attempted.add(base)
+        attempted = {
+            field.removesuffix("_band")
+            for field in sidecar.discovery.adjustment_fields
+        }
         context_axes = {_quality_feature_node(field) for field in attempted}
         adjustment_dependencies = {
             "quality_risk_intervals.rules[].adjustmentFieldsDropped[]",
@@ -1242,14 +1195,58 @@ def _concrete_quality_lineage(
             "rules[].earlyWarningEligible",
             {"quality_risk_intervals.rules[].firstAvailableStage"},
         )
-        record(
-            "rules[].grade",
-            {"quality_risk_intervals.rules[].discovery.reasonCode"},
+        discovery_metric = rule["discovery"]
+        confirmation_metric = rule["confirmation"]
+        if not isinstance(discovery_metric, Mapping) or not isinstance(
+            confirmation_metric, Mapping
+        ):
+            raise ValueError("quality rule metrics must be mappings")
+        discovery_executed = discovery_metric["reasonCode"] not in (
+            _INSUFFICIENT_QUALITY_REASONS
         )
+        confirmation_executed = confirmation_metric["reasonCode"] not in (
+            _INSUFFICIENT_QUALITY_REASONS
+        )
+        grade_dependencies = {
+            "quality_risk_intervals.rules[].discovery.reasonCode"
+        }
+        if discovery_executed:
+            grade_dependencies.add(
+                "quality_risk_intervals.rules[].confirmation.reasonCode"
+            )
+        if discovery_executed and confirmation_executed:
+            grade_dependencies.update(
+                {
+                    "config.qualityRisk.bhQ.caution",
+                    "config.qualityRisk.bhQ.danger",
+                    "config.qualityRisk.confirmationRelativeRisk.cautionExclusive",
+                    "config.qualityRisk.confirmationRelativeRisk.danger",
+                    "config.qualityRisk.minimumDangerDefects",
+                    "config.qualityRisk.relativeRisk.caution",
+                    "config.qualityRisk.relativeRisk.danger",
+                    "config.qualityRisk.riskDifference.caution",
+                    "config.qualityRisk.riskDifference.danger",
+                    "quality_risk_intervals.rules[].adjustmentKind",
+                    "quality_risk_intervals.rules[].confirmation.reasonCode",
+                    "quality_risk_intervals.rules[].confirmation.relativeRisk",
+                    "quality_risk_intervals.rules[].confirmation.riskDifference",
+                    "quality_risk_intervals.rules[].discovery.defects",
+                    "quality_risk_intervals.rules[].discovery.qValue",
+                    "quality_risk_intervals.rules[].discovery.relativeRisk",
+                    "quality_risk_intervals.rules[].discovery.relativeRiskCiLower",
+                    "quality_risk_intervals.rules[].discovery.riskDifference",
+                }
+            )
+        record("rules[].grade", grade_dependencies)
         if rule["displayMergeRuleIds"]:
             record("rules[].displayMergeRuleIds[]", display_dependencies)
 
         for split_name in ("discovery", "confirmation"):
+            split_sidecar = (
+                sidecar.discovery
+                if split_name == "discovery"
+                else sidecar.confirmation
+            )
             population_dependencies = {
                 "population.DISCOVERY",
                 *predicate_paths,
@@ -1259,11 +1256,41 @@ def _concrete_quality_lineage(
             if split_name == "confirmation":
                 population_dependencies.add("population.CONFIRMATION")
             prefix = "quality_risk_intervals.rules[]." + split_name + "."
-            record("rules[]." + split_name + ".support", population_dependencies)
-            record(
-                "rules[]." + split_name + ".defects",
-                population_dependencies | {"replay_events.values_json.judge"},
+            metric = rule[split_name]
+            if not isinstance(metric, Mapping):
+                raise ValueError("quality metric must be a mapping")
+            executed = metric["reasonCode"] not in _INSUFFICIENT_QUALITY_REASONS
+            minimum_support = (
+                "config.qualityRisk.minimumDiscoverySupport"
+                if split_name == "discovery"
+                else "config.qualityRisk.minimumConfirmationSupport"
             )
+            minimum_defects = (
+                "config.qualityRisk.minimumCautionDefects"
+                if split_name == "discovery"
+                else "config.qualityRisk.minimumConfirmationDefects"
+            )
+            support_dependencies = set(population_dependencies)
+            if executed:
+                if (
+                    not split_sidecar.informative_stratum_keys
+                    or not split_sidecar.discovery_weights
+                ):
+                    raise ValueError(
+                        "executed quality metric lacks informative strata or weights"
+                    )
+                support_dependencies.update(
+                    {
+                        "config.qualityRisk.minimumInformativeStrata",
+                        minimum_support,
+                        *context_axes,
+                    }
+                )
+            record("rules[]." + split_name + ".support", support_dependencies)
+            defect_dependencies = support_dependencies | {
+                "replay_events.values_json.judge"
+            }
+            record("rules[]." + split_name + ".defects", defect_dependencies)
             count_nodes = {prefix + "support", prefix + "defects"}
             record("rules[]." + split_name + ".crudeRate", count_nodes)
             record(
@@ -1274,29 +1301,58 @@ def _concrete_quality_lineage(
                 "rules[]." + split_name + ".crudeRateCiUpper",
                 count_nodes | {"config.wilsonZ"},
             )
-            minimum_support = (
-                "config.qualityRisk.minimumDiscoverySupport"
-                if split_name == "discovery"
-                else "config.qualityRisk.minimumConfirmationSupport"
-            )
             reason_dependencies = set(population_dependencies)
-            metric = rule[split_name]
-            if not isinstance(metric, Mapping):
-                raise ValueError("quality metric must be a mapping")
             if metric["reasonCode"] != "NO_INFORMATIVE_STRATA":
                 reason_dependencies.update({prefix + "support", minimum_support})
-            record("rules[]." + split_name + ".reasonCode", reason_dependencies)
-            for suffix in (
-                "adjustedRate",
-                "comparatorAdjustedRate",
-                "riskDifference",
-                "relativeRisk",
-                "pValue",
-            ):
-                record(
-                    "rules[]." + split_name + "." + suffix,
-                    {prefix + "reasonCode"},
+            if executed:
+                reason_dependencies.update(
+                    {
+                        prefix + "defects",
+                        minimum_defects,
+                        "config.qualityRisk.minimumInformativeStrata",
+                        "replay_events.values_json.judge",
+                        *context_axes,
+                    }
                 )
+            record("rules[]." + split_name + ".reasonCode", reason_dependencies)
+            if executed:
+                statistical_inputs = {
+                    prefix + "reasonCode",
+                    *support_dependencies,
+                    "replay_events.values_json.judge",
+                    minimum_defects,
+                }
+                record("rules[]." + split_name + ".adjustedRate", statistical_inputs)
+                record(
+                    "rules[]." + split_name + ".comparatorAdjustedRate",
+                    statistical_inputs,
+                )
+                record(
+                    "rules[]." + split_name + ".riskDifference",
+                    {
+                        prefix + "adjustedRate",
+                        prefix + "comparatorAdjustedRate",
+                    },
+                )
+                record("rules[]." + split_name + ".relativeRisk", statistical_inputs)
+                record(
+                    "rules[]." + split_name + ".pValue",
+                    statistical_inputs
+                    if split_name == "discovery"
+                    else {prefix + "reasonCode"},
+                )
+            else:
+                for suffix in (
+                    "adjustedRate",
+                    "comparatorAdjustedRate",
+                    "riskDifference",
+                    "relativeRisk",
+                    "pValue",
+                ):
+                    record(
+                        "rules[]." + split_name + "." + suffix,
+                        {prefix + "reasonCode"},
+                    )
             if split_name == "discovery":
                 record(
                     "rules[].discovery.qValue",
@@ -1311,6 +1367,17 @@ def _concrete_quality_lineage(
                     "quality_risk_intervals.rules[].discovery.reasonCode",
                     "quality_risk_intervals.rules[].discovery.support",
                 }
+                if executed:
+                    rr_ci_dependencies.update(
+                        {
+                            "config.bootstrap.minimumValidReplicates",
+                            "config.bootstrap.replicates",
+                            "config.qualityRisk.minimumCautionDefects",
+                            "identity.criteria_id",
+                            "replay_events.charge_id",
+                            "quality_risk_intervals.rules[].discovery.relativeRisk",
+                        }
+                    )
             else:
                 record(
                     "rules[].confirmation.qValue",
@@ -1368,9 +1435,13 @@ def _derived_field(
 
 
 def _field_lineage(
-    config: AnalysisConfig,
+    request: SummaryBuildRequest,
     quality_lineage: Mapping[str, Sequence[str]],
+    summary_payload: Mapping[str, object],
 ) -> list[dict[str, object]]:
+    config = request.analysis_config
+    role_paths = _artifact_lineage_paths(request, summary_payload)
+    range_lineage = _range_lineage(request)
     definitions = {str(item["field"]): item for item in config.fields}
     identifier_paths = {
         "charge_id": "charge_id",
@@ -1422,7 +1493,7 @@ def _field_lineage(
     }
     non_manifest_nodes = {
         role + "." + path
-        for role, paths in _LINEAGE_PATHS.items()
+        for role, paths in role_paths.items()
         if role != "bundle_manifest"
         for path in paths
     }
@@ -1459,7 +1530,7 @@ def _field_lineage(
         "replay_events.values_json.judge"
     }
     result: list[dict[str, object]] = []
-    for role, raw_role_paths in _LINEAGE_PATHS.items():
+    for role, raw_role_paths in role_paths.items():
         paths = sorted(raw_role_paths, key=lambda value: value.encode("utf-8"))
         for path in paths:
             if role == "replay_events" and path in raw_paths:
@@ -1576,14 +1647,14 @@ def _field_lineage(
                     conversion = "COMPUTE_IDENTITY"
                     dependencies = sorted(
                         "bundle_manifest." + value
-                        for value in _LINEAGE_PATHS["bundle_manifest"]
+                        for value in role_paths["bundle_manifest"]
                         if value.startswith("identity.")
                     )
                 elif path == "criteriaId":
                     conversion = "COMPUTE_IDENTITY"
                     dependencies = sorted(
                         "bundle_manifest." + value
-                        for value in _LINEAGE_PATHS["bundle_manifest"]
+                        for value in role_paths["bundle_manifest"]
                         if value.startswith("criteriaIdentity.")
                     )
                 elif path == "schemaVersion":
@@ -1685,9 +1756,41 @@ def _field_lineage(
                 elif path == "criteriaId":
                     conversion = "COPY_IDENTITY_VALUE"
                     dependencies = ["identity.criteria_id"]
-                else:
+                elif path == "schemaVersion":
                     conversion = "COPY_SCHEMA_VERSION"
                     dependencies = ["schema.equipment_operating_ranges"]
+                else:
+                    dependencies = range_lineage[path]
+                    conversion = (
+                        "COMPUTE_IDENTITY"
+                        if path == "ranges[].ruleId"
+                        else "COPY_FIELD_METADATA"
+                        if path
+                        in {
+                            "ranges[].field",
+                            "ranges[].fieldRole",
+                            "ranges[].firstAvailableStage",
+                            "ranges[].equipmentType",
+                        }
+                        else "COUNT_RANGE_SUPPORT"
+                        if path == "ranges[].support"
+                        else "TYPE1_QUANTILE"
+                        if path
+                        in {
+                            "ranges[].median",
+                            "ranges[].p01",
+                            "ranges[].p05",
+                            "ranges[].p95",
+                            "ranges[].p99",
+                        }
+                        else "APPLY_RANGE_TAIL_POLICY"
+                        if path
+                        in {
+                            "ranges[].lowerTailEnabled",
+                            "ranges[].upperTailEnabled",
+                        }
+                        else "DERIVE_RANGE_GROUP"
+                    )
                 result.append(_derived_field(role, path, conversion, dependencies))
                 continue
             if role == "quality_risk_intervals":
@@ -2004,19 +2107,21 @@ def _field_lineage(
                 result.append(_derived_field(role, path, "COUNT_PARTITION", dependencies))
                 continue
             elif path.startswith("quarantineCounts"):
-                dependencies = ["ap.hr_coil_id"]
-                if path.endswith("UNLINKED_AP"):
-                    dependencies.append("fur_hr.hr_coil_id")
+                reason = path.removeprefix("quarantineCounts.")
+                dependencies = list(_QUARANTINE_DEPENDENCIES[reason])
                 result.append(_derived_field(role, path, "COUNT_PARTITION", dependencies))
                 continue
             elif path.startswith("labelCensoringCounts"):
-                if path.endswith("AP_UNLINKED"):
+                reason = path.removeprefix("labelCensoringCounts.")
+                if reason == "AP_UNLINKED":
                     dependencies = [
                         "ap.hr_coil_id",
                         "fur_hr.hr_coil_id",
                         "population.HOLDOUT",
                         "population.REFERENCE",
                     ]
+                elif reason == "LABEL_MISSING":
+                    dependencies = ["ap.judge", "population.REFERENCE"]
                 else:
                     dependencies = [
                         "analysis_summary.asOf",
@@ -2146,7 +2251,7 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
         raise TypeError("request must be an exact SummaryBuildRequest")
     rules = request.quality_rules.to_wire()
     quality_lineage = _normalize_quality_lineage(
-        _concrete_quality_lineage(rules, request.analysis_config)
+        _concrete_quality_lineage(request.quality_rules, request.analysis_config)
     )
     populations = _population_keys(request)
     replay_dates = [event.replay_date.isoformat() for event in request.events]
@@ -2171,12 +2276,6 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
             request.split.counts.get("labelCensoring"),
             "label censoring counts",
         ),
-        "lineage": {
-            "aggregates": _aggregate_lineage(request, populations),
-            "fields": _field_lineage(request.analysis_config, quality_lineage),
-            "materials": _material_lineage(request.material_catalog),
-            "populations": [item.to_wire() for item in populations],
-        },
         "quarantineCounts": _observed_nonzero_counts(
             request.genealogy.audit.get("quarantine"),
             "quarantine counts",
@@ -2184,6 +2283,12 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
         "schemaVersion": "sfep-analysis-summary/v1",
         "sourceColumnProfiles": _source_profiles(request),
         "splitCounts": _split_counts(request),
+    }
+    summary["lineage"] = {
+        "aggregates": _aggregate_lineage(request, populations),
+        "fields": _field_lineage(request, quality_lineage, summary),
+        "materials": _material_lineage(request.material_catalog),
+        "populations": [item.to_wire() for item in populations],
     }
     canonical_json_bytes(summary)
     from equipment_quality.schema import validate_normative_instance

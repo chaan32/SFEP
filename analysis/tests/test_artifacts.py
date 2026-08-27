@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import date
 import hashlib
@@ -10,6 +11,7 @@ import pytest
 
 import equipment_quality.artifacts as artifact_module
 import equipment_quality.event_builder as event_builder_module
+import equipment_quality.summary as summary_module
 from equipment_quality.artifacts import (
     FIXED_ARTIFACT_FILENAMES,
     FIXED_ARTIFACT_ROLES,
@@ -23,7 +25,9 @@ from equipment_quality.artifacts import (
     write_bundle,
 )
 from equipment_quality.criteria_projection import build_criteria_projection
+from equipment_quality.feature_roles import definitions
 from equipment_quality.models import AggregateLineage, Identity, SourceFile
+from equipment_quality.quality_intervals import build_quality_rules_result
 from equipment_quality.schema import validate_normative_instance
 from equipment_quality.summary import build_summary, holdout_metrics
 from equipment_quality.deterministic import canonical_json_bytes, id_lines, sha256_uri
@@ -48,7 +52,9 @@ from factories.artifacts import (
     mutate_holdout,
     mutate_mature_feature,
     mutate_mature_label,
+    nonempty_range_summary_request,
 )
+from factories.quality import identified_split_and_catalog, strong_repeated_fixture
 
 
 def test_literal_criteria_identity_has_exact_eight_fields_and_id() -> None:
@@ -224,6 +230,265 @@ def test_golden_summary_has_balanced_counts_and_complete_lineage() -> None:
     }
 
 
+def _normalized_leaf_paths(value: object, prefix: str = "") -> set[str]:
+    if isinstance(value, Mapping):
+        if not value:
+            return {prefix} if prefix else set()
+        result: set[str] = set()
+        for key, item in value.items():
+            child = str(key) if not prefix else prefix + "." + str(key)
+            result.update(_normalized_leaf_paths(item, child))
+        return result
+    if isinstance(value, (list, tuple)):
+        result = set()
+        for item in value:
+            result.update(_normalized_leaf_paths(item, prefix + "[]"))
+        return result
+    return {prefix}
+
+
+def test_lineage_inventory_tracks_only_actual_dynamic_leaves_and_range_sidecar() -> None:
+    request = nonempty_range_summary_request()
+    summary = build_summary(request)
+    fields = summary["lineage"]["fields"]
+    recorded = {
+        role: {
+            item["outputField"]
+            for item in fields
+            if item["artifactRole"] == role
+        }
+        for role in ("equipment_operating_ranges", "analysis_summary")
+    }
+    range_payload = {
+        "asOf": request.split.as_of.isoformat(),
+        "criteriaId": request.criteria_identity.value,
+        "ranges": request.operating_ranges.to_wire(),
+        "schemaVersion": "sfep-operating-ranges/v1",
+    }
+    summary_payload = {key: value for key, value in summary.items() if key != "lineage"}
+
+    assert recorded["equipment_operating_ranges"] == _normalized_leaf_paths(
+        range_payload
+    )
+    assert recorded["analysis_summary"] == _normalized_leaf_paths(summary_payload)
+    assert {
+        "ranges[].ruleId",
+        "ranges[].field",
+        "ranges[].fieldRole",
+        "ranges[].firstAvailableStage",
+        "ranges[].equipmentType",
+        "ranges[].equipmentId",
+        "ranges[].contextLevel",
+        "ranges[].context.furnace_no",
+        "ranges[].context.f_jangip_gubun",
+        "ranges[].context.slab_width_band",
+        "ranges[].context.steel_grade",
+        "ranges[].context.steel_usage",
+        "ranges[].support",
+        "ranges[].median",
+        "ranges[].p01",
+        "ranges[].p05",
+        "ranges[].p95",
+        "ranges[].p99",
+        "ranges[].lowerTailEnabled",
+        "ranges[].upperTailEnabled",
+    }.issubset(recorded["equipment_operating_ranges"])
+    assert "quarantineCounts.MISSING_SM_CC_KEY" in recorded["analysis_summary"]
+    assert "labelCensoringCounts.LABEL_MISSING" in recorded["analysis_summary"]
+    assert "quarantineCounts.UNLINKED_AP" not in recorded["analysis_summary"]
+    assert "labelCensoringCounts.AP_UNLINKED" not in recorded["analysis_summary"]
+
+    aggregate = next(
+        item
+        for item in summary["lineage"]["aggregates"]
+        if item["artifactRole"] == "equipment_operating_ranges"
+    )
+    assert aggregate["inputMaterialKeys"] == list(
+        request.operating_ranges.sidecars[0].contributor_material_keys
+    )
+    field_index = {
+        item["outputField"]: item
+        for item in fields
+        if item["artifactRole"] == "equipment_operating_ranges"
+    }
+    assert "population.REFERENCE" in field_index["ranges[].support"]["dependencies"]
+    assert "fur_hr.f_pre_temp" in field_index["ranges[].support"]["dependencies"]
+    assert {
+        "config.operatingRanges.minimumSupport",
+        "fur_hr.furnace_no",
+        "fur_hr.f_ext_date",
+        "fur_hr.slab_width",
+        "sm_cc.cast_date",
+        "sm_cc.steel_grade",
+    }.issubset(set(field_index["ranges[].support"]["dependencies"]))
+    assert {
+        "fur_hr.furnace_no",
+        "fur_hr.f_ext_date",
+    }.issubset(set(field_index["ranges[].equipmentId"]["dependencies"]))
+    assert {
+        "sm_cc.cast_date",
+        "sm_cc.steel_grade",
+    }.issubset(set(field_index["ranges[].context.steel_grade"]["dependencies"]))
+    assert {
+        "population.REFERENCE",
+        "fur_hr.f_ext_date",
+        "fur_hr.slab_width",
+    }.issubset(
+        set(field_index["ranges[].context.slab_width_band"]["dependencies"])
+    )
+    assert {
+        "config.operatingRanges.minimumSupport",
+        "config.operatingRanges.typicalLowerQuantile",
+        "fur_hr.f_pre_temp",
+    }.issubset(set(field_index["ranges[].p05"]["dependencies"]))
+    summary_index = {
+        item["outputField"]: item
+        for item in fields
+        if item["artifactRole"] == "analysis_summary"
+    }
+    assert summary_index["quarantineCounts.MISSING_SM_CC_KEY"]["dependencies"] == [
+        "sm_cc.charge_id",
+        "sm_cc.slab_no",
+    ]
+    assert summary_index["labelCensoringCounts.LABEL_MISSING"]["dependencies"] == [
+        "ap.judge",
+        "population.REFERENCE",
+    ]
+
+
+def test_lineage_inventory_omits_absent_dynamic_count_leaves() -> None:
+    request = golden_summary_request()
+    counts = dict(request.split.counts)
+    counts["labelCensoring"] = {
+        key: 0 for key in counts["labelCensoring"]
+    }
+    audit = dict(request.genealogy.audit)
+    audit["quarantine"] = {
+        key: 0 for key in audit["quarantine"]
+    }
+    empty_request = replace(
+        request,
+        split=replace(request.split, counts=counts),
+        genealogy=replace(request.genealogy, audit=audit),
+    )
+
+    summary = build_summary(empty_request)
+    output_fields = {
+        item["outputField"]
+        for item in summary["lineage"]["fields"]
+        if item["artifactRole"] == "analysis_summary"
+    }
+
+    assert not any(
+        path.startswith(("quarantineCounts", "labelCensoringCounts"))
+        for path in output_fields
+    )
+
+
+def test_strong_repeated_rule_lineage_records_the_executed_statistical_branch() -> None:
+    config = golden_summary_request().analysis_config
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    result = build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        LITERAL_CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    record = next(
+        item
+        for item in result.records
+        if tuple(item["fieldNames"]) == ("slab_grind",)
+        and tuple(item["predicate"]["allOf"][0]["values"]) == ("RISK",)
+    )
+    assert record["grade"] == "DANGER"
+    assert record["discovery"]["reasonCode"] == "NONE"
+    assert record["confirmation"]["reasonCode"] == "NONE"
+
+    trace = summary_module._concrete_quality_lineage(result, config)[record["ruleId"]]
+    prefix = "quality_risk_intervals."
+
+    def reachable(path: str) -> set[str]:
+        seen: set[str] = set()
+
+        def visit(current: str) -> None:
+            for dependency in trace[current]:
+                normalized = dependency.removeprefix(prefix)
+                if dependency.startswith(prefix) and normalized in trace:
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        visit(normalized)
+                else:
+                    seen.add(dependency)
+
+        visit(path)
+        return seen
+
+    executed_inputs = {
+        "replay_events.values_json.judge",
+        "replay_events.values_json.slab_grind",
+        "replay_events.values_json.sm_plant",
+        "replay_events.values_json.steel_grade",
+        "replay_events.values_json.steel_usage",
+    }
+    for split_name, metric_names in (
+        (
+            "discovery",
+            (
+                "adjustedRate",
+                "comparatorAdjustedRate",
+                "riskDifference",
+                "relativeRisk",
+                "pValue",
+            ),
+        ),
+        (
+            "confirmation",
+            (
+                "adjustedRate",
+                "comparatorAdjustedRate",
+                "riskDifference",
+                "relativeRisk",
+            ),
+        ),
+    ):
+        for metric_name in metric_names:
+            assert executed_inputs.issubset(
+                reachable(f"rules[].{split_name}.{metric_name}")
+            )
+
+    assert {
+        "config.qualityRisk.minimumDiscoverySupport",
+        "config.qualityRisk.minimumCautionDefects",
+        "config.qualityRisk.minimumInformativeStrata",
+    }.issubset(reachable("rules[].discovery.adjustedRate"))
+    assert {
+        "config.qualityRisk.minimumConfirmationSupport",
+        "config.qualityRisk.minimumConfirmationDefects",
+        "config.qualityRisk.minimumInformativeStrata",
+    }.issubset(reachable("rules[].confirmation.adjustedRate"))
+    assert {
+        "quality_risk_intervals.rules[].adjustmentKind",
+        "quality_risk_intervals.rules[].discovery.defects",
+        "quality_risk_intervals.rules[].discovery.qValue",
+        "quality_risk_intervals.rules[].discovery.relativeRisk",
+        "quality_risk_intervals.rules[].discovery.relativeRiskCiLower",
+        "quality_risk_intervals.rules[].discovery.riskDifference",
+        "quality_risk_intervals.rules[].confirmation.relativeRisk",
+        "quality_risk_intervals.rules[].confirmation.riskDifference",
+        "config.qualityRisk.bhQ.caution",
+        "config.qualityRisk.bhQ.danger",
+        "config.qualityRisk.confirmationRelativeRisk.cautionExclusive",
+        "config.qualityRisk.confirmationRelativeRisk.danger",
+        "config.qualityRisk.minimumDangerDefects",
+        "config.qualityRisk.relativeRisk.caution",
+        "config.qualityRisk.relativeRisk.danger",
+        "config.qualityRisk.riskDifference.caution",
+        "config.qualityRisk.riskDifference.danger",
+    }.issubset(set(trace["rules[].grade"]))
+    assert "replay_events.charge_id" in reachable("rules[].grade")
+
+
 def test_summary_lineage_graph_is_closed_sorted_unique_and_acyclic() -> None:
     fields = build_summary(golden_summary_request())["lineage"]["fields"]
     identities = [f'{item["artifactRole"]}.{item["outputField"]}' for item in fields]
@@ -318,6 +583,23 @@ def test_summary_request_rejects_config_bytes_that_drift_from_identity() -> None
     request = golden_summary_request()
     with pytest.raises(ValueError, match="analysis_config"):
         replace(request, analysis_config_bytes=b"{}\n")
+
+
+def test_summary_request_rejects_an_unrelated_criteria_projection_identity() -> None:
+    request = golden_summary_request()
+    unrelated = compute_criteria_identity(
+        request.split.as_of,
+        b'{"kind":"UNRELATED_PROJECTION"}\n',
+        request.analysis_config_bytes,
+        request.producer_runtime_bytes,
+        {
+            role: request.schema_digests[role]
+            for role in LITERAL_CRITERIA_SCHEMA_DIGESTS
+        },
+    )
+
+    with pytest.raises(ValueError, match="criteria projection"):
+        replace(request, criteria_identity=unrelated)
 
 
 def test_holdout_metrics_requires_pre_ap_eligible_grade_and_charge_bootstraps() -> None:

@@ -15,6 +15,9 @@ from equipment_quality.deterministic import canonical_json_bytes, sha256_uri
 from equipment_quality.event_builder import build_replay_events
 from equipment_quality.models import (
     BundleWriteRequest,
+    GenealogyResult,
+    OperatingRangeSidecar,
+    OperatingRangesResult,
     SourceFile,
     SummaryBuildRequest,
     TimeSplitResult,
@@ -349,6 +352,71 @@ def golden_summary_request(*, return_aliases: bool = False):
         events=events,
     )
     return (request, inputs) if return_aliases else request
+
+
+def nonempty_range_summary_request() -> SummaryBuildRequest:
+    """Return a golden-shaped request with one literal rich range sidecar."""
+    request = golden_summary_request()
+    row = request.split.reference_rows.iloc[0]
+    contributor = next(
+        material
+        for material in request.material_catalog
+        if (
+            material.charge_id,
+            material.slab_no,
+            material.hr_coil_id,
+        )
+        == (row["charge_id"], row["slab_no"], row["hr_coil_id"])
+    )
+    rule_id = "sha256:" + "b" * 64
+    ranges = OperatingRangesResult(
+        (
+            {
+                "ruleId": rule_id,
+                "field": "f_pre_temp",
+                "fieldRole": "DIRECT_OPERATION",
+                "firstAvailableStage": "PREHEAT_COMPLETE",
+                "equipmentType": "FURNACE",
+                "equipmentId": "1",
+                "contextLevel": 0,
+                "context": {
+                    "furnace_no": "1호기",
+                    "f_jangip_gubun": "DIRECT",
+                    "slab_width_band": "Q2",
+                    "steel_grade": "S1",
+                    "steel_usage": "U1",
+                },
+                "support": 1,
+                "median": 1120.0,
+                "p01": None,
+                "p05": 1110.0,
+                "p95": 1130.0,
+                "p99": None,
+                "lowerTailEnabled": False,
+                "upperTailEnabled": False,
+            },
+        ),
+        (OperatingRangeSidecar(rule_id, (contributor.material_key,)),),
+    )
+    counts = dict(request.split.counts)
+    counts["labelCensoring"] = {"LABEL_MISSING": 1}
+    split = replace(request.split, counts=counts)
+    audit = dict(request.genealogy.audit)
+    audit["quarantine"] = {"MISSING_SM_CC_KEY": 1}
+    genealogy = GenealogyResult(
+        boundary_rows=request.genealogy.boundary_rows.copy(deep=True),
+        replay_rows=request.genealogy.replay_rows.copy(deep=True),
+        quality_rows=request.genealogy.quality_rows.copy(deep=True),
+        quarantine_rows=request.genealogy.quarantine_rows.copy(deep=True),
+        lineage_rows=request.genealogy.lineage_rows.copy(deep=True),
+        audit=audit,
+    )
+    return replace(
+        request,
+        split=split,
+        genealogy=genealogy,
+        operating_ranges=ranges,
+    )
 
 
 def expected_golden_summary_bytes(request: SummaryBuildRequest) -> bytes:
