@@ -10,8 +10,12 @@ from email.message import Message
 import hashlib
 import io
 from importlib.metadata import Distribution
+import json
 from pathlib import Path, PurePosixPath
+import subprocess
+import sys
 from typing import Callable, Iterable, Mapping
+import zipfile
 
 from equipment_quality.deterministic import canonical_json_bytes
 from equipment_quality.runtime_verify import RuntimeEnvironment, RuntimeImportOrigin
@@ -514,3 +518,146 @@ def build_runtime_fixture(
     )
     fixture.write_manifest()
     return fixture
+
+
+def source_tree_bytes(source_root: Path) -> dict[str, bytes]:
+    """Snapshot the producer inputs with a test-side inventory implementation."""
+    paths = [source_root / "pyproject.toml"]
+    paths.extend((source_root / "equipment_quality").rglob("*"))
+    snapshot: dict[str, bytes] = {}
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source_root).as_posix()
+        parts = PurePosixPath(relative).parts
+        if "__pycache__" in parts:
+            continue
+        if relative.endswith((".pyc", ".pyo")):
+            continue
+        snapshot[relative] = path.read_bytes()
+    return snapshot
+
+
+def independent_source_preimage(source_root: Path) -> bytes:
+    """Build the frozen source preimage without production helper code."""
+    lines = [b"sfep-source-lines/v1\n"]
+    included = {
+        relative: payload
+        for relative, payload in source_tree_bytes(source_root).items()
+        if relative != PROVENANCE_PATH
+    }
+    for relative, payload in sorted(
+        included.items(),
+        key=lambda item: item[0].encode("utf-8"),
+    ):
+        lines.append(
+            relative.encode("utf-8")
+            + b"=sha256:"
+            + hashlib.sha256(payload).hexdigest().encode("ascii")
+            + b"\n"
+        )
+    return b"".join(lines)
+
+
+def independent_source_digest(source_root: Path) -> str:
+    return sha256_uri(independent_source_preimage(source_root))
+
+
+def independently_expected_provenance(source_root: Path) -> bytes:
+    """Render the seven-field provenance using only test-side primitives."""
+    value = {
+        "schemaVersion": "sfep-producer-provenance/v1",
+        "producerName": "equipment-quality",
+        "distributionName": PRODUCER_NAME,
+        "version": PRODUCER_VERSION,
+        "sourceSha256": independent_source_digest(source_root),
+        "sourceDateEpoch": SOURCE_DATE_EPOCH,
+        "requirementsLockSha256": sha256_uri(
+            (source_root / "requirements.lock").read_bytes()
+        ),
+    }
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def wheel_resource(wheel: Path, member: str) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(wheel.read_bytes())) as archive:
+        matches = [info for info in archive.infolist() if info.orig_filename == member]
+        if len(matches) != 1:
+            raise AssertionError(f"expected one {member!r}, found {len(matches)}")
+        return archive.read(matches[0])
+
+
+def run_producer_build(
+    source_root: Path,
+    build_python: Path,
+    work_root: Path,
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    tool = source_root / "tools/build_producer.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--source-root",
+            str(source_root),
+            "--build-python",
+            str(build_python),
+            "--work-root",
+            str(work_root),
+        ],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_build_seal(
+    source_root: Path,
+    wheel_dir_a: Path,
+    wheel_dir_b: Path,
+    wheelhouse: Path,
+    producer_lock: Path,
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    tool = source_root / "tools/seal_producer_build.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--source-root",
+            str(source_root),
+            "--wheel-dir-a",
+            str(wheel_dir_a),
+            "--wheel-dir-b",
+            str(wheel_dir_b),
+            "--wheelhouse",
+            str(wheelhouse),
+            "--producer-lock",
+            str(producer_lock),
+        ],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def two_wheels(
+    root: Path,
+    first_payload: bytes,
+    second_payload: bytes | None = None,
+) -> tuple[Path, Path]:
+    filename = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+    wheel_a = root / "wheel-a" / filename
+    wheel_b = root / "wheel-b" / filename
+    wheel_a.parent.mkdir(parents=True)
+    wheel_b.parent.mkdir(parents=True)
+    wheel_a.write_bytes(first_payload)
+    wheel_b.write_bytes(first_payload if second_payload is None else second_payload)
+    return wheel_a, wheel_b
