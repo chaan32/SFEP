@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 import math
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from types import MappingProxyType
 import pandas as pd
 
@@ -102,6 +102,94 @@ def _string_tuple(
     ):
         raise ValueError(f"{label} must be UTF-8 sorted")
     return snapshot
+
+
+@dataclass(frozen=True)
+class Identity:
+    value: str
+    version: str
+    fields: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        from equipment_quality.deterministic import id_lines, sha256_uri
+
+        _validate_sha256_uri(self.value, "identity value")
+        if type(self.version) is not str or self.version not in {
+            "sfep-criteria-id/v1",
+            "sfep-bundle-id/v1",
+        }:
+            raise ValueError("identity version must be a supported built-in string")
+        items = _mapping_items(self.fields, "identity fields")
+        fields: dict[str, str] = {}
+        for key, value in items:
+            if type(value) is not str:
+                raise TypeError("identity field values must be built-in strings")
+            if any(character in key or character in value for character in ("=", "\r", "\n")):
+                raise ValueError("identity fields must be valid sfep-id-lines values")
+            fields[key] = value
+        criteria_keys = {
+            "analysis_config_sha256",
+            "as_of",
+            "criteria_projection_sha256",
+            "producer_runtime_sha256",
+            "schema.analysis_config.sha256",
+            "schema.equipment_operating_ranges.sha256",
+            "schema.producer_runtime.sha256",
+            "schema.quality_risk_intervals.sha256",
+        }
+        bundle_keys = {
+            "analysis_config_sha256",
+            "criteria_id",
+            "producer_runtime_sha256",
+            "schema.analysis_config.sha256",
+            "schema.analysis_summary.sha256",
+            "schema.bundle_manifest.sha256",
+            "schema.equipment_operating_ranges.sha256",
+            "schema.producer_runtime.sha256",
+            "schema.quality_risk_intervals.sha256",
+            "schema.replay_events.sha256",
+            "source.ap.name",
+            "source.ap.sha256",
+            "source.ap.size_bytes",
+            "source.fur_hr.name",
+            "source.fur_hr.sha256",
+            "source.fur_hr.size_bytes",
+            "source.sm_cc.name",
+            "source.sm_cc.sha256",
+            "source.sm_cc.size_bytes",
+        }
+        expected_keys = (
+            criteria_keys if self.version == "sfep-criteria-id/v1" else bundle_keys
+        )
+        if set(fields) != expected_keys:
+            raise ValueError("identity fields do not match the version contract")
+        for key, field_value in fields.items():
+            if key.endswith("_sha256") or key.endswith(".sha256") or key == "criteria_id":
+                _validate_sha256_uri(field_value, f"identity field {key}")
+        if self.version == "sfep-criteria-id/v1":
+            try:
+                parsed_as_of = date.fromisoformat(fields["as_of"])
+            except ValueError as error:
+                raise ValueError("identity as_of must be an exact date") from error
+            if parsed_as_of.isoformat() != fields["as_of"]:
+                raise ValueError("identity as_of must be an exact date")
+        else:
+            fixed_names = {
+                "source.sm_cc.name": "sts_1sm_cc_1.csv",
+                "source.fur_hr.name": "sts_2fur_hr_2.csv",
+                "source.ap.name": "sts_3ap_3.csv",
+            }
+            if any(fields[key] != name for key, name in fixed_names.items()):
+                raise ValueError("identity source names must use fixed role/name triples")
+            for role in ("sm_cc", "fur_hr", "ap"):
+                size = fields[f"source.{role}.size_bytes"]
+                if not size.isascii() or not size.isdecimal() or (
+                    len(size) > 1 and size.startswith("0")
+                ):
+                    raise ValueError("identity source sizes must be canonical decimals")
+        if self.value != sha256_uri(id_lines(self.version, fields)):
+            raise ValueError("identity value does not match its fields")
+        object.__setattr__(self, "fields", MappingProxyType(fields))
 
 
 @dataclass(frozen=True)
@@ -450,6 +538,107 @@ class QualityRulesResult:
 
 
 @dataclass(frozen=True)
+class PopulationLineage:
+    population_ref: str
+    split: str
+    material_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        accepted = {"REFERENCE", "DISCOVERY", "CONFIRMATION", "HOLDOUT"}
+        if type(self.population_ref) is not str or self.population_ref not in accepted:
+            raise ValueError("population_ref must be a fixed population name")
+        if type(self.split) is not str or self.split != self.population_ref:
+            raise ValueError("population split must equal population_ref")
+        keys = _string_tuple(
+            self.material_keys,
+            "population material keys",
+            require_utf8_sorted=True,
+        )
+        for key in keys:
+            _validate_sha256_uri(key, "population material key")
+        object.__setattr__(self, "material_keys", keys)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "populationRef": self.population_ref,
+            "split": self.split,
+            "materialKeys": list(self.material_keys),
+        }
+
+
+@dataclass(frozen=True)
+class AggregateLineage:
+    artifact_role: str
+    rule_id: str
+    split: str
+    population_ref: str
+    input_material_keys: tuple[str, ...]
+    comparator_definition: str
+    filters: tuple[str, ...]
+    transformations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.artifact_role not in {
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+        }:
+            raise ValueError("aggregate artifact_role is invalid")
+        _validate_sha256_uri(self.rule_id, "aggregate rule_id")
+        if self.split not in {"REFERENCE", "DISCOVERY", "CONFIRMATION"}:
+            raise ValueError("aggregate split is invalid")
+        if self.population_ref != self.split:
+            raise ValueError("aggregate population_ref must match split")
+        if self.artifact_role == "equipment_operating_ranges":
+            if self.split != "REFERENCE" or self.comparator_definition != "NOT_APPLICABLE":
+                raise ValueError("range aggregate must use REFERENCE/NOT_APPLICABLE")
+        elif self.comparator_definition != "FIXED_POPULATION_STRATA_MINUS_CANDIDATE":
+            raise ValueError("quality aggregate comparator definition is invalid")
+        keys = _string_tuple(
+            self.input_material_keys,
+            "aggregate input material keys",
+            require_utf8_sorted=True,
+        )
+        for key in keys:
+            _validate_sha256_uri(key, "aggregate input material key")
+        filters = _string_tuple(self.filters, "aggregate filters")
+        transformations = _string_tuple(
+            self.transformations, "aggregate transformations"
+        )
+        accepted_filters = {
+            "STAGE_AVAILABLE_AT_AS_OF",
+            "LABEL_AVAILABLE_AND_MATURE",
+            "FINITE_VALUE",
+            "PREDICATE_MATCH",
+            "FIXED_DISCOVERY_STRATA",
+            "INFORMATIVE_STRATA_ONLY",
+        }
+        accepted_transformations = {
+            "TYPE1_QUANTILE",
+            "WILSON_SCORE_INTERVAL",
+            "BENJAMINI_HOCHBERG_FDR",
+        }
+        if not set(filters).issubset(accepted_filters):
+            raise ValueError("aggregate filters contain an unknown value")
+        if not set(transformations).issubset(accepted_transformations):
+            raise ValueError("aggregate transformations contain an unknown value")
+        object.__setattr__(self, "input_material_keys", keys)
+        object.__setattr__(self, "filters", filters)
+        object.__setattr__(self, "transformations", transformations)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "artifactRole": self.artifact_role,
+            "ruleId": self.rule_id,
+            "split": self.split,
+            "populationRef": self.population_ref,
+            "inputMaterialKeys": list(self.input_material_keys),
+            "comparatorDefinition": self.comparator_definition,
+            "filters": list(self.filters),
+            "transformations": list(self.transformations),
+        }
+
+
+@dataclass(frozen=True)
 class AnalysisConfig:
     schema_version: str
     analysis_config_version: str
@@ -517,3 +706,369 @@ class TimeSplitResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "counts", _freeze(self.counts))
+
+
+def _analysis_config_payload(config: AnalysisConfig) -> dict[str, object]:
+    return {
+        "analysisConfigVersion": config.analysis_config_version,
+        "bootstrap": _thaw_json(config.bootstrap),
+        "evidenceFamilies": list(config.evidence_families),
+        "fdrFamilies": list(config.fdr_families),
+        "fields": _thaw_json(config.fields),
+        "fixedInteractions": _thaw_json(config.fixed_interactions),
+        "labelMaturityDays": config.label_maturity_days,
+        "operatingRanges": _thaw_json(config.operating_ranges),
+        "qualityRisk": _thaw_json(config.quality_risk),
+        "rangeContextHierarchies": [
+            {
+                "equipmentType": equipment_type,
+                "levels": _thaw_json(levels),
+            }
+            for equipment_type, levels in config.range_context_hierarchies.items()
+        ],
+        "riskAdjustmentHierarchies": [
+            {
+                "equipmentType": equipment_type,
+                "levels": _thaw_json(levels),
+            }
+            for equipment_type, levels in config.risk_adjustment_hierarchies.items()
+        ],
+        "schemaVersion": config.schema_version,
+        "splits": {
+            "discoveryFraction": config.discovery_fraction,
+            "referenceFraction": config.reference_fraction,
+        },
+        "timezone": config.timezone,
+        "wilsonZ": config.wilson_z,
+    }
+
+
+@dataclass(frozen=True)
+class SummaryBuildRequest:
+    analysis_config: AnalysisConfig
+    analysis_config_bytes: bytes
+    producer_runtime_bytes: bytes
+    schema_digests: Mapping[str, str]
+    inputs: InputTables
+    genealogy: GenealogyResult
+    split: TimeSplitResult
+    material_catalog: tuple[MaterialLineage, ...]
+    definitions: tuple[object, ...]
+    criteria_identity: Identity
+    bundle_identity: Identity
+    operating_ranges: OperatingRangesResult
+    quality_rules: QualityRulesResult
+    events: tuple[object, ...]
+
+    def __post_init__(self) -> None:
+        from equipment_quality.deterministic import canonical_json_bytes, sha256_uri
+        from equipment_quality.event_builder import ReplayEvent
+        from equipment_quality.feature_roles import FeatureDefinition, definitions
+
+        if type(self.analysis_config) is not AnalysisConfig:
+            raise TypeError("analysis_config must be an exact AnalysisConfig")
+        for label, value in (
+            ("analysis_config_bytes", self.analysis_config_bytes),
+            ("producer_runtime_bytes", self.producer_runtime_bytes),
+        ):
+            if type(value) is not bytes:
+                raise TypeError(f"{label} must be built-in bytes")
+        if canonical_json_bytes(_analysis_config_payload(self.analysis_config)) != (
+            self.analysis_config_bytes
+        ):
+            raise ValueError(
+                "analysis_config bytes do not match the frozen AnalysisConfig"
+            )
+        schema_items = _mapping_items(self.schema_digests, "summary schema digests")
+        expected_schema_roles = {
+            "bundle_manifest",
+            "analysis_config",
+            "producer_runtime",
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+            "analysis_summary",
+            "replay_events",
+        }
+        if {key for key, _ in schema_items} != expected_schema_roles:
+            raise ValueError("summary schema roles must be the exact seven roles")
+        schemas: dict[str, str] = {}
+        for key, value in schema_items:
+            schemas[key] = _validate_sha256_uri(value, f"summary schema digest {key}")
+
+        if type(self.inputs) is not InputTables:
+            raise TypeError("inputs must be an exact InputTables")
+        sources = tuple(self.inputs.sources)
+        if len(sources) != 3 or any(
+            type(source) is not SourceFile for source in sources
+        ):
+            raise TypeError("input sources must contain exactly three SourceFile values")
+        if tuple(source.role for source in sources) != ("sm_cc", "fur_hr", "ap"):
+            raise ValueError("input source roles must use the fixed order")
+        if tuple(source.name for source in sources) != (
+            "sts_1sm_cc_1.csv",
+            "sts_2fur_hr_2.csv",
+            "sts_3ap_3.csv",
+        ):
+            raise ValueError("input source names must use fixed role/name triples")
+        input_snapshot = InputTables(
+            sm_cc=self.inputs.sm_cc.copy(deep=True),
+            fur_hr=self.inputs.fur_hr.copy(deep=True),
+            ap=self.inputs.ap.copy(deep=True),
+            sources=sources,
+        )
+        if type(self.genealogy) is not GenealogyResult:
+            raise TypeError("genealogy must be an exact GenealogyResult")
+        genealogy_snapshot = GenealogyResult(
+            boundary_rows=self.genealogy.boundary_rows.copy(deep=True),
+            replay_rows=self.genealogy.replay_rows.copy(deep=True),
+            quality_rows=self.genealogy.quality_rows.copy(deep=True),
+            quarantine_rows=self.genealogy.quarantine_rows.copy(deep=True),
+            lineage_rows=self.genealogy.lineage_rows.copy(deep=True),
+            audit=self.genealogy.audit,
+        )
+        if type(self.split) is not TimeSplitResult:
+            raise TypeError("split must be an exact TimeSplitResult")
+        if type(self.split.as_of) is not date or type(self.split.discovery_cutoff) is not date:
+            raise TypeError("split boundaries must be exact dates")
+        split_snapshot = TimeSplitResult(
+            as_of=self.split.as_of,
+            discovery_cutoff=self.split.discovery_cutoff,
+            reference_rows=self.split.reference_rows.copy(deep=True),
+            discovery_rows=self.split.discovery_rows.copy(deep=True),
+            confirmation_rows=self.split.confirmation_rows.copy(deep=True),
+            holdout_rows=self.split.holdout_rows.copy(deep=True),
+            counts=self.split.counts,
+        )
+        catalog = tuple(self.material_catalog)
+        if any(type(material) is not MaterialLineage for material in catalog):
+            raise TypeError("material_catalog must contain exact MaterialLineage values")
+        if len({material.material_key for material in catalog}) != len(catalog):
+            raise ValueError("material_catalog material keys must be unique")
+        _MaterialCatalogIndex(catalog)
+        definition_snapshot = tuple(self.definitions)
+        if any(type(item) is not FeatureDefinition for item in definition_snapshot):
+            raise TypeError("definitions must contain exact FeatureDefinition values")
+        if definition_snapshot != definitions(self.analysis_config):
+            raise ValueError("definitions must be derived from the frozen analysis config")
+        if type(self.criteria_identity) is not Identity or self.criteria_identity.version != "sfep-criteria-id/v1":
+            raise TypeError("criteria_identity must be a criteria Identity")
+        if type(self.bundle_identity) is not Identity or self.bundle_identity.version != "sfep-bundle-id/v1":
+            raise TypeError("bundle_identity must be a bundle Identity")
+        if self.bundle_identity.fields.get("criteria_id") != self.criteria_identity.value:
+            raise ValueError("bundle identity must bind the criteria identity")
+        criteria_fields = self.criteria_identity.fields
+        bundle_fields = self.bundle_identity.fields
+        if criteria_fields.get("as_of") != self.split.as_of.isoformat():
+            raise ValueError("criteria identity as_of must match the split")
+        for label, payload in (
+            ("analysis_config", self.analysis_config_bytes),
+            ("producer_runtime", self.producer_runtime_bytes),
+        ):
+            digest = sha256_uri(payload)
+            if criteria_fields.get(label + "_sha256") != digest or bundle_fields.get(
+                label + "_sha256"
+            ) != digest:
+                raise ValueError(f"{label} bytes do not match both identities")
+        for role, digest in schemas.items():
+            bundle_key = f"schema.{role}.sha256"
+            criteria_key = bundle_key
+            if bundle_fields.get(bundle_key) != digest or (
+                criteria_key in criteria_fields
+                and criteria_fields.get(criteria_key) != digest
+            ):
+                raise ValueError("schema descriptors do not match both identities")
+        for source in sources:
+            prefix = f"source.{source.role}"
+            if (
+                bundle_fields.get(prefix + ".name") != source.name
+                or bundle_fields.get(prefix + ".size_bytes") != str(source.size_bytes)
+                or bundle_fields.get(prefix + ".sha256") != source.sha256
+            ):
+                raise ValueError("source descriptors do not match the bundle identity")
+        if type(self.operating_ranges) is not OperatingRangesResult:
+            raise TypeError("operating_ranges must be an OperatingRangesResult")
+        if type(self.quality_rules) is not QualityRulesResult:
+            raise TypeError("quality_rules must be a QualityRulesResult")
+        event_snapshot = tuple(self.events)
+        if any(type(event) is not ReplayEvent for event in event_snapshot):
+            raise TypeError("events must contain exact ReplayEvent values")
+        if any(
+            event.bundle_id != self.bundle_identity.value
+            or event.criteria_id != self.criteria_identity.value
+            for event in event_snapshot
+        ):
+            raise ValueError("events must bind both request identities")
+
+        object.__setattr__(self, "schema_digests", MappingProxyType(schemas))
+        object.__setattr__(self, "inputs", input_snapshot)
+        object.__setattr__(self, "genealogy", genealogy_snapshot)
+        object.__setattr__(self, "split", split_snapshot)
+        object.__setattr__(self, "material_catalog", catalog)
+        object.__setattr__(self, "definitions", definition_snapshot)
+        object.__setattr__(self, "events", event_snapshot)
+
+
+@dataclass(frozen=True)
+class BundleWriteRequest:
+    output_root: Path
+    analysis_config: bytes
+    producer_runtime: bytes
+    equipment_operating_ranges: Mapping[str, object]
+    quality_risk_intervals: Mapping[str, object]
+    replay_events: tuple[object, ...]
+    analysis_summary: Mapping[str, object]
+    criteria_identity: Identity
+    bundle_identity: Identity
+    sources: tuple[SourceFile, ...]
+    schema_digests: Mapping[str, str]
+    as_of: date
+    timezone: str
+    label_maturity_days: int
+
+    def __post_init__(self) -> None:
+        from equipment_quality.deterministic import id_lines, sha256_uri
+        from equipment_quality.event_builder import ReplayEvent
+
+        if not isinstance(self.output_root, Path):
+            raise TypeError("output_root must be a pathlib Path")
+        output_root = Path(str(self.output_root))
+        if not output_root.is_absolute():
+            raise ValueError("output_root must be absolute")
+        for label, payload in (
+            ("analysis_config", self.analysis_config),
+            ("producer_runtime", self.producer_runtime),
+        ):
+            if type(payload) is not bytes:
+                raise TypeError(f"{label} must be built-in bytes")
+
+        if type(self.criteria_identity) is not Identity or (
+            self.criteria_identity.version != "sfep-criteria-id/v1"
+        ):
+            raise TypeError("criteria_identity must be an exact criteria Identity")
+        if type(self.bundle_identity) is not Identity or (
+            self.bundle_identity.version != "sfep-bundle-id/v1"
+        ):
+            raise TypeError("bundle_identity must be an exact bundle Identity")
+        if type(self.as_of) is not date:
+            raise TypeError("as_of must be an exact date")
+        for identity in (self.criteria_identity, self.bundle_identity):
+            expected = sha256_uri(id_lines(identity.version, identity.fields))
+            if identity.value != expected:
+                raise ValueError("identity value does not match its frozen fields")
+
+        sources = tuple(self.sources)
+        expected_source_roles = ("sm_cc", "fur_hr", "ap")
+        expected_source_names = (
+            "sts_1sm_cc_1.csv",
+            "sts_2fur_hr_2.csv",
+            "sts_3ap_3.csv",
+        )
+        if len(sources) != 3 or any(
+            type(source) is not SourceFile for source in sources
+        ):
+            raise TypeError("sources must contain exactly three SourceFile values")
+        if tuple(source.role for source in sources) != expected_source_roles:
+            raise ValueError("source roles must use the fixed order")
+        if tuple(source.name for source in sources) != expected_source_names:
+            raise ValueError("source names must use the fixed role/name triples")
+        if any(
+            type(source.role) is not str
+            or type(source.name) is not str
+            or type(source.size_bytes) is not int
+            or source.size_bytes < 0
+            or type(source.sha256) is not str
+            for source in sources
+        ):
+            raise TypeError("source descriptors must use exact built-in field types")
+
+        schema_items = _mapping_items(self.schema_digests, "bundle schema digests")
+        expected_schema_roles = {
+            "bundle_manifest",
+            "analysis_config",
+            "producer_runtime",
+            "equipment_operating_ranges",
+            "quality_risk_intervals",
+            "analysis_summary",
+            "replay_events",
+        }
+        if {key for key, _ in schema_items} != expected_schema_roles:
+            raise ValueError("bundle schema digests must use the exact seven roles")
+        schemas = {
+            key: _validate_sha256_uri(value, f"bundle schema digest {key}")
+            for key, value in schema_items
+        }
+
+        criteria_fields = dict(self.criteria_identity.fields)
+        bundle_fields = dict(self.bundle_identity.fields)
+        if len(criteria_fields) != 8 or len(bundle_fields) != 19:
+            raise ValueError("bundle request identities have invalid field cardinality")
+        if criteria_fields.get("as_of") != self.as_of.isoformat():
+            raise ValueError("criteria identity as_of does not match request")
+        if bundle_fields.get("criteria_id") != self.criteria_identity.value:
+            raise ValueError("bundle identity does not bind criteria identity")
+        for role, digest in schemas.items():
+            bundle_key = f"schema.{role}.sha256"
+            if bundle_fields.get(bundle_key) != digest:
+                raise ValueError("bundle identity schema digests do not match request")
+            criteria_key = f"schema.{role}.sha256"
+            if criteria_key in criteria_fields and criteria_fields[criteria_key] != digest:
+                raise ValueError("criteria identity schema digests do not match request")
+        for source in sources:
+            prefix = f"source.{source.role}"
+            if (
+                bundle_fields.get(prefix + ".name") != source.name
+                or bundle_fields.get(prefix + ".size_bytes") != str(source.size_bytes)
+                or bundle_fields.get(prefix + ".sha256") != source.sha256
+            ):
+                raise ValueError("bundle identity source descriptors do not match request")
+        for label, payload in (
+            ("analysis_config", self.analysis_config),
+            ("producer_runtime", self.producer_runtime),
+        ):
+            digest = sha256_uri(payload)
+            if criteria_fields.get(label + "_sha256") != digest or bundle_fields.get(
+                label + "_sha256"
+            ) != digest:
+                raise ValueError(f"{label} bytes do not match request identities")
+
+        if type(self.timezone) is not str or self.timezone != "Asia/Seoul":
+            raise ValueError("timezone must be Asia/Seoul")
+        if type(self.label_maturity_days) is not int or self.label_maturity_days != 38:
+            raise ValueError("label_maturity_days must be the built-in integer 38")
+
+        ranges = _freeze_json(
+            self.equipment_operating_ranges, "equipment_operating_ranges"
+        )
+        rules = _freeze_json(self.quality_risk_intervals, "quality_risk_intervals")
+        summary = _freeze_json(self.analysis_summary, "analysis_summary")
+        for label, payload in (
+            ("equipment_operating_ranges", ranges),
+            ("quality_risk_intervals", rules),
+            ("analysis_summary", summary),
+        ):
+            if not isinstance(payload, Mapping):
+                raise TypeError(f"{label} must be a mapping")
+            if payload.get("criteriaId") != self.criteria_identity.value:
+                raise ValueError(f"{label} does not bind criteria identity")
+            if payload.get("asOf") != self.as_of.isoformat():
+                raise ValueError(f"{label} does not bind request as_of")
+        if summary.get("bundleId") != self.bundle_identity.value:
+            raise ValueError("analysis_summary does not bind bundle identity")
+
+        events = tuple(self.replay_events)
+        if any(type(event) is not ReplayEvent for event in events):
+            raise TypeError("replay_events must contain exact ReplayEvent values")
+        if any(
+            event.bundle_id != self.bundle_identity.value
+            or event.criteria_id != self.criteria_identity.value
+            for event in events
+        ):
+            raise ValueError("replay events do not bind request identities")
+
+        object.__setattr__(self, "output_root", output_root)
+        object.__setattr__(self, "equipment_operating_ranges", ranges)
+        object.__setattr__(self, "quality_risk_intervals", rules)
+        object.__setattr__(self, "analysis_summary", summary)
+        object.__setattr__(self, "replay_events", events)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "schema_digests", MappingProxyType(schemas))
