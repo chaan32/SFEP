@@ -590,6 +590,14 @@ def wheel_resource(wheel: Path, member: str) -> bytes:
         return archive.read(matches[0])
 
 
+def prepare_producer_work_root(work_root: Path) -> Path:
+    """Provision the caller-owned directory layout required by the producer."""
+    work_root.mkdir()
+    (work_root / "wheel-a").mkdir()
+    (work_root / "wheel-b").mkdir()
+    return work_root
+
+
 def run_producer_build(
     source_root: Path,
     build_python: Path,

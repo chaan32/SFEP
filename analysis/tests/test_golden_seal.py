@@ -28,6 +28,7 @@ from factories.runtime import (
     independent_source_digest,
     independent_source_preimage,
     independently_expected_provenance,
+    prepare_producer_work_root,
     run_build_seal,
     run_producer_build,
     source_tree_bytes,
@@ -582,8 +583,12 @@ def test_build_stages_one_snapshot_twice_without_mutating_source(
     build_python: Path,
 ) -> None:
     before = source_tree_bytes(ANALYSIS_ROOT)
-    first_work = tmp_path / "first-absolute-work-root"
-    second_work = tmp_path / "second-absolute-work-root"
+    first_work = prepare_producer_work_root(
+        tmp_path / "first-absolute-work-root"
+    )
+    second_work = prepare_producer_work_root(
+        tmp_path / "second-absolute-work-root"
+    )
 
     first = run_producer_build(
         ANALYSIS_ROOT,
@@ -629,193 +634,146 @@ def test_build_stages_one_snapshot_twice_without_mutating_source(
             assert stat.S_IMODE(mode) == expected_mode
 
 
-def test_build_controls_umask_before_creating_and_rolls_back_work_directories(
-    tmp_path: Path,
-    build_python: Path,
-) -> None:
-    source = _copy_source_root(tmp_path / "analysis-copy")
-    created_parent = tmp_path / "created-parent"
-    work_root = created_parent / "created-work"
-    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
-    module_globals = namespace["_run"].__globals__
-    error_type = module_globals["ProducerBuildError"]
-    observed_modes: list[int] = []
-
-    def failing_snapshot(_source_root: Path) -> dict[str, bytes]:
-        observed_modes.extend(
-            stat.S_IMODE(os.lstat(path).st_mode)
-            for path in (created_parent, work_root)
+def _caller_surface(root: Path) -> dict[str, tuple[object, ...]]:
+    """Capture caller-owned names without following symlinks."""
+    if not os.path.lexists(root):
+        return {}
+    captured: dict[str, tuple[object, ...]] = {}
+    pending = [(root, ".")]
+    while pending:
+        current, relative = pending.pop()
+        result = os.lstat(current)
+        kind = stat.S_IFMT(result.st_mode)
+        detail: object = None
+        if stat.S_ISLNK(result.st_mode):
+            detail = os.readlink(current)
+        elif stat.S_ISREG(result.st_mode):
+            detail = current.read_bytes()
+        captured[relative] = (
+            result.st_dev,
+            result.st_ino,
+            kind,
+            stat.S_IMODE(result.st_mode),
+            detail,
         )
-        raise error_type("injected failure after work-root creation")
-
-    module_globals["_source_snapshot"] = failing_snapshot
-    previous_umask = os.umask(0o777)
-    try:
-        with pytest.raises(error_type, match="injected failure"):
-            module_globals["_run"](source, build_python, work_root)
-    finally:
-        os.umask(previous_umask)
-
-    assert observed_modes == [0o755, 0o755]
-    assert not created_parent.exists()
+        if stat.S_ISDIR(result.st_mode):
+            pending.extend(
+                (Path(entry.path), f"{relative}/{entry.name}")
+                for entry in os.scandir(current)
+            )
+    return captured
 
 
-def test_build_rolls_back_a_directory_when_reopening_it_fails(
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing-root",
+        "missing-output-directories",
+        "missing-wheel-b",
+        "extra-root-entry",
+        "symlink-wheel-a",
+        "nonempty-wheel-a",
+        "nonempty-wheel-b",
+        "wheel-a-file",
+    ),
+)
+def test_build_requires_an_exact_prepared_root_without_mutating_caller_data(
     tmp_path: Path,
     build_python: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    case: str,
 ) -> None:
     source = _copy_source_root(tmp_path / "analysis-copy")
-    created_parent = tmp_path / "created-parent"
-    work_root = created_parent / "created-work"
+    work_root = tmp_path / "work"
+    if case not in {
+        "missing-root",
+        "nonempty-wheel-a",
+        "nonempty-wheel-b",
+    }:
+        work_root.mkdir()
+    if case == "missing-wheel-b":
+        (work_root / "wheel-a").mkdir()
+    elif case == "extra-root-entry":
+        (work_root / "wheel-a").mkdir()
+        (work_root / "wheel-b").mkdir()
+        (work_root / "caller.txt").write_bytes(b"caller-owned")
+    elif case == "symlink-wheel-a":
+        external = tmp_path / "external-wheel-a"
+        external.mkdir()
+        (work_root / "wheel-a").symlink_to(external, target_is_directory=True)
+        (work_root / "wheel-b").mkdir()
+    elif case == "nonempty-wheel-a":
+        prepare_producer_work_root(work_root)
+        (work_root / "wheel-a/caller.whl").write_bytes(b"caller-owned")
+    elif case == "nonempty-wheel-b":
+        prepare_producer_work_root(work_root)
+        (work_root / "wheel-b/caller.whl").write_bytes(b"caller-owned")
+    elif case == "wheel-a-file":
+        (work_root / "wheel-a").write_bytes(b"caller-owned")
+        (work_root / "wheel-b").mkdir()
+    before = _caller_surface(work_root)
     namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
     module_globals = namespace["_run"].__globals__
     error_type = module_globals["ProducerBuildError"]
-    real_open = os.open
-    attempts = 0
-
-    def failing_reopen(
-        path: os.PathLike[str] | str | bytes | int,
-        flags: int,
-        *arguments: object,
-        **keywords: object,
-    ) -> int:
-        nonlocal attempts
-        if path == "created-parent":
-            attempts += 1
-            if attempts == 2:
-                raise PermissionError("injected reopen failure")
-        return real_open(path, flags, *arguments, **keywords)
-
-    monkeypatch.setattr(module_globals["os"], "open", failing_reopen)
-
-    with pytest.raises((error_type, PermissionError), match="reopen|opened safely"):
-        module_globals["_run"](source, build_python, work_root)
-
-    assert attempts == 2
-    assert not created_parent.exists()
-
-
-@pytest.mark.parametrize("operation", ("stat", "dup"))
-def test_build_rolls_back_or_avoids_creation_when_ownership_capture_fails(
-    tmp_path: Path,
-    build_python: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    operation: str,
-) -> None:
-    source = _copy_source_root(tmp_path / "analysis-copy")
-    created_parent = tmp_path / "created-parent"
-    work_root = created_parent / "created-work"
-    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
-    module_globals = namespace["_run"].__globals__
-    error_type = module_globals["ProducerBuildError"]
-    injected = False
-
-    if operation == "stat":
-        real_operation = os.stat
-
-        def failing_operation(
-            path: os.PathLike[str] | str | bytes | int,
-            *arguments: object,
-            **keywords: object,
-        ) -> os.stat_result:
-            nonlocal injected
-            if path == "created-parent":
-                injected = True
-                raise OSError("injected ownership stat failure")
-            return real_operation(path, *arguments, **keywords)
-
-    else:
-        real_operation = os.dup
-
-        def failing_operation(
-            descriptor: int,
-            *arguments: object,
-            **keywords: object,
-        ) -> int:
-            nonlocal injected
-            if not injected:
-                injected = True
-                raise OSError("injected parent descriptor duplication failure")
-            return real_operation(descriptor, *arguments, **keywords)
-
-    monkeypatch.setattr(module_globals["os"], operation, failing_operation)
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
 
     with pytest.raises((error_type, OSError)):
         module_globals["_run"](source, build_python, work_root)
 
-    assert injected
-    with pytest.raises(FileNotFoundError):
-        os.lstat(created_parent)
+    assert _caller_surface(work_root) == before
 
 
-@pytest.mark.parametrize("directory_name", ("wheel-a", "wheel-b"))
-@pytest.mark.parametrize("reopen_result", ("failure", "replacement"))
-def test_build_publication_never_removes_a_replacement_directory_before_reopen(
+def test_build_uses_prepared_directories_without_changing_their_identity_or_mode(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    caller_directories = (
+        work_root,
+        work_root / "wheel-a",
+        work_root / "wheel-b",
+    )
+    before = {
+        path: (
+            os.lstat(path).st_dev,
+            os.lstat(path).st_ino,
+            stat.S_IMODE(os.lstat(path).st_mode),
+        )
+        for path in caller_directories
+    }
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+
+    previous_umask = os.umask(0o777)
+    try:
+        result = module_globals["_run"](source, build_python, work_root)
+    finally:
+        os.umask(previous_umask)
+
+    assert result[2] == len(b"identical test wheel")
+    for path in caller_directories:
+        current = os.lstat(path)
+        assert (current.st_dev, current.st_ino, stat.S_IMODE(current.st_mode)) == before[path]
+    for directory_name in ("wheel-a", "wheel-b"):
+        output = work_root / directory_name / PRODUCER_FILENAME
+        assert output.read_bytes() == b"identical test wheel"
+        assert stat.S_IMODE(os.lstat(output).st_mode) == 0o644
+
+
+def test_build_pins_the_root_and_both_output_directories_before_source_snapshot(
     tmp_path: Path,
     build_python: Path,
     monkeypatch: pytest.MonkeyPatch,
-    directory_name: str,
-    reopen_result: str,
 ) -> None:
     source = _copy_source_root(tmp_path / "analysis-copy")
-    work_root = tmp_path / "work"
-    detached = tmp_path / f"{directory_name}-detached-original"
+    work_root = prepare_producer_work_root(tmp_path / "work")
     namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
     module_globals = namespace["_run"].__globals__
-    error_type = module_globals["ProducerBuildError"]
     module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
     real_open = os.open
-    external_identity: tuple[int, int] | None = None
-
-    def replacing_open(
-        path: os.PathLike[str] | str | bytes | int,
-        flags: int,
-        *arguments: object,
-        **keywords: object,
-    ) -> int:
-        nonlocal external_identity
-        if external_identity is None and path == directory_name:
-            target = work_root / directory_name
-            target.rename(detached)
-            target.mkdir()
-            result = os.lstat(target)
-            external_identity = result.st_dev, result.st_ino
-            if reopen_result == "failure":
-                raise PermissionError("injected output directory reopen failure")
-        return real_open(path, flags, *arguments, **keywords)
-
-    monkeypatch.setattr(module_globals["os"], "open", replacing_open)
-
-    expected_message = "reopen" if reopen_result == "failure" else "changed before reopen"
-    with pytest.raises(error_type, match=expected_message):
-        module_globals["_run"](source, build_python, work_root)
-
-    assert external_identity is not None
-    current = os.lstat(work_root / directory_name)
-    assert (current.st_dev, current.st_ino) == external_identity
-    assert detached.is_dir()
-
-
-@pytest.mark.parametrize("phase", ("work-root", "publication"))
-def test_build_closes_a_reopened_directory_if_descriptor_authentication_fails(
-    tmp_path: Path,
-    build_python: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    phase: str,
-) -> None:
-    source = _copy_source_root(tmp_path / "analysis-copy")
-    work_root = tmp_path / "created-parent" / "work"
-    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
-    module_globals = namespace["_run"].__globals__
-    error_type = module_globals["ProducerBuildError"]
-    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
-    target_name = "created-parent" if phase == "work-root" else "wheel-a"
-    real_open = os.open
-    real_fstat = os.fstat
-    real_close = os.close
-    target_descriptor: int | None = None
-    closed = False
+    real_snapshot = module_globals["_source_snapshot"]
+    retained: dict[str, int] = {}
 
     def recording_open(
         path: os.PathLike[str] | str | bytes | int,
@@ -823,35 +781,379 @@ def test_build_closes_a_reopened_directory_if_descriptor_authentication_fails(
         *arguments: object,
         **keywords: object,
     ) -> int:
-        nonlocal target_descriptor
         descriptor = real_open(path, flags, *arguments, **keywords)
-        if target_descriptor is None and path == target_name:
-            target_descriptor = descriptor
+        if path == work_root:
+            retained["work"] = descriptor
+        elif path in {"wheel-a", "wheel-b"}:
+            retained[str(path)] = descriptor
+        return descriptor
+
+    def asserting_snapshot(path: Path) -> dict[str, bytes]:
+        assert set(retained) == {"work", "wheel-a", "wheel-b"}
+        assert all(stat.S_ISDIR(os.fstat(value).st_mode) for value in retained.values())
+        return real_snapshot(path)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    module_globals["_source_snapshot"] = asserting_snapshot
+
+    module_globals["_run"](source, build_python, work_root)
+
+    assert all(
+        (work_root / name / PRODUCER_FILENAME).is_file()
+        for name in ("wheel-a", "wheel-b")
+    )
+
+
+def test_build_treats_replacement_before_initial_output_open_as_caller_input(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    detached = tmp_path / "wheel-a-before-open"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_open = os.open
+    replaced = False
+
+    def replacing_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal replaced
+        if path == "wheel-a" and not replaced:
+            (work_root / "wheel-a").rename(detached)
+            (work_root / "wheel-a").mkdir()
+            replaced = True
+        return real_open(path, flags, *arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], "open", replacing_open)
+
+    module_globals["_run"](source, build_python, work_root)
+
+    assert replaced
+    assert list(detached.iterdir()) == []
+    assert (work_root / "wheel-a" / PRODUCER_FILENAME).is_file()
+
+
+def test_build_preserves_a_replacement_after_pin_and_cleans_the_detached_owned_file(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    detached = tmp_path / "wheel-a-after-pin"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_open = os.open
+    replacement_identity: tuple[int, int] | None = None
+
+    def replacing_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal replacement_identity
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == PRODUCER_FILENAME and replacement_identity is None:
+            (work_root / "wheel-a").rename(detached)
+            (work_root / "wheel-a").mkdir()
+            current = os.lstat(work_root / "wheel-a")
+            replacement_identity = current.st_dev, current.st_ino
+        return descriptor
+
+    monkeypatch.setattr(module_globals["os"], "open", replacing_open)
+
+    with pytest.raises(error_type, match="changed|identity|inventory"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert replacement_identity is not None
+    current = os.lstat(work_root / "wheel-a")
+    assert (current.st_dev, current.st_ino) == replacement_identity
+    assert list((work_root / "wheel-a").iterdir()) == []
+    detached_scratch = detached / PRODUCER_FILENAME
+    assert detached_scratch.read_bytes() == b""
+    assert list((work_root / "wheel-b").iterdir()) == []
+
+
+def test_build_invalidates_the_owned_fd_despite_persistent_output_name_stat_failure(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    identities = {
+        path: (os.lstat(path).st_dev, os.lstat(path).st_ino)
+        for path in (work_root / "wheel-a", work_root / "wheel-b")
+    }
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_open = os.open
+    real_stat = os.stat
+    output_opens = 0
+    stat_broken = False
+
+    def failing_second_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal output_opens, stat_broken
+        if path == PRODUCER_FILENAME:
+            output_opens += 1
+            if output_opens == 2:
+                stat_broken = True
+                raise PermissionError("injected second output open failure")
+        return real_open(path, flags, *arguments, **keywords)
+
+    def failing_stat(
+        path: os.PathLike[str] | str | bytes | int,
+        *arguments: object,
+        **keywords: object,
+    ) -> os.stat_result:
+        if stat_broken and path == PRODUCER_FILENAME:
+            raise OSError("persistent output-name stat failure")
+        return real_stat(path, *arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], "open", failing_second_open)
+    monkeypatch.setattr(module_globals["os"], "stat", failing_stat)
+
+    with pytest.raises(
+        (PermissionError, module_globals["ProducerBuildError"]),
+        match="second output|cannot be created",
+    ):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert output_opens == 2
+    for path, identity in identities.items():
+        current = os.lstat(path)
+        assert (current.st_dev, current.st_ino) == identity
+    assert (work_root / "wheel-a" / PRODUCER_FILENAME).read_bytes() == b""
+    assert list((work_root / "wheel-b").iterdir()) == []
+
+
+def test_build_cleanup_never_unlinks_a_replacement_installed_after_identity_check(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    target = work_root / "wheel-a" / PRODUCER_FILENAME
+    detached_owned = tmp_path / "detached-owned-wheel"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_open = os.open
+    real_stat = os.stat
+    real_ftruncate = os.ftruncate
+    output_opens = 0
+    cleanup_active = False
+    replaced = False
+
+    def install_replacement() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        target.rename(detached_owned)
+        target.write_bytes(b"external replacement")
+        replaced = True
+
+    def failing_second_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal output_opens, cleanup_active
+        if path == PRODUCER_FILENAME:
+            output_opens += 1
+            if output_opens == 2:
+                cleanup_active = True
+                raise PermissionError("injected second output open failure")
+        return real_open(path, flags, *arguments, **keywords)
+
+    def replacing_after_stat(
+        path: os.PathLike[str] | str | bytes | int,
+        *arguments: object,
+        **keywords: object,
+    ) -> os.stat_result:
+        nonlocal replaced
+        result = real_stat(path, *arguments, **keywords)
+        if cleanup_active and path == PRODUCER_FILENAME and not replaced:
+            install_replacement()
+        return result
+
+    def replacing_before_ftruncate(descriptor: int, length: int) -> None:
+        if cleanup_active and not replaced:
+            install_replacement()
+        real_ftruncate(descriptor, length)
+
+    monkeypatch.setattr(module_globals["os"], "open", failing_second_open)
+    monkeypatch.setattr(module_globals["os"], "stat", replacing_after_stat)
+    monkeypatch.setattr(
+        module_globals["os"],
+        "ftruncate",
+        replacing_before_ftruncate,
+    )
+
+    with pytest.raises(
+        (PermissionError, module_globals["ProducerBuildError"]),
+        match="cannot be created|second output",
+    ):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert replaced
+    assert target.read_bytes() == b"external replacement"
+    assert detached_owned.read_bytes() == b""
+    assert list((work_root / "wheel-b").iterdir()) == []
+
+
+def test_build_closes_every_initial_pin_once_when_close_closes_then_raises(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    before = _caller_surface(work_root)
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    real_open = os.open
+    real_fstat = os.fstat
+    real_close = os.close
+    retained: list[int] = []
+    close_attempts: list[int] = []
+    wheel_b_descriptor: int | None = None
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal wheel_b_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root or path in {"wheel-a", "wheel-b"}:
+            retained.append(descriptor)
+        if path == "wheel-b":
+            wheel_b_descriptor = descriptor
         return descriptor
 
     def failing_fstat(descriptor: int) -> os.stat_result:
-        if descriptor == target_descriptor:
-            raise OSError("injected directory descriptor authentication failure")
+        if descriptor == wheel_b_descriptor:
+            raise OSError("injected initial pin authentication failure")
         return real_fstat(descriptor)
 
-    def recording_close(descriptor: int) -> None:
-        nonlocal closed
-        if descriptor == target_descriptor:
-            closed = True
+    def closing_then_raising(descriptor: int) -> None:
+        close_attempts.append(descriptor)
         real_close(descriptor)
+        raise OSError("injected close-after-success failure")
 
     monkeypatch.setattr(module_globals["os"], "open", recording_open)
     monkeypatch.setattr(module_globals["os"], "fstat", failing_fstat)
-    monkeypatch.setattr(module_globals["os"], "close", recording_close)
+    monkeypatch.setattr(module_globals["os"], "close", closing_then_raising)
 
-    try:
-        with pytest.raises((error_type, OSError), match="authentication|changed"):
+    with pytest.raises((error_type, OSError), match="pin|authentication"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert len(retained) == 3
+    assert sorted(close_attempts) == sorted(retained)
+    assert len(close_attempts) == len(set(close_attempts))
+    assert _caller_surface(work_root) == before
+
+
+@pytest.mark.parametrize("outcome", ("success", "cleanup"))
+def test_build_close_after_success_never_masks_publication_or_aborts_cleanup(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    real_publish = module_globals["_publish_pair"]
+    real_open = os.open
+    real_close = os.close
+    active = False
+    output_opens = 0
+    retained: set[int] = set()
+    close_attempts: list[int] = []
+    bad_descriptor_closes: list[int] = []
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal output_opens
+        if path == PRODUCER_FILENAME:
+            output_opens += 1
+            if outcome == "cleanup" and output_opens == 2:
+                raise PermissionError("injected second output open failure")
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root or path in {"wheel-a", "wheel-b", PRODUCER_FILENAME}:
+            retained.add(descriptor)
+        return descriptor
+
+    def activating_publish(*arguments: object, **keywords: object) -> None:
+        nonlocal active
+        active = True
+        return real_publish(*arguments, **keywords)
+
+    def closing_then_raising(descriptor: int) -> None:
+        if active:
+            close_attempts.append(descriptor)
+            try:
+                real_close(descriptor)
+            except OSError:
+                bad_descriptor_closes.append(descriptor)
+                raise
+            raise OSError("injected close-after-success failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "close", closing_then_raising)
+    module_globals["_publish_pair"] = activating_publish
+
+    if outcome == "success":
+        result = module_globals["_run"](source, build_python, work_root)
+        assert result[2] == len(b"identical test wheel")
+        assert output_opens == 2
+        assert all(
+            (work_root / directory / PRODUCER_FILENAME).is_file()
+            for directory in ("wheel-a", "wheel-b")
+        )
+    else:
+        with pytest.raises(
+            (PermissionError, module_globals["ProducerBuildError"]),
+            match="second output|cannot be created",
+        ):
             module_globals["_run"](source, build_python, work_root)
-        assert target_descriptor is not None
-        assert closed
-    finally:
-        if target_descriptor is not None and not closed:
-            real_close(target_descriptor)
+        assert output_opens == 2
+        assert (work_root / "wheel-a" / PRODUCER_FILENAME).read_bytes() == b""
+        assert list((work_root / "wheel-b").iterdir()) == []
+    assert retained <= set(close_attempts)
+    assert bad_descriptor_closes == []
+    for descriptor in retained:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_build_uses_safe_interpreter_cwd_and_allowlisted_environment(
@@ -896,7 +1198,7 @@ def test_build_uses_safe_interpreter_cwd_and_allowlisted_environment(
         "SFEP_AMBIENT_BUILD_VARIABLE": "must-not-leak",
         "SETUPTOOLS_SCM_PRETEND_VERSION": "9.9.9",
     }
-    work_root = tmp_path / "isolated-work"
+    work_root = prepare_producer_work_root(tmp_path / "isolated-work")
 
     result = run_producer_build(
         source,
@@ -946,10 +1248,11 @@ def test_source_mutation_changes_provenance_not_the_source_tree(
     before = source_tree_bytes(source)
     expected = independently_expected_provenance(source)
 
-    result = run_producer_build(source, build_python, tmp_path / "mutated-work")
+    work_root = prepare_producer_work_root(tmp_path / "mutated-work")
+    result = run_producer_build(source, build_python, work_root)
 
     assert result.returncode == 0, result.stderr
-    wheel = tmp_path / "mutated-work/wheel-a" / PRODUCER_FILENAME
+    wheel = work_root / "wheel-a" / PRODUCER_FILENAME
     assert wheel_resource(wheel, PROVENANCE_PATH) == expected
     assert json.loads(expected)["sourceSha256"] != EXPECTED_SOURCE_DIGEST
     assert source_tree_bytes(source) == before
@@ -1040,7 +1343,7 @@ def test_build_rejects_unsafe_inputs_without_claimed_wheel_pair(
     source = _copy_source_root(tmp_path / "analysis-copy")
     requested_source: Path | str = source
     requested_python = build_python
-    work_root = tmp_path / "work"
+    work_root = prepare_producer_work_root(tmp_path / "work")
     if case == "relative-source":
         requested_source = Path("analysis-copy")
     elif case == "symlink-source":
@@ -1052,10 +1355,9 @@ def test_build_rejects_unsafe_inputs_without_claimed_wheel_pair(
         link.symlink_to(build_python)
         requested_python = link
     elif case == "nonempty-work":
-        work_root.mkdir()
-        (work_root / "occupied").write_bytes(b"occupied")
+        (work_root / "wheel-a/occupied").write_bytes(b"occupied")
     elif case == "source-overlap":
-        work_root = source / "work"
+        work_root = prepare_producer_work_root(source / "work")
     elif case == "case-aliased-source-overlap":
         aliased_source = source.with_name(source.name.swapcase())
         if not aliased_source.exists() or not os.path.samefile(
@@ -1063,7 +1365,7 @@ def test_build_rejects_unsafe_inputs_without_claimed_wheel_pair(
             source,
         ):
             pytest.skip("requires a case-insensitive filesystem")
-        work_root = aliased_source / "work"
+        work_root = prepare_producer_work_root(aliased_source / "work")
     elif case == "source-symlink-entry":
         (source / "equipment_quality/link.py").symlink_to(
             source / "equipment_quality/__init__.py"
@@ -1094,9 +1396,7 @@ def test_build_rechecks_the_pinned_work_root_before_any_output_write(
     case: str,
 ) -> None:
     source = _copy_source_root(tmp_path / "analysis-copy")
-    work_root = tmp_path / "work"
-    if case != "symlink-to-source":
-        work_root.mkdir()
+    work_root = prepare_producer_work_root(tmp_path / "work")
     namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
     module_globals = namespace["_run"].__globals__
     error_type = module_globals["ProducerBuildError"]
@@ -1114,7 +1414,7 @@ def test_build_rechecks_the_pinned_work_root_before_any_output_write(
             if case == "symlink-to-source":
                 work_root.symlink_to(source, target_is_directory=True)
             else:
-                work_root.mkdir()
+                prepare_producer_work_root(work_root)
         mutated = True
         return snapshot
 
@@ -1169,7 +1469,7 @@ def test_build_rechecks_the_authenticated_source_before_publishing(
     build_python: Path,
 ) -> None:
     source = _copy_source_root(tmp_path / "analysis-copy")
-    work_root = tmp_path / "work"
+    work_root = prepare_producer_work_root(tmp_path / "work")
     namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
     module_globals = namespace["_run"].__globals__
     error_type = module_globals["ProducerBuildError"]
@@ -1189,8 +1489,8 @@ def test_build_rechecks_the_authenticated_source_before_publishing(
         module_globals["_run"](source, build_python, work_root)
 
     assert builds == 2
-    assert not (work_root / "wheel-a").exists()
-    assert not (work_root / "wheel-b").exists()
+    assert list((work_root / "wheel-a").iterdir()) == []
+    assert list((work_root / "wheel-b").iterdir()) == []
 
 
 def test_build_rejects_replaced_output_instead_of_adopting_its_fingerprint(
@@ -1199,7 +1499,7 @@ def test_build_rejects_replaced_output_instead_of_adopting_its_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _copy_source_root(tmp_path / "analysis-copy")
-    work_root = tmp_path / "work"
+    work_root = prepare_producer_work_root(tmp_path / "work")
     namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
     module_globals = namespace["_run"].__globals__
     error_type = module_globals["ProducerBuildError"]
@@ -1230,7 +1530,9 @@ def producer_wheel_pair(
     tmp_path_factory: pytest.TempPathFactory,
     build_python: Path,
 ) -> tuple[Path, Path]:
-    work_root = tmp_path_factory.mktemp("producer-wheel-pair") / "work"
+    work_root = prepare_producer_work_root(
+        tmp_path_factory.mktemp("producer-wheel-pair") / "work"
+    )
     result = run_producer_build(ANALYSIS_ROOT, build_python, work_root)
     assert result.returncode == 0, result.stderr
     return (
