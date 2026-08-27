@@ -24,8 +24,3 @@ sfep:
     enabled: false
   kafka:
     alert-consumer-enabled: false
-  steel-shadow:
-    enabled: false
-    base-url: http://127.0.0.1:18081
-    connect-timeout: 2s
-    read-timeout: 120s
