@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from numbers import Integral, Real
 
@@ -19,13 +20,26 @@ from equipment_quality.feature_roles import (
     FeatureDefinition,
     definitions as configured_definitions,
 )
-from equipment_quality.models import AnalysisConfig, TimeSplitResult
+from equipment_quality.models import (
+    AnalysisConfig,
+    MaterialLineage,
+    OperatingRangeSidecar,
+    OperatingRangesResult,
+    TimeSplitResult,
+    _MaterialCatalogIndex,
+)
 
 
 _RANGE_ROLES = {"DIRECT_OPERATION", "PRODUCT_STATE_REFERENCE"}
 _EQUIPMENT_RANK = {"SM_CC": 0, "FURNACE": 1, "RM4": 2, "AP": 3}
 _BAND_QUANTILES = (0.25, 0.50, 0.75)
 _MISSING = object()
+
+
+@dataclass(frozen=True)
+class _RangeCoreItem:
+    record: dict[str, object]
+    contributor_positions: tuple[int, ...]
 
 
 def _is_missing(value: object) -> bool:
@@ -313,13 +327,13 @@ def _records_for_feature(
     minimum_support: int,
     extreme_support: int,
     quantiles: tuple[float, ...],
-) -> list[dict[str, object]]:
+) -> list[_RangeCoreItem]:
     if definition.name not in columns or definition.event_date_column not in columns:
         return []
     context_fields = {
         field for level in definition.context_hierarchy for field in level
     }
-    prepared: list[tuple[float, str, dict[str, object]]] = []
+    prepared: list[tuple[float, int, str, dict[str, object]]] = []
     for index in range(row_count):
         if not _available_by(columns, index, definition.event_date_column, as_of):
             continue
@@ -338,56 +352,66 @@ def _records_for_feature(
             )
             for field in context_fields
         }
-        prepared.append((value, equipment_id, context))
+        prepared.append((value, index, equipment_id, context))
     if not prepared:
         return []
 
-    groups_by_level: list[dict[tuple[str, tuple[object, ...]], list[float]]] = []
+    groups_by_level: list[
+        dict[tuple[str, tuple[object, ...]], list[tuple[float, int]]]
+    ] = []
     for level in definition.context_hierarchy:
-        groups: dict[tuple[str, tuple[object, ...]], list[float]] = {}
-        for value, equipment_id, context in prepared:
+        groups: dict[
+            tuple[str, tuple[object, ...]], list[tuple[float, int]]
+        ] = {}
+        for value, position, equipment_id, context in prepared:
             context_values = tuple(context[field] for field in level)
             if any(item is _MISSING for item in context_values):
                 continue
-            groups.setdefault((equipment_id, context_values), []).append(value)
+            groups.setdefault((equipment_id, context_values), []).append(
+                (value, position)
+            )
         groups_by_level.append(groups)
 
     selected: set[tuple[int, str, tuple[object, ...]]] = set()
-    for _, equipment_id, context in prepared:
+    for _, _, equipment_id, context in prepared:
         for level_index, level in enumerate(definition.context_hierarchy):
             context_values = tuple(context[field] for field in level)
             if any(item is _MISSING for item in context_values):
                 continue
-            values = groups_by_level[level_index].get((equipment_id, context_values), ())
-            if len(values) >= minimum_support:
+            members = groups_by_level[level_index].get(
+                (equipment_id, context_values), ()
+            )
+            if len(members) >= minimum_support:
                 selected.add((level_index, equipment_id, context_values))
                 break
 
-    records: list[dict[str, object]] = []
+    records: list[_RangeCoreItem] = []
     for level_index, equipment_id, context_values in selected:
         level = definition.context_hierarchy[level_index]
         context = dict(zip(level, context_values, strict=True))
-        values = groups_by_level[level_index][(equipment_id, context_values)]
+        members = groups_by_level[level_index][(equipment_id, context_values)]
         records.append(
-            _range_record(
-                definition=definition,
-                equipment_id=equipment_id,
-                context_level=level_index,
-                context=context,
-                values=values,
-                extreme_support=extreme_support,
-                quantiles=quantiles,
+            _RangeCoreItem(
+                _range_record(
+                    definition=definition,
+                    equipment_id=equipment_id,
+                    context_level=level_index,
+                    context=context,
+                    values=tuple(value for value, _ in members),
+                    extreme_support=extreme_support,
+                    quantiles=quantiles,
+                ),
+                tuple(position for _, position in members),
             )
         )
     return records
 
 
-def build_operating_ranges(
+def _build_operating_ranges_core(
     split: TimeSplitResult,
     definitions: Sequence[FeatureDefinition],
     config: AnalysisConfig,
-) -> list[dict[str, object]]:
-    """Build deterministic numeric ranges from reference rows available by ``as_of``."""
+) -> tuple[_RangeCoreItem, ...]:
     minimum_support, extreme_support, quantiles = _validated_policy(config)
     requested = _validated_definition_surface(definitions, config)
     all_definitions = {
@@ -400,7 +424,7 @@ def build_operating_ranges(
         and definition.data_type == "NUMBER"
     )
     if not numeric or split.reference_rows.empty:
-        return []
+        return ()
 
     reference_columns = {
         str(column): split.reference_rows[column].tolist()
@@ -422,9 +446,9 @@ def build_operating_ranges(
         all_definitions,
         split.as_of,
     )
-    records: list[dict[str, object]] = []
+    items: list[_RangeCoreItem] = []
     for definition in numeric:
-        records.extend(
+        items.extend(
             _records_for_feature(
                 reference_columns,
                 reference_row_count,
@@ -437,19 +461,20 @@ def build_operating_ranges(
                 quantiles=quantiles,
             )
         )
-    records.sort(
-        key=lambda record: (
-            STAGE_RANK[str(record["firstAvailableStage"])],
-            _EQUIPMENT_RANK[str(record["equipmentType"])],
-            str(record["field"]).encode("utf-8"),
-            str(record["equipmentId"]).encode("utf-8"),
-            int(record["contextLevel"]),
-            _context_sort_bytes(record["context"]),
-            str(record["ruleId"]).encode("utf-8"),
+    items.sort(
+        key=lambda item: (
+            STAGE_RANK[str(item.record["firstAvailableStage"])],
+            _EQUIPMENT_RANK[str(item.record["equipmentType"])],
+            str(item.record["field"]).encode("utf-8"),
+            str(item.record["equipmentId"]).encode("utf-8"),
+            int(item.record["contextLevel"]),
+            _context_sort_bytes(item.record["context"]),
+            str(item.record["ruleId"]).encode("utf-8"),
         )
     )
     preimage_by_rule_id: dict[str, bytes] = {}
-    for record in records:
+    for item in items:
+        record = item.record
         rule_id = str(record["ruleId"])
         preimage = canonical_json_bytes(
             {key: value for key, value in record.items() if key != "ruleId"}
@@ -457,4 +482,43 @@ def build_operating_ranges(
         previous = preimage_by_rule_id.setdefault(rule_id, preimage)
         if previous != preimage:
             raise ValueError("operating range rule ID collision")
-    return records
+    return tuple(items)
+
+
+def build_operating_ranges(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+) -> list[dict[str, object]]:
+    """Build the byte-compatible legacy operating-range wire records."""
+    return [
+        item.record
+        for item in _build_operating_ranges_core(split, definitions, config)
+    ]
+
+
+def build_operating_ranges_result(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    *,
+    material_catalog: Sequence[MaterialLineage],
+) -> OperatingRangesResult:
+    """Build wire records plus exact reference contributor material keys."""
+    catalog = _MaterialCatalogIndex(material_catalog)
+    material_keys = catalog.resolve_rows(split.reference_rows, "range reference")
+    items = _build_operating_ranges_core(split, definitions, config)
+    records = tuple(item.record for item in items)
+    sidecars = tuple(
+        OperatingRangeSidecar(
+            str(item.record["ruleId"]),
+            tuple(
+                sorted(
+                    (material_keys[position] for position in item.contributor_positions),
+                    key=lambda value: value.encode("utf-8"),
+                )
+            ),
+        )
+        for item in items
+    )
+    return OperatingRangesResult(records, sidecars)

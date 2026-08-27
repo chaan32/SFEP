@@ -21,7 +21,15 @@ import pandas as pd
 
 from equipment_quality.deterministic import canonical_json_bytes, sha256_uri, type1_quantile
 from equipment_quality.feature_roles import STAGE_RANK, FeatureDefinition, definitions as configured_definitions
-from equipment_quality.models import AnalysisConfig, TimeSplitResult
+from equipment_quality.models import (
+    AnalysisConfig,
+    MaterialLineage,
+    QualityRuleSidecar,
+    QualityRulesResult,
+    QualitySplitSidecar,
+    TimeSplitResult,
+    _MaterialCatalogIndex,
+)
 from equipment_quality.statistics import (
     BootstrapCi,
     Stratum,
@@ -253,6 +261,92 @@ class QualityMetric:
             "qValue": self.q_value,
             "reasonCode": self.reason_code,
         }
+
+
+@dataclass(frozen=True)
+class _MetricComputation:
+    metric: QualityMetric
+    informative_stratum_keys: tuple[str, ...]
+    candidate_positions: tuple[int, ...]
+    comparator_positions: tuple[int, ...]
+    row_position_to_stratum: Mapping[int, str]
+    comparator_counts_by_stratum: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        if type(self.metric) is not QualityMetric:
+            raise TypeError("metric computation must contain a QualityMetric")
+        informative = tuple(self.informative_stratum_keys)
+        if any(type(key) is not str for key in informative):
+            raise TypeError("metric informative stratum keys must be built-in strings")
+        if len(informative) != len(set(informative)):
+            raise ValueError("metric informative stratum keys must be unique")
+        if informative != tuple(sorted(informative, key=lambda key: key.encode("utf-8"))):
+            raise ValueError("metric informative stratum keys must be UTF-8 sorted")
+        candidate_positions = tuple(self.candidate_positions)
+        comparator_positions = tuple(self.comparator_positions)
+        for label, positions in (
+            ("candidate", candidate_positions),
+            ("comparator", comparator_positions),
+        ):
+            if any(type(position) is not int or position < 0 for position in positions):
+                raise ValueError(f"metric {label} positions must be non-negative integers")
+            if len(positions) != len(set(positions)) or positions != tuple(sorted(positions)):
+                raise ValueError(f"metric {label} positions must be unique and sorted")
+        if set(candidate_positions) & set(comparator_positions):
+            raise ValueError("metric candidate/comparator positions overlap")
+        if not isinstance(self.row_position_to_stratum, Mapping):
+            raise TypeError("metric row-position strata must be a mapping")
+        position_to_stratum = dict(self.row_position_to_stratum)
+        expected_positions = set(candidate_positions) | set(comparator_positions)
+        if set(position_to_stratum) != expected_positions:
+            raise ValueError("metric row-position strata must cover selected positions exactly")
+        if any(
+            type(position) is not int
+            or type(key) is not str
+            or key not in informative
+            for position, key in position_to_stratum.items()
+        ):
+            raise ValueError("metric row-position strata contain invalid entries")
+        if not isinstance(self.comparator_counts_by_stratum, Mapping):
+            raise TypeError("metric comparator counts must be a mapping")
+        comparator_counts = dict(self.comparator_counts_by_stratum)
+        if set(comparator_counts) != set(informative) or any(
+            type(value) is not int or value <= 0
+            for value in comparator_counts.values()
+        ):
+            raise ValueError("metric comparator counts must match informative strata")
+        observed_comparator_counts = {
+            key: sum(
+                1
+                for position in comparator_positions
+                if position_to_stratum[position] == key
+            )
+            for key in informative
+        }
+        if comparator_counts != observed_comparator_counts:
+            raise ValueError("metric comparator counts do not match comparator positions")
+        if self.metric.support != len(candidate_positions):
+            raise ValueError("metric support does not match candidate positions")
+        object.__setattr__(self, "informative_stratum_keys", informative)
+        object.__setattr__(self, "candidate_positions", candidate_positions)
+        object.__setattr__(self, "comparator_positions", comparator_positions)
+        object.__setattr__(
+            self,
+            "row_position_to_stratum",
+            MappingProxyType(dict(sorted(position_to_stratum.items()))),
+        )
+        object.__setattr__(
+            self,
+            "comparator_counts_by_stratum",
+            MappingProxyType(
+                dict(
+                    sorted(
+                        comparator_counts.items(),
+                        key=lambda item: item[0].encode("utf-8"),
+                    )
+                )
+            ),
+        )
 
 
 def _validate_sha256_uri(value: object, label: str) -> str:
@@ -889,7 +983,7 @@ def _metric(
     *,
     confirmation: bool,
     strata_cache: _StrataCache | None = None,
-) -> QualityMetric:
+) -> _MetricComputation:
     mask = _predicate_mask(rows, candidate.predicate)
     eligible = _eligible_mask(rows, candidate.predicate)
     cache = strata_cache or _StrataCache(rows, candidate.band_boundaries)
@@ -915,6 +1009,39 @@ def _metric(
     support = sum(stratum.a + stratum.b for stratum in strata)
     comparator_support = sum(stratum.c + stratum.d for stratum in strata)
     defects = sum(stratum.a for stratum in strata)
+    informative_keys = tuple(
+        sorted(informative, key=lambda value: value.encode("utf-8"))
+    )
+    candidate_positions = tuple(
+        index
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index] and mask[index]
+    )
+    comparator_positions = tuple(
+        index
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index] and not mask[index]
+    )
+    row_position_to_stratum = {
+        index: key
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index]
+    }
+    comparator_counts = {
+        key: informative[key][2] + informative[key][3]
+        for key in informative_keys
+    }
+
+    def computation(metric: QualityMetric) -> _MetricComputation:
+        return _MetricComputation(
+            metric,
+            informative_keys,
+            candidate_positions,
+            comparator_positions,
+            row_position_to_stratum,
+            comparator_counts,
+        )
+
     crude = defects / support if support else None
     wilson = wilson_interval(defects, support, config.wilson_z)
     minimum_support = int(
@@ -936,41 +1063,45 @@ def _metric(
     low_support = support < minimum_support or comparator_support < minimum_support
     if low_structure or low_support:
         reason = "NO_INFORMATIVE_STRATA" if low_structure else "LOW_SUPPORT"
-        return QualityMetric(
-            support,
-            defects,
-            crude,
-            None if wilson is None else wilson[0],
-            None if wilson is None else wilson[1],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None if confirmation else 1.0,
-            None,
-            reason,
+        return computation(
+            QualityMetric(
+                support,
+                defects,
+                crude,
+                None if wilson is None else wilson[0],
+                None if wilson is None else wilson[1],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None if confirmation else 1.0,
+                None,
+                reason,
+            )
         )
     rates = standardized_rates(strata, candidate.discovery_weights)
     relative_risk = mantel_haenszel_rr(strata)
     p_value, p_reason = cmh_p_value(strata)
     reason = "LOW_DEFECT_COUNT" if defects < minimum_defects else p_reason
-    return QualityMetric(
-        support,
-        defects,
-        crude,
-        None if wilson is None else wilson[0],
-        None if wilson is None else wilson[1],
-        rates.candidate,
-        rates.comparator,
-        rates.risk_difference,
-        relative_risk,
-        None,
-        None,
-        None if confirmation else p_value,
-        None,
-        reason,
+    return computation(
+        QualityMetric(
+            support,
+            defects,
+            crude,
+            None if wilson is None else wilson[0],
+            None if wilson is None else wilson[1],
+            rates.candidate,
+            rates.comparator,
+            rates.risk_difference,
+            relative_risk,
+            None,
+            None,
+            None if confirmation else p_value,
+            None,
+            reason,
+        )
     )
 
 
@@ -1051,24 +1182,17 @@ def _confirmation_danger_pass(metric: QualityMetric, config: AnalysisConfig) -> 
 
 def _bootstrap_rows(
     rows: _Rows,
-    candidate: Candidate,
-    strata_cache: _StrataCache | None = None,
+    computation: _MetricComputation,
 ) -> pd.DataFrame:
     charge_ids = rows.columns.get("charge_id")
     if charge_ids is None:
         raise ValueError("quality bootstrap rows must contain charge_id")
-    mask = _predicate_mask(rows, candidate.predicate)
-    eligible = _eligible_mask(rows, candidate.predicate)
-    cache = strata_cache or _StrataCache(rows, candidate.band_boundaries)
-    keys = cache.keys(candidate.adjustment_fields)
-    allowed = set(candidate.discovery_weights)
     judges = rows.columns.get("judge")
     if judges is None:
         raise ValueError("quality bootstrap rows must contain judge")
     records: list[dict[str, object]] = []
-    for index, key in enumerate(keys):
-        if key is None or key not in allowed or not eligible[index]:
-            continue
+    candidate_positions = set(computation.candidate_positions)
+    for index, key in computation.row_position_to_stratum.items():
         charge_id = charge_ids[index]
         if type(charge_id) is not str or not charge_id:
             raise ValueError("quality bootstrap charge_id must be a non-empty string")
@@ -1079,7 +1203,7 @@ def _bootstrap_rows(
             {
                 "charge_id": charge_id,
                 "stratum": key,
-                "candidate": bool(mask[index]),
+                "candidate": index in candidate_positions,
                 "judge": judge,
             }
         )
@@ -1745,22 +1869,21 @@ def _parallel_bootstrap_tasks(
 def _bootstrap_discovery_metrics(
     rows: _Rows,
     candidates: tuple[Candidate, ...],
-    discovery: list[QualityMetric],
-    strata_cache: _StrataCache,
+    discovery: list[_MetricComputation],
     criteria_id: str,
     config: AnalysisConfig,
-) -> list[QualityMetric]:
+) -> list[_MetricComputation]:
     replicates = int(config.bootstrap["replicates"])
     tasks = [
         (
             index,
-            _bootstrap_rows(rows, candidate, strata_cache),
+            _bootstrap_rows(rows, discovery[index]),
             criteria_id,
             candidate.rule_id,
             replicates,
         )
         for index, candidate in enumerate(candidates)
-        if _bootstrap_applicable(discovery[index], config)
+        if _bootstrap_applicable(discovery[index].metric, config)
     ]
     expected = tuple((task[0], task[3], task[4]) for task in tasks)
     _validate_expected_bootstrap_identities(
@@ -1788,15 +1911,19 @@ def _bootstrap_discovery_metrics(
 
     result = list(discovery)
     for response in validated:
-        metric = result[response.index]
+        computation = result[response.index]
+        metric = computation.metric
         result[response.index] = replace(
-            metric,
-            relative_risk_ci_lower=response.interval.lower,
-            relative_risk_ci_upper=response.interval.upper,
-            reason_code=(
-                response.interval.reason_code
-                if metric.reason_code == "NONE"
-                else metric.reason_code
+            computation,
+            metric=replace(
+                metric,
+                relative_risk_ci_lower=response.interval.lower,
+                relative_risk_ci_upper=response.interval.upper,
+                reason_code=(
+                    response.interval.reason_code
+                    if metric.reason_code == "NONE"
+                    else metric.reason_code
+                ),
             ),
         )
     return result
@@ -1900,13 +2027,19 @@ def _annotate_display_merges(rules: list[QualityRule]) -> list[QualityRule]:
     return result
 
 
-def build_quality_rules(
+@dataclass(frozen=True)
+class _QualityCoreItem:
+    rule: QualityRule
+    discovery: _MetricComputation
+    confirmation: _MetricComputation
+
+
+def _build_quality_rules_core(
     split: TimeSplitResult,
     definitions: Sequence[FeatureDefinition],
     config: AnalysisConfig,
     criteria_id: str,
-) -> list[dict[str, object]]:
-    """Build deterministic atomic discovery/confirmation quality-risk rules."""
+) -> tuple[_QualityCoreItem, ...]:
     _validate_criteria_id(criteria_id)
     wanted = _definition_surface(definitions, config)
     discovery_rows = _snapshot_rows(split.discovery_rows)
@@ -1928,20 +2061,28 @@ def build_quality_rules(
     for family in config.fdr_families:
         indexes = [index for index, candidate in enumerate(candidates) if candidate.analysis_family == family]
         adjusted = benjamini_hochberg(
-            [1.0 if discovery[index].p_value is None else discovery[index].p_value for index in indexes]
+            [
+                1.0
+                if discovery[index].metric.p_value is None
+                else discovery[index].metric.p_value
+                for index in indexes
+            ]
         )
         for index, q_value in zip(indexes, adjusted, strict=True):
-            discovery[index] = replace(discovery[index], q_value=q_value)
+            discovery[index] = replace(
+                discovery[index],
+                metric=replace(discovery[index].metric, q_value=q_value),
+            )
     discovery = _bootstrap_discovery_metrics(
         discovery_rows,
         candidates,
         discovery,
-        discovery_cache,
         criteria_id,
         config,
     )
 
     rules: list[QualityRule] = []
+    confirmation_computations: list[_MetricComputation] = []
     for index, candidate in enumerate(candidates):
         confirmation = _metric(
             confirmation_rows,
@@ -1950,14 +2091,104 @@ def build_quality_rules(
             confirmation=True,
             strata_cache=confirmation_cache,
         )
-        grade, confirmation = _grade(
-            candidate, discovery[index], confirmation, config
+        grade, confirmation_metric = _grade(
+            candidate, discovery[index].metric, confirmation.metric, config
         )
+        confirmation = replace(confirmation, metric=confirmation_metric)
+        confirmation_computations.append(confirmation)
         rules.append(
-            QualityRule(candidate, discovery[index], confirmation, grade)
+            QualityRule(
+                candidate,
+                discovery[index].metric,
+                confirmation.metric,
+                grade,
+            )
         )
     rules = _annotate_display_merges(rules)
-    return [rule.to_wire() for rule in rules]
+    return tuple(
+        _QualityCoreItem(rule, discovery[index], confirmation_computations[index])
+        for index, rule in enumerate(rules)
+    )
+
+
+def build_quality_rules(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+) -> list[dict[str, object]]:
+    """Build the byte-compatible legacy quality-rule wire records."""
+    return [
+        item.rule.to_wire()
+        for item in _build_quality_rules_core(
+            split, definitions, config, criteria_id
+        )
+    ]
+
+
+def _quality_split_sidecar(
+    candidate: Candidate,
+    computation: _MetricComputation,
+    material_keys: tuple[str, ...],
+) -> QualitySplitSidecar:
+    projected_bands = {
+        field: candidate.band_boundaries[field]
+        for field in candidate.adjustment_fields
+        if field.endswith("_band")
+    }
+    candidate_material_keys = tuple(
+        sorted(
+            (material_keys[position] for position in computation.candidate_positions),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    return QualitySplitSidecar(
+        candidate.adjustment_fields,
+        projected_bands,
+        computation.informative_stratum_keys,
+        candidate.discovery_weights,
+        candidate_material_keys,
+        computation.comparator_counts_by_stratum,
+    )
+
+
+def build_quality_rules_result(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+    *,
+    material_catalog: Sequence[MaterialLineage],
+) -> QualityRulesResult:
+    """Build quality wire records plus exact fixed statistical input sidecars."""
+    catalog = _MaterialCatalogIndex(material_catalog)
+    discovery_material_keys = catalog.resolve_rows(
+        split.discovery_rows, "quality discovery"
+    )
+    confirmation_material_keys = catalog.resolve_rows(
+        split.confirmation_rows, "quality confirmation"
+    )
+    if set(discovery_material_keys) & set(confirmation_material_keys):
+        raise ValueError("quality discovery/confirmation material identity overlap")
+    items = _build_quality_rules_core(split, definitions, config, criteria_id)
+    records = tuple(item.rule.to_wire() for item in items)
+    sidecars = tuple(
+        QualityRuleSidecar(
+            item.rule.candidate.rule_id,
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.discovery,
+                discovery_material_keys,
+            ),
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.confirmation,
+                confirmation_material_keys,
+            ),
+        )
+        for item in items
+    )
+    return QualityRulesResult(records, sidecars)
 
 
 def _module_main(arguments: Sequence[str] | None = None) -> int:

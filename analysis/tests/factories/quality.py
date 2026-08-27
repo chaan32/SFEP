@@ -6,12 +6,14 @@ quality candidate, statistics, grading, or identifier production helpers.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 
-from equipment_quality.models import TimeSplitResult
+from equipment_quality.models import MaterialLineage, SourceRecordRef, TimeSplitResult
 from equipment_quality.schema import load_analysis_config
 
 
@@ -326,3 +328,53 @@ def performance_fixture(row_count: int = 4000) -> pd.DataFrame:
                 f"L{(index + category_rank) % 4}" for index in range(row_count)
             ]
     return pd.DataFrame(columns)
+
+
+def identified_split_and_catalog(
+    split: TimeSplitResult,
+) -> tuple[TimeSplitResult, tuple[MaterialLineage, ...]]:
+    """Add row identities only for rich-result tests and return a stdlib catalog."""
+
+    def identified(rows: pd.DataFrame) -> pd.DataFrame:
+        result = rows.copy(deep=True)
+        if "slab_no" not in result:
+            result["slab_no"] = "1"
+        if "hr_coil_id" not in result:
+            result["hr_coil_id"] = [
+                f"{charge_id}-COIL" for charge_id in result["charge_id"]
+            ]
+        return result
+
+    discovery = identified(split.discovery_rows)
+    confirmation = identified(split.confirmation_rows)
+    reference = pd.concat([discovery, confirmation], ignore_index=True)
+    holdout = identified(split.holdout_rows)
+    identified_split = replace(
+        split,
+        reference_rows=reference,
+        discovery_rows=discovery,
+        confirmation_rows=confirmation,
+        holdout_rows=holdout,
+    )
+    catalog: list[MaterialLineage] = []
+    seen: set[tuple[str, str]] = set()
+    for position, row in enumerate(reference.itertuples(index=False), start=2):
+        charge_id = str(row.charge_id)
+        slab_no = str(row.slab_no)
+        pair = (charge_id, slab_no)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        preimage = f"quality-fixture-v1\0{charge_id}\0{slab_no}".encode("utf-8")
+        catalog.append(
+            MaterialLineage(
+                material_key="sha256:" + hashlib.sha256(preimage).hexdigest(),
+                charge_id=charge_id,
+                slab_no=slab_no,
+                hr_coil_id=str(row.hr_coil_id),
+                source_records=(
+                    SourceRecordRef("ap", "quality-fixture.csv", position),
+                ),
+            )
+        )
+    return identified_split, tuple(catalog)

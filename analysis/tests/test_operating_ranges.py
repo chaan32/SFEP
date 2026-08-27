@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
+import hashlib
 import json
 import math
 
@@ -12,12 +14,14 @@ import pytest
 from jsonschema.validators import validator_for
 
 from equipment_quality.feature_roles import definitions
-from equipment_quality import operating_ranges
+from equipment_quality import models as equipment_models, operating_ranges
+from equipment_quality.deterministic import canonical_json_bytes
 from equipment_quality.operating_ranges import build_operating_ranges
 from equipment_quality.schema import load_analysis_config
 from factories.ranges import (
     collapsed_lower_tail_fixture,
     future_context_fixture,
+    material_catalog_for_rows,
     only,
     range_rows,
     sparse_context_fixture,
@@ -465,3 +469,210 @@ def test_range_records_validate_against_normative_contract():
             "ranges": records,
         }
     )
+
+
+def test_legacy_range_payload_is_byte_pinned_before_rich_result_refactor():
+    config = analysis_config()
+    records = build_operating_ranges(
+        split_with_reference(range_rows(values=range(1, 401))),
+        definitions(config),
+        config,
+    )
+
+    payload = canonical_json_bytes(records)
+
+    assert len(payload) == 442
+    assert hashlib.sha256(payload).hexdigest() == (
+        "f2929e5736a9d3afbc5f04b01321e39ba6f307a8f1253ebfb3636270d1f6e9e4"
+    )
+
+
+def test_rich_range_sidecar_has_exact_sorted_finite_available_contributors():
+    config = analysis_config()
+    rows = range_rows(
+        values=[*range(1, 401), math.nan, math.inf, 999.0],
+        f_ext_date=[date(2025, 1, 2)] * 402 + [date(2025, 1, 5)],
+    )
+    split = split_with_reference(rows, as_of=date(2025, 1, 4))
+    catalog = material_catalog_for_rows(rows)
+
+    result = operating_ranges.build_operating_ranges_result(
+        split,
+        definitions(config),
+        config,
+        material_catalog=catalog,
+    )
+
+    expected = tuple(
+        sorted(
+            (material.material_key for material in catalog[:400]),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    assert len(result.records) == len(result.sidecars) == 1
+    assert result.sidecars[0].rule_id == result.records[0]["ruleId"]
+    assert result.sidecars[0].contributor_material_keys == expected
+    assert result.records[0]["support"] == len(expected) == 400
+
+
+def test_rich_range_wire_is_legacy_exact_fresh_immutable_and_order_independent():
+    config = analysis_config()
+    rows = range_rows(values=range(1, 401))
+    split = split_with_reference(rows)
+    catalog = material_catalog_for_rows(rows)
+    legacy = build_operating_ranges(split, definitions(config), config)
+
+    result = operating_ranges.build_operating_ranges_result(
+        split,
+        definitions(config),
+        config,
+        material_catalog=catalog,
+    )
+    first = result.to_wire()
+    first[0]["context"]["callerMutation"] = True
+    second = result.to_wire()
+    reversed_result = operating_ranges.build_operating_ranges_result(
+        replace(
+            split,
+            reference_rows=split.reference_rows.iloc[::-1].reset_index(drop=True),
+        ),
+        tuple(reversed(definitions(config))),
+        config,
+        material_catalog=tuple(reversed(catalog)),
+    )
+
+    assert canonical_json_bytes(second) == canonical_json_bytes(legacy)
+    assert canonical_json_bytes(second) == canonical_json_bytes(reversed_result.to_wire())
+    assert result.sidecars == reversed_result.sidecars
+    assert "callerMutation" not in second[0]["context"]
+    assert type(second) is list and type(second[0]) is dict
+    with pytest.raises(TypeError):
+        result.records[0]["context"]["forbidden"] = True
+    assert "material_key" not in split.reference_rows.columns
+
+
+def test_range_result_constructor_rejects_wire_sidecar_id_mismatch():
+    config = analysis_config()
+    record = only(
+        build_operating_ranges(
+            split_with_reference(range_rows(values=range(1, 401))),
+            definitions(config),
+            config,
+        )
+    )
+    sidecar_type = equipment_models.OperatingRangeSidecar
+    result_type = equipment_models.OperatingRangesResult
+    keys = tuple("sha256:" + f"{index:064x}" for index in range(1, 401))
+    sidecar = sidecar_type("sha256:" + "f" * 64, keys)
+
+    with pytest.raises(ValueError, match="same order"):
+        result_type((record,), (sidecar,))
+
+
+def test_range_rich_builder_rejects_catalog_ambiguity_and_duplicate_rows():
+    config = analysis_config()
+    rows = range_rows(values=range(1, 401))
+    split = split_with_reference(rows)
+    catalog = material_catalog_for_rows(rows)
+
+    invalid_catalogs = [
+        catalog[1:],
+        (
+            catalog[0],
+            replace(catalog[1], material_key=catalog[0].material_key),
+            *catalog[2:],
+        ),
+        (
+            catalog[0],
+            replace(
+                catalog[1],
+                charge_id=catalog[0].charge_id,
+                slab_no=catalog[0].slab_no,
+            ),
+            *catalog[2:],
+        ),
+        (
+            catalog[0],
+            replace(catalog[1], hr_coil_id=catalog[0].hr_coil_id),
+            *catalog[2:],
+        ),
+    ]
+    for invalid in invalid_catalogs:
+        with pytest.raises(ValueError):
+            operating_ranges.build_operating_ranges_result(
+                split,
+                definitions(config),
+                config,
+                material_catalog=invalid,
+            )
+
+    disagreement = rows.copy(deep=True)
+    disagreement.loc[0, "hr_coil_id"] = rows.loc[1, "hr_coil_id"]
+    with pytest.raises(ValueError, match="disagreement"):
+        operating_ranges.build_operating_ranges_result(
+            replace(split, reference_rows=disagreement),
+            definitions(config),
+            config,
+            material_catalog=catalog,
+        )
+
+    duplicate_row = pd.concat([rows, rows.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate"):
+        operating_ranges.build_operating_ranges_result(
+            replace(split, reference_rows=duplicate_row),
+            definitions(config),
+            config,
+            material_catalog=catalog,
+        )
+
+    with pytest.raises(ValueError, match="identity columns"):
+        operating_ranges.build_operating_ranges_result(
+            replace(split, reference_rows=rows.drop(columns="slab_no")),
+            definitions(config),
+            config,
+            material_catalog=catalog,
+        )
+
+    missing_value = rows.copy(deep=True)
+    missing_value.loc[0, "slab_no"] = None
+    with pytest.raises(ValueError, match="non-empty"):
+        operating_ranges.build_operating_ranges_result(
+            replace(split, reference_rows=missing_value),
+            definitions(config),
+            config,
+            material_catalog=catalog,
+        )
+
+
+def test_range_rich_builder_accepts_unused_catalog_entry_and_calls_core_once(monkeypatch):
+    config = analysis_config()
+    rows = range_rows(values=range(1, 401))
+    split = split_with_reference(rows)
+    catalog = material_catalog_for_rows(rows)
+    unused = replace(
+        catalog[0],
+        material_key="sha256:" + "e" * 64,
+        charge_id="UNUSED",
+        slab_no="9",
+        hr_coil_id="UNUSED-COIL",
+    )
+    original = operating_ranges._build_operating_ranges_core
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(operating_ranges, "_build_operating_ranges_core", counted)
+    build_operating_ranges(split, definitions(config), config)
+    assert calls == 1
+    calls = 0
+    result = operating_ranges.build_operating_ranges_result(
+        split,
+        definitions(config),
+        config,
+        material_catalog=(*catalog, unused),
+    )
+    assert calls == 1
+    assert len(result.sidecars) == 1

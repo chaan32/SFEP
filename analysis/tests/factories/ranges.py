@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import date
+import hashlib
 
 import pandas as pd
 
-from equipment_quality.models import TimeSplitResult
+from equipment_quality.models import MaterialLineage, SourceRecordRef, TimeSplitResult
 
 
 def _literal_date(value: date | str) -> date:
@@ -121,3 +122,29 @@ def collapsed_lower_tail_fixture() -> TimeSplitResult:
 def only(items: Sequence[object]):
     assert len(items) == 1
     return items[0]
+
+
+def material_catalog_for_rows(rows: pd.DataFrame) -> tuple[MaterialLineage, ...]:
+    """Build a deterministic test-only catalog without production ID helpers."""
+    catalog: list[MaterialLineage] = []
+    seen: set[tuple[str, str]] = set()
+    for position, row in enumerate(rows.itertuples(index=False), start=2):
+        charge_id = str(row.charge_id)
+        slab_no = str(row.slab_no)
+        pair = (charge_id, slab_no)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        preimage = f"range-fixture-v1\0{charge_id}\0{slab_no}".encode("utf-8")
+        catalog.append(
+            MaterialLineage(
+                material_key="sha256:" + hashlib.sha256(preimage).hexdigest(),
+                charge_id=charge_id,
+                slab_no=slab_no,
+                hr_coil_id=str(row.hr_coil_id),
+                source_records=(
+                    SourceRecordRef("fur_hr", "range-fixture.csv", position),
+                ),
+            )
+        )
+    return tuple(catalog)

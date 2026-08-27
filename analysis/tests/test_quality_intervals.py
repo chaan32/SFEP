@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import fields, replace
 import errno
 import hashlib
 import json
@@ -25,7 +25,7 @@ from jsonschema.validators import validator_for
 
 from equipment_quality.deterministic import canonical_json_bytes
 from equipment_quality.feature_roles import definitions
-from equipment_quality import quality_intervals
+from equipment_quality import models as equipment_models, quality_intervals
 from equipment_quality.quality_intervals import build_quality_rules, generate_candidates
 from equipment_quality.statistics import BootstrapCi
 from factories.quality import (
@@ -39,6 +39,7 @@ from factories.quality import (
     grade_boundary_fixture,
     global_family_fixture,
     global_family_split,
+    identified_split_and_catalog,
     null_fixture,
     performance_fixture,
     q_values_by_rule_id,
@@ -2113,3 +2114,511 @@ def test_parallel_bootstrap_handles_zero_one_and_multiple_tasks():
         (0, _bootstrap_rule_id("1")),
         (1, _bootstrap_rule_id("2")),
     ]
+
+
+def _risk_record_and_sidecar(result):
+    for record, sidecar in zip(result.records, result.sidecars, strict=True):
+        if (
+            record["fieldNames"] == ("slab_grind",)
+            and record["predicate"]["allOf"][0]["values"] == ("RISK",)
+        ):
+            return record, sidecar
+    raise AssertionError("missing RISK slab_grind rule")
+
+
+def test_legacy_quality_payload_is_byte_pinned_before_rich_result_refactor():
+    config = analysis_config()
+    records = build_quality_rules(
+        strong_repeated_fixture(), definitions(config), config, CRITERIA_ID
+    )
+    payload = canonical_json_bytes(records)
+
+    assert len(payload) == 9_590
+    assert hashlib.sha256(payload).hexdigest() == (
+        "6f6463806267a357c215847db192e340e94bf08be0a1d54113e08c3f14f315e5"
+    )
+
+
+def test_rich_quality_sidecars_capture_exact_fixed_discovery_and_confirmation_inputs():
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    record, sidecar = _risk_record_and_sidecar(result)
+    key_by_charge = {material.charge_id: material.material_key for material in catalog}
+    discovery_expected = tuple(
+        sorted(
+            (
+                key_by_charge[charge_id]
+                for charge_id in split.discovery_rows.loc[
+                    split.discovery_rows["slab_grind"] == "RISK", "charge_id"
+                ]
+            ),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    confirmation_expected = tuple(
+        sorted(
+            (
+                key_by_charge[charge_id]
+                for charge_id in split.confirmation_rows.loc[
+                    split.confirmation_rows["slab_grind"] == "RISK", "charge_id"
+                ]
+            ),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    strata = (
+        '{"sm_plant":"P1","steel_grade":"G1","steel_usage":"U"}',
+        '{"sm_plant":"P2","steel_grade":"G2","steel_usage":"U"}',
+    )
+
+    assert sidecar.rule_id == record["ruleId"]
+    assert sidecar.discovery.adjustment_fields == (
+        "sm_plant",
+        "steel_grade",
+        "steel_usage",
+    )
+    assert dict(sidecar.discovery.discovery_band_boundaries) == {}
+    assert sidecar.discovery.informative_stratum_keys == strata
+    assert dict(sidecar.discovery.discovery_weights) == {
+        strata[0]: 0.5,
+        strata[1]: 0.5,
+    }
+    assert sidecar.discovery.candidate_material_keys == discovery_expected
+    assert dict(sidecar.discovery.comparator_counts_by_stratum) == {
+        strata[0]: 100,
+        strata[1]: 100,
+    }
+    assert sidecar.confirmation.adjustment_fields == sidecar.discovery.adjustment_fields
+    assert sidecar.confirmation.discovery_band_boundaries == sidecar.discovery.discovery_band_boundaries
+    assert sidecar.confirmation.discovery_weights == sidecar.discovery.discovery_weights
+    assert sidecar.confirmation.informative_stratum_keys == strata
+    assert sidecar.confirmation.candidate_material_keys == confirmation_expected
+    assert dict(sidecar.confirmation.comparator_counts_by_stratum) == {
+        strata[0]: 50,
+        strata[1]: 50,
+    }
+    assert record["discovery"]["support"] == len(discovery_expected) == 200
+    assert record["confirmation"]["support"] == len(confirmation_expected) == 100
+
+
+def test_confirmation_only_new_strata_are_excluded_from_fixed_sidecar_inputs():
+    config = analysis_config()
+    base = strong_repeated_fixture()
+    extra = pd.DataFrame(
+        [
+            {
+                "charge_id": f"NEW-{level}-{index:03d}",
+                "sm_plant": "P3",
+                "steel_grade": "G3",
+                "steel_usage": "U",
+                "slab_grind": level,
+                "judge": "불량" if index < 5 else "양품",
+            }
+            for level in ("RISK", "BASE")
+            for index in range(50)
+        ]
+    )
+    expanded = replace(
+        base,
+        confirmation_rows=pd.concat(
+            [base.confirmation_rows, extra], ignore_index=True
+        ),
+    )
+    split, catalog = identified_split_and_catalog(expanded)
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    _, sidecar = _risk_record_and_sidecar(result)
+
+    assert all('"P3"' not in key for key in sidecar.confirmation.informative_stratum_keys)
+    assert all(
+        not material.charge_id.startswith("NEW-")
+        for material in catalog
+        if material.material_key in sidecar.confirmation.candidate_material_keys
+    )
+    assert sidecar.confirmation.adjustment_fields == sidecar.discovery.adjustment_fields
+    assert sidecar.confirmation.discovery_band_boundaries == sidecar.discovery.discovery_band_boundaries
+    assert sidecar.confirmation.discovery_weights == sidecar.discovery.discovery_weights
+
+
+def test_no_informative_quality_rule_has_no_candidate_membership_despite_raw_matches():
+    config = analysis_config()
+    discovery = pd.DataFrame(
+        {
+            "charge_id": [f"NI-D-{index:03d}" for index in range(200)],
+            "slab_grind": ["RISK"] * 200,
+            "judge": ["양품"] * 200,
+        }
+    )
+    confirmation = pd.DataFrame(
+        {
+            "charge_id": [f"NI-C-{index:03d}" for index in range(100)],
+            "slab_grind": ["RISK"] * 100,
+            "judge": ["양품"] * 100,
+        }
+    )
+    split, catalog = identified_split_and_catalog(
+        split_from_rows(discovery, confirmation)
+    )
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    record, sidecar = _risk_record_and_sidecar(result)
+
+    assert record["discovery"]["support"] == 0
+    assert record["confirmation"]["support"] == 0
+    assert sidecar.discovery.candidate_material_keys == ()
+    assert sidecar.confirmation.candidate_material_keys == ()
+    assert sidecar.discovery.informative_stratum_keys == ()
+    assert sidecar.confirmation.informative_stratum_keys == ()
+
+
+def test_rich_quality_wire_is_legacy_exact_fresh_immutable_and_order_independent():
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    legacy = build_quality_rules(split, definitions(config), config, CRITERIA_ID)
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    first = result.to_wire()
+    first[0]["predicate"]["allOf"][0]["values"].append("CALLER")
+    second = result.to_wire()
+    reversed_result = quality_intervals.build_quality_rules_result(
+        replace(
+            split,
+            discovery_rows=split.discovery_rows.iloc[::-1].reset_index(drop=True),
+            confirmation_rows=split.confirmation_rows.iloc[::-1].reset_index(drop=True),
+        ),
+        tuple(reversed(definitions(config))),
+        config,
+        CRITERIA_ID,
+        material_catalog=tuple(reversed(catalog)),
+    )
+
+    assert canonical_json_bytes(second) == canonical_json_bytes(legacy)
+    assert canonical_json_bytes(second) == canonical_json_bytes(reversed_result.to_wire())
+    assert result.sidecars == reversed_result.sidecars
+    assert type(second) is list and type(second[0]) is dict
+    assert "CALLER" not in second[0]["predicate"]["allOf"][0]["values"]
+    with pytest.raises(TypeError):
+        result.records[0]["discovery"]["support"] = 0
+    assert "material_key" not in split.discovery_rows.columns
+    assert "material_key" not in split.confirmation_rows.columns
+
+
+def _valid_split_sidecar(*, confirmation: bool = False):
+    model = equipment_models.QualitySplitSidecar
+    informative = ("A",) if confirmation else ("A", "B")
+    candidates = (
+        ("sha256:" + "3" * 64,)
+        if confirmation
+        else ("sha256:" + "1" * 64, "sha256:" + "2" * 64)
+    )
+    return model(
+        ("steel_grade", "slab_width_band"),
+        {"slab_width_band": (1.0, 2.0, 3.0)},
+        informative,
+        {"A": 0.4, "B": 0.6},
+        candidates,
+        {key: 5 for key in informative},
+    )
+
+
+def test_quality_sidecar_models_reject_every_statistical_shape_violation():
+    model = equipment_models.QualitySplitSidecar
+    key = "sha256:" + "1" * 64
+
+    class DuplicateWeightItems(dict):
+        def items(self):
+            return [("A", 0.5), ("A", 0.5)]
+
+    invalid_arguments = [
+        (("steel_grade", "steel_grade"), {}, ("A",), {"A": 1.0}, (key,), {"A": 1}),
+        (("steel_grade",), {"slab_width_band": (1.0, 2.0, 3.0)}, ("A",), {"A": 1.0}, (key,), {"A": 1}),
+        (("slab_width_band",), {"slab_width_band": (1.0, math.nan, 3.0)}, ("A",), {"A": 1.0}, (key,), {"A": 1}),
+        (("slab_width_band",), {"slab_width_band": (2.0, 1.0, 3.0)}, ("A",), {"A": 1.0}, (key,), {"A": 1}),
+        ((), {}, ("A", "A"), {"A": 1.0}, (key,), {"A": 1}),
+        ((), {}, ("B", "A"), {"A": 0.5, "B": 0.5}, (key,), {"A": 1, "B": 1}),
+        ((), {}, ("A",), {"A": 1.0}, (key,), {"A": 0}),
+        ((), {}, ("A",), {"A": 1.0}, (key,), {"A": True}),
+        ((), {}, ("A",), {"A": math.inf}, (key,), {"A": 1}),
+        ((), {}, ("A",), {"A": 0.0}, (key,), {"A": 1}),
+        ((), {}, ("A", "B"), {"A": 0.4, "B": 0.5}, (key,), {"A": 1, "B": 1}),
+        ((), {}, ("A",), DuplicateWeightItems(), (key,), {"A": 1}),
+        ((), {}, ("A",), {"A": 1.0}, (key, key), {"A": 1}),
+    ]
+    for arguments in invalid_arguments:
+        with pytest.raises((TypeError, ValueError)):
+            model(*arguments)
+
+
+def test_quality_rule_sidecar_rejects_discovery_confirmation_drift():
+    rule_model = equipment_models.QualityRuleSidecar
+    discovery = _valid_split_sidecar()
+    confirmation = _valid_split_sidecar(confirmation=True)
+    rule_id = "sha256:" + "a" * 64
+    rule_model(rule_id, discovery, confirmation)
+
+    invalid_confirmations = [
+        replace(
+            confirmation,
+            adjustment_fields=("steel_grade",),
+            discovery_band_boundaries={},
+        ),
+        replace(
+            confirmation,
+            discovery_band_boundaries={"slab_width_band": (1.0, 2.0, 4.0)},
+        ),
+        replace(confirmation, discovery_weights={"A": 0.5, "B": 0.5}),
+        replace(
+            confirmation,
+            informative_stratum_keys=("C",),
+            comparator_counts_by_stratum={"C": 1},
+        ),
+    ]
+    for invalid in invalid_confirmations:
+        with pytest.raises(ValueError):
+            rule_model(rule_id, discovery, invalid)
+    mismatched_discovery = replace(
+        discovery,
+        informative_stratum_keys=("A",),
+        comparator_counts_by_stratum={"A": 1},
+    )
+    with pytest.raises(ValueError, match="weight"):
+        rule_model(rule_id, mismatched_discovery, confirmation)
+
+
+def test_quality_result_rejects_misaligned_rule_id_and_support_cardinality():
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    result_type = equipment_models.QualityRulesResult
+    first = result.sidecars[0]
+
+    with pytest.raises(ValueError, match="same order"):
+        result_type(
+            result.records,
+            (replace(first, rule_id="sha256:" + "f" * 64), *result.sidecars[1:]),
+        )
+    with pytest.raises(ValueError, match="support"):
+        result_type(
+            result.records,
+            (
+                replace(
+                    first,
+                    discovery=replace(
+                        first.discovery,
+                        candidate_material_keys=(
+                            *first.discovery.candidate_material_keys,
+                            "sha256:" + "f" * 64,
+                        ),
+                    ),
+                ),
+                *result.sidecars[1:],
+            ),
+        )
+
+
+def test_quality_result_models_reject_malformed_and_duplicate_rule_ids():
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    result = quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+    result_type = equipment_models.QualityRulesResult
+
+    with pytest.raises(ValueError, match="sha256"):
+        equipment_models.QualityRuleSidecar(
+            "invalid", result.sidecars[0].discovery, result.sidecars[0].confirmation
+        )
+    malformed_record = result.to_wire()[0]
+    malformed_record["ruleId"] = "invalid"
+    with pytest.raises(ValueError, match="sha256"):
+        result_type((malformed_record,), (result.sidecars[0],))
+    with pytest.raises(ValueError, match="unique"):
+        result_type(
+            (result.records[0], result.records[0]),
+            (result.sidecars[0], result.sidecars[0]),
+        )
+
+
+def test_material_lineage_snapshots_records_and_rejects_malformed_identities():
+    record = equipment_models.SourceRecordRef("ap", "fixture.csv", 2)
+    external = [record]
+    lineage = equipment_models.MaterialLineage(
+        "sha256:" + "1" * 64,
+        "C1",
+        "1",
+        "H1",
+        external,
+    )
+    external.append(equipment_models.SourceRecordRef("ap", "fixture.csv", 3))
+    assert lineage.source_records == (record,)
+
+    invalid = [
+        ("not-a-sha", "C1", "1", "H1"),
+        ("sha256:" + "1" * 64, "", "1", "H1"),
+        ("sha256:" + "1" * 64, "C1", "", "H1"),
+        ("sha256:" + "1" * 64, "C1", "1", ""),
+    ]
+    for material_key, charge_id, slab_no, hr_coil_id in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            equipment_models.MaterialLineage(
+                material_key,
+                charge_id,
+                slab_no,
+                hr_coil_id,
+                (record,),
+            )
+
+
+def test_quality_rich_builder_rejects_catalog_disagreement_duplicates_and_overlap():
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+
+    disagreement = split.discovery_rows.copy(deep=True)
+    disagreement.loc[0, "hr_coil_id"] = split.discovery_rows.loc[1, "hr_coil_id"]
+    with pytest.raises(ValueError, match="disagreement"):
+        quality_intervals.build_quality_rules_result(
+            replace(split, discovery_rows=disagreement),
+            definitions(config),
+            config,
+            CRITERIA_ID,
+            material_catalog=catalog,
+        )
+
+    duplicate = pd.concat(
+        [split.discovery_rows, split.discovery_rows.iloc[[0]]], ignore_index=True
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        quality_intervals.build_quality_rules_result(
+            replace(split, discovery_rows=duplicate),
+            definitions(config),
+            config,
+            CRITERIA_ID,
+            material_catalog=catalog,
+        )
+
+    overlap = split.confirmation_rows.copy(deep=True)
+    for column in ("charge_id", "slab_no", "hr_coil_id"):
+        overlap.loc[0, column] = split.discovery_rows.loc[0, column]
+    with pytest.raises(ValueError, match="overlap"):
+        quality_intervals.build_quality_rules_result(
+            replace(split, confirmation_rows=overlap),
+            definitions(config),
+            config,
+            CRITERIA_ID,
+            material_catalog=catalog,
+        )
+
+    with pytest.raises(ValueError, match="identity columns"):
+        quality_intervals.build_quality_rules_result(
+            replace(split, discovery_rows=split.discovery_rows.drop(columns="slab_no")),
+            definitions(config),
+            config,
+            CRITERIA_ID,
+            material_catalog=catalog,
+        )
+
+
+def test_transient_metric_computation_rejects_candidate_comparator_overlap():
+    computation_type = quality_intervals._MetricComputation
+
+    with pytest.raises(ValueError, match="overlap"):
+        computation_type(
+            _literal_metric(),
+            ("A",),
+            (0,),
+            (0,),
+            {0: "A"},
+            {"A": 1},
+        )
+
+
+def test_public_quality_sidecar_retains_no_comparator_material_identity_field():
+    names = {field.name for field in fields(equipment_models.QualitySplitSidecar)}
+
+    assert names == {
+        "adjustment_fields",
+        "discovery_band_boundaries",
+        "informative_stratum_keys",
+        "discovery_weights",
+        "candidate_material_keys",
+        "comparator_counts_by_stratum",
+    }
+    assert not any("comparator_material" in name for name in names)
+
+
+def test_quality_legacy_and_rich_calls_use_core_once_and_worker_payload_stays_minimal(monkeypatch):
+    config = analysis_config()
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    original_core = quality_intervals._build_quality_rules_core
+    original_task = quality_intervals._bootstrap_task
+    core_calls = 0
+    observed_tasks = []
+
+    def counted_core(*args, **kwargs):
+        nonlocal core_calls
+        core_calls += 1
+        return original_core(*args, **kwargs)
+
+    def observed_task(task):
+        observed_tasks.append(task)
+        return original_task(task)
+
+    monkeypatch.setattr(quality_intervals, "_build_quality_rules_core", counted_core)
+    monkeypatch.setattr(quality_intervals, "_bootstrap_task", observed_task)
+    build_quality_rules(split, definitions(config), config, CRITERIA_ID)
+    assert core_calls == 1
+    core_calls = 0
+    quality_intervals.build_quality_rules_result(
+        split,
+        definitions(config),
+        config,
+        CRITERIA_ID,
+        material_catalog=catalog,
+    )
+
+    assert core_calls == 1
+    assert observed_tasks
+    for _, worker_rows, worker_criteria_id, worker_rule_id, replicates in observed_tasks:
+        assert tuple(worker_rows.columns) == (
+            "charge_id",
+            "stratum",
+            "candidate",
+            "judge",
+        )
+        assert "material_key" not in worker_rows.columns
+        assert all(type(value) in {str, bool} for value in worker_rows.to_numpy().ravel())
+        assert type(worker_criteria_id) is str
+        assert type(worker_rule_id) is str
+        assert type(replicates) is int
