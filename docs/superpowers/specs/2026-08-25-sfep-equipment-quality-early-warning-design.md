@@ -295,6 +295,10 @@ installed-code-tree digest는 wheel의 RECORD 대상 중 실제 `purelib`·`plat
 
 분석기 시작 시에는 별도 source root나 wheel archive를 요구하지 않는다. 대신 runtime manifest schema와 bytes, OS/architecture, CPython build, realpath 대상 interpreter bytes, 환경정책, 설치 distribution version·installed-code-tree를 다시 계산하고, 설치 package의 `sfep_producer_provenance.json`을 runtime manifest의 source/build provenance와 exact-match한다. wheel archive SHA는 build/seal attestation으로 보존하되 실행 시 복원할 수 있다고 주장하지 않는다. dependency와 producer 모두 검증된 wheelhouse에서 wheel로만 설치하며 `pip install ./analysis`는 금지한다. 서로 다른 두 절대경로의 새 venv에 같은 wheelhouse를 설치했을 때 runtime 검증결과와 생성 Bundle bytes가 같아야 한다. runtime manifest와 embedded provenance에는 절대경로, 설치시각과 venv 이름을 넣지 않는다. producer 코드·Python build·OS·wheel 또는 설치 bytes가 바뀌면 기존 runtime manifest 검증 또는 build/seal이 실패하고, 검토된 새 runtime file의 SHA-256이 두 ID를 바꾼다.
 
+런타임 검증 계약은 다음처럼 폐쇄한다. `producer_runtime.json`의 wheel filename/tag/archive SHA는 build/seal이 이미 확인한 증명값이며, 시작 검증기는 이 값을 schema-valid canonical manifest bytes의 일부로 보존하되 현재 파일시스템에서 wheel archive를 재구성하거나 재검증했다고 주장하지 않는다. 설치 시점에 포함되는 `equipment_quality/sfep_producer_provenance.json`은 canonical JSON이며 정확히 `schemaVersion=sfep-producer-provenance/v1`, `producerName=equipment-quality`, `distributionName=sfep-equipment-quality`, `version`, `sourceSha256`, `sourceDateEpoch="1735689600"`, `requirementsLockSha256` 일곱 필드만 가진다. 이 중 version/source digest는 Manifest producer와, requirements lock digest는 `locks.requirements`와 exact-match한다. 나머지 lock 증명값은 seal 도구가 검증한다.
+
+논리 producer `equipment-quality`는 설치 distribution `sfep-equipment-quality`에만 대응한다. `packages[]`의 허용 inventory는 UTF-8 순서의 `attrs,jsonschema,jsonschema-specifications,numpy,pandas,python-dateutil,pytz,referencing,rpds-py,six,typing-extensions,tzdata` 정확히 12개이며, direct=true는 `jsonschema,numpy,pandas` 세 개뿐이다. producer distribution은 `packages[]`와 분리한다. 새 runtime venv에서 bootstrap 도구로 허용하면서 package inventory에서 제외하는 distribution은 manifest의 `pipVersion`으로 별도 검증하는 `pip` 하나뿐이다. setuptools, wheel, build, pytest 및 그 밖의 미신고 distribution은 production runtime에서 거부한다. 이름 비교는 PEP 503 정규형을 사용하고 중복·누락·추가 이름을 모두 거부한다.
+
 재현 명령은 다음 순서로 고정한다.
 
 ```text
