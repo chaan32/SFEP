@@ -423,6 +423,38 @@ def _zip_with_false_end_signature_in_compressed_data() -> bytes:
     return payload
 
 
+def _zip_with_declared_unused_deflate_byte() -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(
+        output,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr(_new_zip_info("x"), b"authenticated payload")
+    payload = bytearray(output.getvalue())
+    original_end_offset = len(payload) - 22
+    original_central_offset = struct.unpack_from(
+        "<I", payload, original_end_offset + 16
+    )[0]
+    filename_size = struct.unpack_from("<H", payload, 26)[0]
+    extra_size = struct.unpack_from("<H", payload, 28)[0]
+    compressed_size = struct.unpack_from("<I", payload, 18)[0]
+    data_end = 30 + filename_size + extra_size + compressed_size
+    assert data_end == original_central_offset
+
+    payload[data_end:data_end] = b"\x00"
+    shifted_central_offset = original_central_offset + 1
+    shifted_end_offset = original_end_offset + 1
+    struct.pack_into("<I", payload, 18, compressed_size + 1)
+    struct.pack_into(
+        "<I", payload, shifted_central_offset + 20, compressed_size + 1
+    )
+    struct.pack_into(
+        "<I", payload, shifted_end_offset + 16, shifted_central_offset
+    )
+    return bytes(payload)
+
+
 @pytest.fixture(scope="module")
 def build_python(tmp_path_factory: pytest.TempPathFactory) -> Path:
     environment_root = tmp_path_factory.mktemp("producer-build-python") / "venv"
@@ -536,6 +568,15 @@ def test_raw_zip_layout_uses_the_exact_tail_end_record() -> None:
     assert records[0]["filename"] == b"x"
 
 
+def test_raw_zip_layout_rejects_declared_bytes_after_a_deflate_stream() -> None:
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    error_type = namespace["ProducerSealError"]
+    payload = _zip_with_declared_unused_deflate_byte()
+
+    with pytest.raises(error_type, match="DEFLATE|compressed|stream"):
+        namespace["_raw_zip_layout"](payload)
+
+
 def test_build_stages_one_snapshot_twice_without_mutating_source(
     tmp_path: Path,
     build_python: Path,
@@ -586,6 +627,73 @@ def test_build_stages_one_snapshot_twice_without_mutating_source(
             assert stat.S_IFMT(mode) in {0, stat.S_IFREG}
             expected_mode = 0o664 if info.filename.endswith(".dist-info/RECORD") else 0o644
             assert stat.S_IMODE(mode) == expected_mode
+
+
+def test_build_controls_umask_before_creating_and_rolls_back_work_directories(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    created_parent = tmp_path / "created-parent"
+    work_root = created_parent / "created-work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    observed_modes: list[int] = []
+
+    def failing_snapshot(_source_root: Path) -> dict[str, bytes]:
+        observed_modes.extend(
+            stat.S_IMODE(os.lstat(path).st_mode)
+            for path in (created_parent, work_root)
+        )
+        raise error_type("injected failure after work-root creation")
+
+    module_globals["_source_snapshot"] = failing_snapshot
+    previous_umask = os.umask(0o777)
+    try:
+        with pytest.raises(error_type, match="injected failure"):
+            module_globals["_run"](source, build_python, work_root)
+    finally:
+        os.umask(previous_umask)
+
+    assert observed_modes == [0o755, 0o755]
+    assert not created_parent.exists()
+
+
+def test_build_rolls_back_a_directory_when_reopening_it_fails(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    created_parent = tmp_path / "created-parent"
+    work_root = created_parent / "created-work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    real_open = os.open
+    attempts = 0
+
+    def failing_reopen(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal attempts
+        if path == "created-parent":
+            attempts += 1
+            if attempts == 2:
+                raise PermissionError("injected reopen failure")
+        return real_open(path, flags, *arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], "open", failing_reopen)
+
+    with pytest.raises((error_type, PermissionError), match="reopen|opened safely"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert attempts == 2
+    assert not created_parent.exists()
 
 
 def test_build_uses_safe_interpreter_cwd_and_allowlisted_environment(

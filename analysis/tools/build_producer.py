@@ -41,6 +41,7 @@ _LOCK_LINE = re.compile(
 _Fingerprint = tuple[int, int, int, int, int, int]
 _DirectoryInventory = tuple[_Fingerprint, dict[str, _Fingerprint]]
 _DirectoryPin = tuple[Path, Path, tuple[int, int]]
+_CreatedDirectory = tuple[int, str, tuple[int, int]]
 _SourceAttestation = tuple[
     tuple[int, int, int],
     dict[str, _Fingerprint],
@@ -148,7 +149,12 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 def _prepare_work_root(
     path: Path,
     source_root: Path,
-) -> tuple[int, _DirectoryPin, _DirectoryInventory]:
+) -> tuple[
+    int,
+    _DirectoryPin,
+    _DirectoryInventory,
+    list[_CreatedDirectory],
+]:
     source_physical = Path(os.path.realpath(source_root))
     work_physical = Path(os.path.realpath(path))
     if _paths_overlap(source_physical, work_physical):
@@ -166,9 +172,11 @@ def _prepare_work_root(
         descriptor = os.open(path.anchor, flags)
     except OSError as error:
         raise ProducerBuildError("work root anchor cannot be opened safely") from error
+    created: list[_CreatedDirectory] = []
     try:
         parts = path.parts[1:]
         for part in parts:
+            created_here = False
             try:
                 next_descriptor = os.open(
                     part,
@@ -178,13 +186,32 @@ def _prepare_work_root(
             except FileNotFoundError:
                 try:
                     os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                    created_here = True
                 except FileExistsError:
                     pass
-                next_descriptor = os.open(
-                    part,
-                    flags,
-                    dir_fd=descriptor,
-                )
+                if created_here:
+                    created_result = os.stat(
+                        part,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(created_result.st_mode):
+                        raise ProducerBuildError(
+                            "created work root component is not a directory"
+                        )
+                    created.append(
+                        (os.dup(descriptor), part, _identity(created_result))
+                    )
+                try:
+                    next_descriptor = os.open(
+                        part,
+                        flags,
+                        dir_fd=descriptor,
+                    )
+                except OSError as error:
+                    raise ProducerBuildError(
+                        "work root cannot be opened safely as a non-symlink directory"
+                    ) from error
             except OSError as error:
                 raise ProducerBuildError(
                     "work root cannot be opened safely as a non-symlink directory"
@@ -193,6 +220,9 @@ def _prepare_work_root(
             if not stat.S_ISDIR(opened.st_mode):
                 os.close(next_descriptor)
                 raise ProducerBuildError("work root path contains a non-directory")
+            if created_here and _identity(opened) != created[-1][2]:
+                os.close(next_descriptor)
+                raise ProducerBuildError("created work root component changed identity")
             component_identity = _identity(opened)
             if component_identity == source_identity:
                 os.close(next_descriptor)
@@ -217,10 +247,42 @@ def _prepare_work_root(
         ):
             raise ProducerBuildError("work root changed while being pinned")
         pin = path, Path(os.path.realpath(path)), work_identity
-        return descriptor, pin, inventory
+        return descriptor, pin, inventory, created
     except Exception:
         os.close(descriptor)
+        _rollback_created_directories(created)
         raise
+
+
+def _close_created_directory_parents(
+    created: list[_CreatedDirectory],
+) -> None:
+    for parent_descriptor, _name, _identity_value in created:
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
+
+
+def _rollback_created_directories(
+    created: list[_CreatedDirectory],
+) -> None:
+    for parent_descriptor, name, expected_identity in reversed(created):
+        try:
+            current = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISDIR(current.st_mode)
+                and _identity(current) == expected_identity
+            ):
+                os.rmdir(name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+        except OSError:
+            pass
+    _close_created_directory_parents(created)
 
 
 def _recheck_work_root_identity(
@@ -946,13 +1008,17 @@ def _publish_pair(
 
 
 def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, str, int]:
-    source_identity = _identity(_require_directory(source_root, "source root"))
-    _require_build_python(build_python)
-    work_descriptor, work_pin, empty_inventory = _prepare_work_root(
-        work_root,
-        source_root,
-    )
+    previous_umask = os.umask(0o022)
+    work_descriptor: int | None = None
+    created: list[_CreatedDirectory] = []
+    succeeded = False
     try:
+        source_identity = _identity(_require_directory(source_root, "source root"))
+        _require_build_python(build_python)
+        work_descriptor, work_pin, empty_inventory, created = _prepare_work_root(
+            work_root,
+            source_root,
+        )
         source_attestation = _source_attestation(source_root)
         snapshot = _source_snapshot(source_root)
         _recheck_source_attestation(source_root, source_attestation)
@@ -994,9 +1060,17 @@ def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, s
             source_root,
             source_attestation,
         )
-        return _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
+        result = _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
+        succeeded = True
+        return result
     finally:
-        os.close(work_descriptor)
+        if work_descriptor is not None:
+            os.close(work_descriptor)
+        if succeeded:
+            _close_created_directory_parents(created)
+        else:
+            _rollback_created_directories(created)
+        os.umask(previous_umask)
 
 
 def main(argv: list[str] | None = None) -> int:

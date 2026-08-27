@@ -22,6 +22,7 @@ import sys
 import tempfile
 import tomllib
 import zipfile
+import zlib
 
 
 _SOURCE_DATE_EPOCH = "1735689600"
@@ -1000,7 +1001,7 @@ def _raw_zip_layout(payload: bytes) -> list[dict[str, int | bytes]]:
             raise ProducerSealError(
                 "producer ZIP encryption, data descriptors, and flags are forbidden"
             )
-        if method != zipfile.ZIP_DEFLATED:
+        if method not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
             raise ProducerSealError("producer ZIP central compression method is invalid")
         if dos_time != _DOS_EPOCH_TIME or dos_date != _DOS_EPOCH_DATE:
             raise ProducerSealError("producer ZIP member timestamp is invalid")
@@ -1096,6 +1097,29 @@ def _raw_zip_layout(payload: bytes) -> list[dict[str, int | bytes]]:
         )
         if compared != expected:
             raise ProducerSealError("producer ZIP local header does not match central entry")
+        compressed = payload[data_start:data_end]
+        if method == zipfile.ZIP_STORED:
+            member = compressed
+        elif method == zipfile.ZIP_DEFLATED:
+            decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+            try:
+                member = decoder.decompress(compressed) + decoder.flush()
+            except zlib.error as error:
+                raise ProducerSealError(
+                    "producer ZIP DEFLATE stream is malformed"
+                ) from error
+            if not decoder.eof:
+                raise ProducerSealError("producer ZIP DEFLATE stream is incomplete")
+            if decoder.unused_data or decoder.unconsumed_tail:
+                raise ProducerSealError(
+                    "producer ZIP DEFLATE stream has unconsumed compressed bytes"
+                )
+        else:  # pragma: no cover - the central-directory gate is fail-closed.
+            raise ProducerSealError("producer ZIP compression method is unsupported")
+        if len(member) != uncompressed_size:
+            raise ProducerSealError("producer ZIP raw member size is invalid")
+        if zlib.crc32(member) & 0xFFFFFFFF != crc:
+            raise ProducerSealError("producer ZIP raw member CRC is invalid")
         expected_local_offset = data_end
     if expected_local_offset != central_offset:
         raise ProducerSealError("producer ZIP local data has unclaimed bytes")
