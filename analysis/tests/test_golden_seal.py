@@ -664,6 +664,20 @@ def _caller_surface(root: Path) -> dict[str, tuple[object, ...]]:
     return captured
 
 
+def _injected_base_exception(kind: str, label: str) -> BaseException:
+    if kind == "keyboard-interrupt":
+        return KeyboardInterrupt(label)
+    if kind == "system-exit":
+        return SystemExit(label)
+    raise AssertionError(f"unsupported BaseException kind: {kind}")
+
+
+def _current_umask() -> int:
+    current = os.umask(0o777)
+    os.umask(current)
+    return current
+
+
 @pytest.mark.parametrize(
     "case",
     (
@@ -1018,6 +1032,756 @@ def test_build_cleanup_never_unlinks_a_replacement_installed_after_identity_chec
     assert target.read_bytes() == b"external replacement"
     assert detached_owned.read_bytes() == b""
     assert list((work_root / "wheel-b").iterdir()) == []
+
+
+@pytest.mark.parametrize("exception_kind", ("keyboard-interrupt", "system-exit"))
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "after-open-a",
+        "after-open-b",
+        "during-write",
+        "after-write",
+        "between-final-checks",
+    ),
+)
+def test_build_publication_base_exception_invalidates_scratch_and_reraises_original(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_kind: str,
+    phase: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    original = _injected_base_exception(exception_kind, phase)
+    real_open = os.open
+    real_fstat = os.fstat
+    real_write = os.write
+    real_fsync = os.fsync
+    work_descriptor: int | None = None
+    output_descriptors: list[int] = []
+    injected = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal work_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            work_descriptor = descriptor
+        elif path == PRODUCER_FILENAME:
+            output_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupting_fstat(descriptor: int) -> os.stat_result:
+        nonlocal injected
+        target_index = 0 if phase == "after-open-a" else 1
+        if (
+            phase in {"after-open-a", "after-open-b"}
+            and len(output_descriptors) > target_index
+            and descriptor == output_descriptors[target_index]
+            and not injected
+        ):
+            injected = True
+            raise original
+        return real_fstat(descriptor)
+
+    def interrupting_write(descriptor: int, payload: object) -> int:
+        nonlocal injected
+        if (
+            phase == "during-write"
+            and output_descriptors
+            and descriptor == output_descriptors[0]
+            and not injected
+        ):
+            injected = True
+            view = memoryview(payload)  # type: ignore[arg-type]
+            real_write(descriptor, view[:17])
+            raise original
+        return real_write(descriptor, payload)  # type: ignore[arg-type]
+
+    def interrupting_fsync(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            phase == "after-write"
+            and output_descriptors
+            and descriptor == output_descriptors[0]
+            and not injected
+        ):
+            injected = True
+            raise original
+        if (
+            phase == "between-final-checks"
+            and work_descriptor is not None
+            and descriptor == work_descriptor
+            and len(output_descriptors) == 2
+            and not injected
+        ):
+            injected = True
+            raise original
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "fstat", interrupting_fstat)
+    monkeypatch.setattr(module_globals["os"], "write", interrupting_write)
+    monkeypatch.setattr(module_globals["os"], "fsync", interrupting_fsync)
+
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(type(original)) as caught:
+            module_globals["_run"](source, build_python, work_root)
+        assert caught.value is original
+        assert _current_umask() == 0o077
+    finally:
+        os.umask(previous_umask)
+
+    assert injected
+    assert output_descriptors
+    for descriptor in output_descriptors:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+    expected_directories = (
+        ("wheel-a",)
+        if phase in {"after-open-a", "during-write", "after-write"}
+        else ("wheel-a", "wheel-b")
+    )
+    for directory in expected_directories:
+        assert (work_root / directory / PRODUCER_FILENAME).read_bytes() == b""
+    if "wheel-b" not in expected_directories:
+        assert list((work_root / "wheel-b").iterdir()) == []
+
+
+@pytest.mark.parametrize("exception_kind", ("keyboard-interrupt", "system-exit"))
+def test_build_post_commit_close_interrupt_preserves_success_and_external_fd(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_kind: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    original = _injected_base_exception(exception_kind, "partial commit close")
+    real_open = os.open
+    real_fstat = os.fstat
+    real_close = os.close
+    real_dup = os.dup
+    output_descriptors: list[int] = []
+    duplicate_descriptors: list[int] = []
+    external_path = tmp_path / "external"
+    external_path.write_bytes(b"must survive")
+    external_descriptor: int | None = None
+    first_closed = False
+    injected = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == PRODUCER_FILENAME:
+            output_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        if descriptor in output_descriptors:
+            duplicate_descriptors.append(duplicate)
+        return duplicate
+
+    def interrupting_close(descriptor: int) -> None:
+        nonlocal external_descriptor, first_closed, injected
+        if len(output_descriptors) == 2 and descriptor == output_descriptors[0]:
+            real_close(descriptor)
+            external_descriptor = real_open(external_path, os.O_RDWR)
+            assert external_descriptor == descriptor
+            first_closed = True
+            return
+        if (
+            len(output_descriptors) == 2
+            and descriptor == output_descriptors[1]
+            and first_closed
+            and not injected
+        ):
+            injected = True
+            raise original
+        real_close(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "dup", recording_dup)
+    monkeypatch.setattr(module_globals["os"], "close", interrupting_close)
+
+    try:
+        result = module_globals["_run"](source, build_python, work_root)
+        assert result[2] == len(b"identical test wheel")
+        assert injected
+        assert external_descriptor is not None
+        assert real_fstat(external_descriptor).st_size == len(b"must survive")
+        assert external_path.read_bytes() == b"must survive"
+        assert all(
+            (work_root / directory / PRODUCER_FILENAME).read_bytes()
+            == b"identical test wheel"
+            for directory in ("wheel-a", "wheel-b")
+        )
+        for descriptor in duplicate_descriptors:
+            with pytest.raises(OSError):
+                real_fstat(descriptor)
+    finally:
+        if external_descriptor is not None:
+            real_close(external_descriptor)
+        if len(output_descriptors) == 2:
+            try:
+                real_close(output_descriptors[1])
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize("exception_kind", ("keyboard-interrupt", "system-exit"))
+@pytest.mark.parametrize("phase", ("work-root", "wheel-a", "wheel-b"))
+def test_build_initial_pin_base_exception_closes_all_fds_and_restores_umask(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_kind: str,
+    phase: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    before = _caller_surface(work_root)
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    original = _injected_base_exception(exception_kind, phase)
+    real_open = os.open
+    real_fstat = os.fstat
+    retained: dict[str, int] = {}
+    injected = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            retained["work-root"] = descriptor
+        elif path in {"wheel-a", "wheel-b"}:
+            retained[str(path)] = descriptor
+        return descriptor
+
+    def interrupting_fstat(descriptor: int) -> os.stat_result:
+        nonlocal injected
+        if descriptor == retained.get(phase) and not injected:
+            injected = True
+            raise original
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "fstat", interrupting_fstat)
+
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(type(original)) as caught:
+            module_globals["_run"](source, build_python, work_root)
+        assert caught.value is original
+        assert _current_umask() == 0o077
+    finally:
+        os.umask(previous_umask)
+
+    assert injected
+    assert retained
+    for descriptor in retained.values():
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+    assert _caller_surface(work_root) == before
+
+
+@pytest.mark.parametrize("cleanup_operation", ("fstat", "ftruncate", "fsync", "close"))
+@pytest.mark.parametrize("secondary_kind", ("keyboard-interrupt", "system-exit"))
+def test_build_cleanup_base_exception_never_masks_original_or_aborts_resources(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_operation: str,
+    secondary_kind: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    original = KeyboardInterrupt("original publication interrupt")
+    secondary = _injected_base_exception(secondary_kind, cleanup_operation)
+    real_open = os.open
+    real_fstat = os.fstat
+    real_ftruncate = os.ftruncate
+    real_fsync = os.fsync
+    real_close = os.close
+    real_dup = os.dup
+    work_descriptor: int | None = None
+    output_descriptors: list[int] = []
+    cleanup_descriptors: list[int] = []
+    cleanup_active = False
+    original_injected = False
+    secondary_injected = False
+    bad_close_attempts: list[int] = []
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal work_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            work_descriptor = descriptor
+        elif path == PRODUCER_FILENAME:
+            output_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        if descriptor in output_descriptors:
+            cleanup_descriptors.append(duplicate)
+        return duplicate
+
+    def interrupting_fstat(descriptor: int) -> os.stat_result:
+        nonlocal secondary_injected
+        if (
+            cleanup_active
+            and cleanup_operation == "fstat"
+            and cleanup_descriptors
+            and descriptor == cleanup_descriptors[0]
+            and not secondary_injected
+        ):
+            secondary_injected = True
+            raise secondary
+        return real_fstat(descriptor)
+
+    def interrupting_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal secondary_injected
+        real_ftruncate(descriptor, length)
+        if (
+            cleanup_active
+            and cleanup_operation == "ftruncate"
+            and cleanup_descriptors
+            and descriptor == cleanup_descriptors[0]
+            and not secondary_injected
+        ):
+            secondary_injected = True
+            raise secondary
+
+    def interrupting_fsync(descriptor: int) -> None:
+        nonlocal cleanup_active, original_injected, secondary_injected
+        if (
+            not cleanup_active
+            and work_descriptor is not None
+            and descriptor == work_descriptor
+            and len(output_descriptors) == 2
+        ):
+            cleanup_active = True
+            original_injected = True
+            raise original
+        real_fsync(descriptor)
+        if (
+            cleanup_active
+            and cleanup_operation == "fsync"
+            and cleanup_descriptors
+            and descriptor == cleanup_descriptors[0]
+            and not secondary_injected
+        ):
+            secondary_injected = True
+            raise secondary
+
+    def interrupting_close(descriptor: int) -> None:
+        nonlocal secondary_injected
+        try:
+            real_close(descriptor)
+        except OSError:
+            bad_close_attempts.append(descriptor)
+            raise
+        if (
+            cleanup_active
+            and cleanup_operation == "close"
+            and cleanup_descriptors
+            and descriptor == cleanup_descriptors[0]
+            and not secondary_injected
+        ):
+            secondary_injected = True
+            raise secondary
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "dup", recording_dup)
+    monkeypatch.setattr(module_globals["os"], "fstat", interrupting_fstat)
+    monkeypatch.setattr(module_globals["os"], "ftruncate", interrupting_ftruncate)
+    monkeypatch.setattr(module_globals["os"], "fsync", interrupting_fsync)
+    monkeypatch.setattr(module_globals["os"], "close", interrupting_close)
+
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            module_globals["_run"](source, build_python, work_root)
+        assert caught.value is original
+        assert _current_umask() == 0o077
+    finally:
+        os.umask(previous_umask)
+
+    assert original_injected
+    assert secondary_injected
+    assert bad_close_attempts == []
+    assert len(output_descriptors) == 2
+    assert len(cleanup_descriptors) == 2
+    for directory in ("wheel-a", "wheel-b"):
+        assert (work_root / directory / PRODUCER_FILENAME).read_bytes() == b""
+    for descriptor in (*output_descriptors, *cleanup_descriptors):
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+@pytest.mark.parametrize("secondary_kind", ("keyboard-interrupt", "system-exit"))
+def test_build_cleanup_persistent_ftruncate_base_exception_leaves_pair_unsealable(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    producer_wheel_pair: tuple[Path, Path],
+    secondary_kind: str,
+) -> None:
+    source = _copy_seal_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    wheel = producer_wheel_pair[0].read_bytes()
+    module_globals["_build_once"] = lambda *_arguments: wheel
+    original = KeyboardInterrupt("original publication interrupt")
+    secondary = _injected_base_exception(secondary_kind, "persistent ftruncate")
+    real_open = os.open
+    real_fstat = os.fstat
+    real_ftruncate = os.ftruncate
+    real_fsync = os.fsync
+    real_dup = os.dup
+    work_descriptor: int | None = None
+    output_descriptors: list[int] = []
+    cleanup_descriptors: list[int] = []
+    cleanup_active = False
+    truncate_attempts: list[int] = []
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal work_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            work_descriptor = descriptor
+        elif path == PRODUCER_FILENAME:
+            output_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        if descriptor in output_descriptors:
+            cleanup_descriptors.append(duplicate)
+        return duplicate
+
+    def interrupting_fsync(descriptor: int) -> None:
+        nonlocal cleanup_active
+        if (
+            not cleanup_active
+            and work_descriptor is not None
+            and descriptor == work_descriptor
+            and len(output_descriptors) == 2
+        ):
+            cleanup_active = True
+            raise original
+        real_fsync(descriptor)
+
+    def persistently_failing_ftruncate(descriptor: int, _length: int) -> None:
+        if cleanup_active and descriptor in cleanup_descriptors:
+            truncate_attempts.append(descriptor)
+            raise secondary
+        real_ftruncate(descriptor, _length)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "dup", recording_dup)
+    monkeypatch.setattr(module_globals["os"], "fsync", interrupting_fsync)
+    monkeypatch.setattr(
+        module_globals["os"],
+        "ftruncate",
+        persistently_failing_ftruncate,
+    )
+
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            module_globals["_run"](source, build_python, work_root)
+        assert caught.value is original
+        assert _current_umask() == 0o077
+    finally:
+        os.umask(previous_umask)
+
+    assert set(truncate_attempts) == set(cleanup_descriptors)
+    assert len(output_descriptors) == 2
+    assert len(cleanup_descriptors) == 2
+    for descriptor in (*output_descriptors, *cleanup_descriptors):
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+    assert all(
+        (work_root / directory / PRODUCER_FILENAME).read_bytes() != wheel
+        for directory in ("wheel-a", "wheel-b")
+    )
+
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    producer_lock = tmp_path / "producer.lock"
+    completed = _run_tool(
+        "seal_producer_build.py",
+        "--source-root",
+        str(source),
+        "--wheel-dir-a",
+        str(work_root / "wheel-a"),
+        "--wheel-dir-b",
+        str(work_root / "wheel-b"),
+        "--wheelhouse",
+        str(wheelhouse),
+        "--producer-lock",
+        str(producer_lock),
+    )
+    assert completed.returncode == 2
+    assert not producer_lock.exists()
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+
+
+@pytest.mark.parametrize("probe_kind", ("keyboard-interrupt", "system-exit"))
+@pytest.mark.parametrize("block_primary_probe", (False, True))
+@pytest.mark.parametrize("block_after_fallback_auth", (False, True))
+def test_build_cleanup_uses_fresh_dup_when_retained_cleanup_probe_is_unavailable(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_kind: str,
+    block_primary_probe: bool,
+    block_after_fallback_auth: bool,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = prepare_producer_work_root(tmp_path / "work")
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    module_globals["_build_once"] = lambda *_arguments: b"identical test wheel"
+    original = KeyboardInterrupt("original publication interrupt")
+    probe_error = _injected_base_exception(probe_kind, "cleanup probe")
+    real_open = os.open
+    real_dup = os.dup
+    real_fstat = os.fstat
+    real_stat = os.stat
+    real_fsync = os.fsync
+    work_descriptor: int | None = None
+    primary_descriptors: list[int] = []
+    retained_cleanup_descriptors: list[int] = []
+    fallback_descriptors: list[int] = []
+    fallback_authentications: dict[int, int] = {}
+    cleanup_active = False
+
+    def recording_open(
+        path: os.PathLike[str] | str | bytes | int,
+        flags: int,
+        *arguments: object,
+        **keywords: object,
+    ) -> int:
+        nonlocal work_descriptor
+        descriptor = real_open(path, flags, *arguments, **keywords)
+        if path == work_root:
+            work_descriptor = descriptor
+        elif path == PRODUCER_FILENAME:
+            primary_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        if descriptor in primary_descriptors:
+            if cleanup_active:
+                fallback_descriptors.append(duplicate)
+            else:
+                retained_cleanup_descriptors.append(duplicate)
+        return duplicate
+
+    def failing_fstat(descriptor: int) -> os.stat_result:
+        if cleanup_active and descriptor in fallback_descriptors:
+            if (
+                block_after_fallback_auth
+                and fallback_authentications.get(descriptor, 0) >= 1
+            ):
+                raise probe_error
+            result = real_fstat(descriptor)
+            fallback_authentications[descriptor] = (
+                fallback_authentications.get(descriptor, 0) + 1
+            )
+            return result
+        if cleanup_active and (
+            descriptor in retained_cleanup_descriptors
+            or block_primary_probe and descriptor in primary_descriptors
+        ):
+            raise probe_error
+        return real_fstat(descriptor)
+
+    def failing_stat(
+        path: os.PathLike[str] | str | bytes | int,
+        *arguments: object,
+        **keywords: object,
+    ) -> os.stat_result:
+        if (
+            cleanup_active
+            and block_after_fallback_auth
+            and path in fallback_descriptors
+            and fallback_authentications.get(path, 0) >= 1
+        ):
+            raise probe_error
+        if cleanup_active and (
+            path in retained_cleanup_descriptors
+            or block_primary_probe and path in primary_descriptors
+        ):
+            raise probe_error
+        return real_stat(path, *arguments, **keywords)
+
+    def interrupting_fsync(descriptor: int) -> None:
+        nonlocal cleanup_active
+        if (
+            not cleanup_active
+            and work_descriptor is not None
+            and descriptor == work_descriptor
+            and len(primary_descriptors) == 2
+        ):
+            cleanup_active = True
+            raise original
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "open", recording_open)
+    monkeypatch.setattr(module_globals["os"], "dup", recording_dup)
+    monkeypatch.setattr(module_globals["os"], "fstat", failing_fstat)
+    monkeypatch.setattr(module_globals["os"], "stat", failing_stat)
+    monkeypatch.setattr(module_globals["os"], "fsync", interrupting_fsync)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        module_globals["_run"](source, build_python, work_root)
+    assert caught.value is original
+    assert len(primary_descriptors) == 2
+    assert len(retained_cleanup_descriptors) == 2
+    assert len(fallback_descriptors) == 2
+    assert set(fallback_authentications) == set(fallback_descriptors)
+    assert all(
+        (work_root / directory / PRODUCER_FILENAME).read_bytes() == b""
+        for directory in ("wheel-a", "wheel-b")
+    )
+    for descriptor in (
+        *primary_descriptors,
+        *retained_cleanup_descriptors,
+        *fallback_descriptors,
+    ):
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+def test_close_best_effort_never_retries_reused_same_inode_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_close_best_effort"].__globals__
+    target = tmp_path / "same-inode"
+    target.write_bytes(b"external data")
+    descriptor = os.open(target, os.O_RDONLY)
+    real_open = os.open
+    real_close = os.close
+    real_fstat = os.fstat
+    replacement_descriptor: int | None = None
+    close_attempts = 0
+
+    def closing_reopening_then_interrupting(value: int) -> None:
+        nonlocal replacement_descriptor, close_attempts
+        close_attempts += 1
+        real_close(value)
+        replacement_descriptor = real_open(target, os.O_RDONLY)
+        assert replacement_descriptor == value
+        raise KeyboardInterrupt("close completed before interrupt")
+
+    monkeypatch.setattr(
+        module_globals["os"],
+        "close",
+        closing_reopening_then_interrupting,
+    )
+
+    try:
+        module_globals["_close_best_effort"]((descriptor,))
+        assert close_attempts == 1
+        assert replacement_descriptor == descriptor
+        assert real_fstat(replacement_descriptor).st_size == len(b"external data")
+    finally:
+        if replacement_descriptor is not None:
+            real_close(replacement_descriptor)
+
+
+def test_cleanup_never_recloses_reused_same_inode_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_cleanup_owned_outputs"].__globals__
+    target = tmp_path / "owned-wheel"
+    target.write_bytes(b"complete wheel bytes")
+    primary_descriptor = os.open(target, os.O_RDWR)
+    cleanup_descriptor = os.dup(primary_descriptor)
+    opened = os.fstat(primary_descriptor)
+    output = module_globals["_OwnedOutput"](
+        primary_descriptor=primary_descriptor,
+        cleanup_descriptor=cleanup_descriptor,
+        owner_identity=(opened.st_dev, opened.st_ino),
+    )
+    real_open = os.open
+    real_close = os.close
+    real_fstat = os.fstat
+    replacement_descriptor: int | None = None
+    cleanup_close_attempts = 0
+
+    def closing_reopening_then_interrupting(descriptor: int) -> None:
+        nonlocal replacement_descriptor, cleanup_close_attempts
+        if descriptor == cleanup_descriptor:
+            cleanup_close_attempts += 1
+            real_close(descriptor)
+            replacement_descriptor = real_open(target, os.O_RDONLY)
+            if replacement_descriptor != descriptor:
+                os.dup2(replacement_descriptor, descriptor)
+                real_close(replacement_descriptor)
+                replacement_descriptor = descriptor
+            raise SystemExit("cleanup close completed before interrupt")
+        real_close(descriptor)
+
+    monkeypatch.setattr(
+        module_globals["os"],
+        "close",
+        closing_reopening_then_interrupting,
+    )
+
+    try:
+        module_globals["_cleanup_owned_outputs"]({"wheel-a": output})
+        assert cleanup_close_attempts == 1
+        assert replacement_descriptor == cleanup_descriptor
+        real_fstat(replacement_descriptor)
+        assert target.read_bytes() == b""
+    finally:
+        if replacement_descriptor is not None:
+            real_close(replacement_descriptor)
 
 
 def test_build_closes_every_initial_pin_once_when_close_closes_then_raises(

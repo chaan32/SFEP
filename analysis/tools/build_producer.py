@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable
+from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -44,7 +46,6 @@ _DirectoryInventory = tuple[_Fingerprint, dict[str, _Fingerprint]]
 _DirectoryPin = tuple[Path, Path, tuple[int, int]]
 _OutputPin = tuple[int, tuple[int, int]]
 _OutputPins = dict[str, _OutputPin]
-_OwnedOutput = tuple[int, tuple[int, int] | None, _Fingerprint | None]
 _SourceAttestation = tuple[
     tuple[int, int, int],
     dict[str, _Fingerprint],
@@ -56,8 +57,36 @@ class ProducerBuildError(RuntimeError):
     """The producer build request is unsafe or could not be completed."""
 
 
+@dataclass
+class _OwnedOutput:
+    primary_descriptor: int | None
+    cleanup_descriptor: int | None = None
+    owner_identity: tuple[int, int] | None = None
+    expected_fingerprint: _Fingerprint | None = None
+    primary_close_attempted: bool = False
+    cleanup_close_attempted: bool = False
+
+
+def _descriptor_identity_status(
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> bool | None:
+    """Return whether an FD still names the owned regular file, if provable."""
+    for inspect in (os.fstat, os.stat):
+        try:
+            opened = inspect(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                return False
+            continue
+        except BaseException:
+            continue
+        return stat.S_ISREG(opened.st_mode) and _identity(opened) == expected_identity
+    return None
+
+
 def _close_best_effort(descriptors: Iterable[int | None]) -> None:
-    """Attempt every distinct close exactly once and never mask the real result."""
+    """Attempt every distinct numeric FD once and never mask the real result."""
     seen: set[int] = set()
     for value in descriptors:
         if value is None:
@@ -68,7 +97,7 @@ def _close_best_effort(descriptors: Iterable[int | None]) -> None:
         seen.add(descriptor)
         try:
             os.close(descriptor)
-        except Exception:
+        except BaseException:
             pass
 
 
@@ -273,7 +302,7 @@ def _prepare_work_root(
             {"wheel-a": None, "wheel-b": None},
         )
         return descriptor, pin, outputs
-    except Exception:
+    except BaseException:
         _close_best_effort(reversed(opened_descriptors))
         raise
 
@@ -875,33 +904,90 @@ def _authenticate_open_file(
 def _cleanup_owned_outputs(
     owned: dict[str, _OwnedOutput],
 ) -> None:
-    descriptors: list[int] = []
+    fallback_descriptors: list[int] = []
     for name in reversed(("wheel-a", "wheel-b")):
-        value = owned.get(name)
-        if value is None:
+        output = owned.get(name)
+        if output is None:
             continue
-        file_descriptor, expected_identity, _expected_fingerprint = value
-        descriptors.append(file_descriptor)
-        if expected_identity is None:
-            continue
-        try:
-            opened = os.fstat(file_descriptor)
-        except OSError:
-            continue
+        owner_identity = output.owner_identity
+        cleanup_descriptor = output.cleanup_descriptor
+        mutation_descriptor: int | None = None
         if (
-            not stat.S_ISREG(opened.st_mode)
-            or _identity(opened) != expected_identity
+            cleanup_descriptor is not None
+            and not output.cleanup_close_attempted
+            and owner_identity is not None
+            and _descriptor_identity_status(cleanup_descriptor, owner_identity) is True
         ):
-            continue
-        try:
-            os.ftruncate(file_descriptor, 0)
-        except OSError:
-            pass
-        try:
-            os.fsync(file_descriptor)
-        except OSError:
-            pass
+            mutation_descriptor = cleanup_descriptor
+        elif (
+            output.primary_descriptor is not None
+            and not output.primary_close_attempted
+            and owner_identity is not None
+        ):
+            try:
+                fallback_descriptor = os.dup(output.primary_descriptor)
+            except BaseException:
+                fallback_descriptor = None
+            if fallback_descriptor is not None:
+                fallback_descriptors.append(fallback_descriptor)
+                if (
+                    _descriptor_identity_status(fallback_descriptor, owner_identity)
+                    is True
+                ):
+                    mutation_descriptor = fallback_descriptor
+
+        if mutation_descriptor is not None and owner_identity is not None:
+            operations = (
+                lambda: os.pwrite(mutation_descriptor, b"\0", 0),
+                lambda: os.ftruncate(mutation_descriptor, 0),
+                lambda: os.fsync(mutation_descriptor),
+            )
+            for operation in operations:
+                if _descriptor_identity_status(
+                    mutation_descriptor,
+                    owner_identity,
+                ) is False:
+                    break
+                try:
+                    operation()
+                except BaseException:
+                    pass
+
+    descriptors: list[int] = []
+    for output in owned.values():
+        if output.primary_descriptor is not None and not output.primary_close_attempted:
+            descriptor = output.primary_descriptor
+            output.primary_descriptor = None
+            output.primary_close_attempted = True
+            descriptors.append(descriptor)
+        if output.cleanup_descriptor is not None and not output.cleanup_close_attempted:
+            descriptor = output.cleanup_descriptor
+            output.cleanup_descriptor = None
+            output.cleanup_close_attempted = True
+            descriptors.append(descriptor)
+    descriptors.extend(fallback_descriptors)
     _close_best_effort(descriptors)
+
+
+def _close_owned_for_commit(output: _OwnedOutput, attribute: str) -> None:
+    descriptor = getattr(output, attribute)
+    attempted_attribute = attribute.replace("descriptor", "close_attempted")
+    if descriptor is None or getattr(output, attempted_attribute):
+        return
+    setattr(output, attribute, None)
+    setattr(output, attempted_attribute, True)
+    try:
+        os.close(descriptor)
+    except BaseException:
+        pass
+
+
+def _commit_owned_outputs(owned: dict[str, _OwnedOutput]) -> None:
+    for attribute in ("primary_descriptor", "cleanup_descriptor"):
+        for name in ("wheel-a", "wheel-b"):
+            output = owned.get(name)
+            if output is not None:
+                _close_owned_for_commit(output, attribute)
 
 
 def _publish_pair(
@@ -924,6 +1010,7 @@ def _publish_pair(
     )
     _recheck_source_attestation(source_root, source_attestation)
     owned: dict[str, _OwnedOutput] = {}
+    committed = False
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -952,7 +1039,8 @@ def _publish_pair(
                 raise ProducerBuildError(
                     f"{directory_name} producer wheel cannot be created exclusively"
                 ) from error
-            owned[directory_name] = file_descriptor, None, None
+            output = _OwnedOutput(primary_descriptor=file_descriptor)
+            owned[directory_name] = output
             try:
                 opened_file = os.fstat(file_descriptor)
             except OSError as error:
@@ -962,18 +1050,28 @@ def _publish_pair(
             if not stat.S_ISREG(opened_file.st_mode):
                 raise ProducerBuildError("producer wheel output is not regular")
             owner_identity = _identity(opened_file)
-            owned[directory_name] = file_descriptor, owner_identity, None
+            output.owner_identity = owner_identity
+            try:
+                cleanup_descriptor = os.dup(file_descriptor)
+            except OSError as error:
+                raise ProducerBuildError(
+                    f"{directory_name} producer wheel cleanup pin failed"
+                ) from error
+            output.cleanup_descriptor = cleanup_descriptor
+            if (
+                _descriptor_identity_status(cleanup_descriptor, owner_identity)
+                is not True
+            ):
+                raise ProducerBuildError(
+                    f"{directory_name} producer wheel cleanup pin changed"
+                )
             expected_file = _write_frozen_open_file(
                 file_descriptor,
                 directory_descriptor,
                 wheel,
             )
             expected_files[directory_name] = expected_file
-            owned[directory_name] = (
-                file_descriptor,
-                owner_identity,
-                expected_file,
-            )
+            output.expected_fingerprint = expected_file
             os.fsync(directory_descriptor)
             _recheck_prepared_root(
                 work_descriptor,
@@ -1005,10 +1103,19 @@ def _publish_pair(
             expected_files,
         )
         _recheck_source_attestation(source_root, source_attestation)
-    except Exception:
+        # COMMIT POINT: every byte/path/source/durability check is complete.
+        # Descriptor-close failures after this point cannot revoke publication.
+        committed = True
+        _commit_owned_outputs(owned)
+    except BaseException:
+        if committed:
+            try:
+                _commit_owned_outputs(owned)
+            except BaseException:
+                pass
+            return
         _cleanup_owned_outputs(owned)
         raise
-    _close_best_effort(value[0] for value in owned.values())
 
 
 def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, str, int]:
@@ -1069,6 +1176,7 @@ def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, s
             if wheel_a != wheel_b:
                 raise ProducerBuildError("independent producer wheel bytes differ")
         _recheck_source_attestation(source_root, source_attestation)
+        result = _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
         _publish_pair(
             work_descriptor,
             work_pin,
@@ -1077,16 +1185,17 @@ def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, s
             source_root,
             source_attestation,
         )
-        result = _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
         return result
     finally:
-        _close_best_effort(
-            [
-                *(value[0] for value in reversed(tuple(outputs.values()))),
-                work_descriptor,
-            ]
-        )
-        os.umask(previous_umask)
+        try:
+            _close_best_effort(
+                [
+                    *(value[0] for value in reversed(tuple(outputs.values()))),
+                    work_descriptor,
+                ]
+            )
+        finally:
+            os.umask(previous_umask)
 
 
 def main(argv: list[str] | None = None) -> int:
