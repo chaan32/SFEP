@@ -596,6 +596,7 @@ def run_producer_build(
     work_root: Path,
     *,
     cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     tool = source_root / "tools/build_producer.py"
     return subprocess.run(
@@ -610,6 +611,7 @@ def run_producer_build(
             str(work_root),
         ],
         cwd=cwd,
+        env=env,
         check=False,
         capture_output=True,
         text=True,

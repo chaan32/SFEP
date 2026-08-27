@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -39,6 +38,14 @@ _LOCK_LINE = re.compile(
     rb"([a-z0-9]+(?:-[a-z0-9]+)*)==([^\x00-\x20]+) "
     rb"--hash=sha256:([0-9a-f]{64})\n"
 )
+_Fingerprint = tuple[int, int, int, int, int, int]
+_DirectoryInventory = tuple[_Fingerprint, dict[str, _Fingerprint]]
+_DirectoryPin = tuple[Path, Path, tuple[int, int]]
+_SourceAttestation = tuple[
+    tuple[int, int, int],
+    dict[str, _Fingerprint],
+    dict[str, _Fingerprint],
+]
 
 
 class ProducerBuildError(RuntimeError):
@@ -96,32 +103,41 @@ def _require_build_python(path: Path) -> None:
         raise ProducerBuildError("build Python must be executable")
 
 
-def _physical_missing_path(path: Path) -> Path:
-    suffix: list[str] = []
+def _path_ancestry(path: Path) -> tuple[tuple[int, int] | None, set[tuple[int, int]]]:
+    endpoint: tuple[int, int] | None = None
+    identities: set[tuple[int, int]] = set()
     current = path
+    first = True
     while True:
         try:
             result = os.lstat(current)
         except FileNotFoundError:
-            suffix.append(current.name)
-            parent = current.parent
-            if parent == current:
-                raise ProducerBuildError("work root has no existing parent")
-            current = parent
-            continue
+            result = None
         except OSError as error:
-            raise ProducerBuildError("work root parent is unavailable") from error
-        if stat.S_ISLNK(result.st_mode) or not stat.S_ISDIR(result.st_mode):
-            raise ProducerBuildError(
-                "work root parent must be a non-symlink directory"
-            )
-        resolved = Path(os.path.realpath(current))
-        for part in reversed(suffix):
-            resolved /= part
-        return resolved
+            raise ProducerBuildError("input path ancestry cannot be inspected") from error
+        if result is not None:
+            identity = result.st_dev, result.st_ino
+            identities.add(identity)
+            if first:
+                endpoint = identity
+        first = False
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return endpoint, identities
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
+    first_endpoint, first_ancestry = _path_ancestry(first)
+    second_endpoint, second_ancestry = _path_ancestry(second)
+    if (
+        first_endpoint is not None
+        and first_endpoint in second_ancestry
+        or second_endpoint is not None
+        and second_endpoint in first_ancestry
+    ):
+        return True
     try:
         common = Path(os.path.commonpath((os.fspath(first), os.fspath(second))))
     except ValueError:
@@ -129,21 +145,113 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return common == first or common == second
 
 
-def _prepare_work_root(path: Path, source_root: Path) -> None:
+def _prepare_work_root(
+    path: Path,
+    source_root: Path,
+) -> tuple[int, _DirectoryPin, _DirectoryInventory]:
     source_physical = Path(os.path.realpath(source_root))
-    if path.exists() or path.is_symlink():
-        _require_directory(path, "work root")
-        work_physical = Path(os.path.realpath(path))
-        try:
-            with os.scandir(path) as entries:
-                if next(entries, None) is not None:
-                    raise ProducerBuildError("work root must be empty")
-        except OSError as error:
-            raise ProducerBuildError("work root cannot be inspected") from error
-    else:
-        work_physical = _physical_missing_path(path)
+    work_physical = Path(os.path.realpath(path))
     if _paths_overlap(source_physical, work_physical):
         raise ProducerBuildError("source root and work root must not overlap")
+    source_identity, source_ancestry = _path_ancestry(source_physical)
+    if source_identity is None:
+        raise ProducerBuildError("source root identity is unavailable")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path.anchor, flags)
+    except OSError as error:
+        raise ProducerBuildError("work root anchor cannot be opened safely") from error
+    try:
+        parts = path.parts[1:]
+        for part in parts:
+            try:
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except OSError as error:
+                raise ProducerBuildError(
+                    "work root cannot be opened safely as a non-symlink directory"
+                ) from error
+            opened = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(next_descriptor)
+                raise ProducerBuildError("work root path contains a non-directory")
+            component_identity = _identity(opened)
+            if component_identity == source_identity:
+                os.close(next_descriptor)
+                raise ProducerBuildError("source root and work root must not overlap")
+            os.close(descriptor)
+            descriptor = next_descriptor
+        opened = os.fstat(descriptor)
+        work_identity = _identity(opened)
+        if work_identity in source_ancestry:
+            raise ProducerBuildError("source root and work root must not overlap")
+        inventory = _directory_inventory_fd(descriptor, "work root")
+        if inventory[1]:
+            raise ProducerBuildError("work root must be empty")
+        try:
+            path_result = os.lstat(path)
+        except OSError as error:
+            raise ProducerBuildError("work root changed while being pinned") from error
+        if (
+            stat.S_ISLNK(path_result.st_mode)
+            or not stat.S_ISDIR(path_result.st_mode)
+            or _identity(path_result) != work_identity
+        ):
+            raise ProducerBuildError("work root changed while being pinned")
+        pin = path, Path(os.path.realpath(path)), work_identity
+        return descriptor, pin, inventory
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _recheck_work_root_identity(
+    descriptor: int,
+    pin: _DirectoryPin,
+) -> None:
+    path, expected_physical, expected_identity = pin
+    try:
+        path_result = os.lstat(path)
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise ProducerBuildError("work root changed after validation") from error
+    if (
+        stat.S_ISLNK(path_result.st_mode)
+        or not stat.S_ISDIR(path_result.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or _identity(path_result) != expected_identity
+        or _identity(opened) != expected_identity
+        or Path(os.path.realpath(path)) != expected_physical
+    ):
+        raise ProducerBuildError("work root physical identity changed")
+
+
+def _recheck_work_root(
+    descriptor: int,
+    pin: _DirectoryPin,
+    expected_inventory: _DirectoryInventory,
+) -> None:
+    _recheck_work_root_identity(descriptor, pin)
+    if _directory_inventory_fd(descriptor, "work root") != expected_inventory:
+        raise ProducerBuildError("work root inventory changed after validation")
 
 
 def _checked_relative(relative: str) -> bytes:
@@ -164,13 +272,102 @@ def _checked_relative(relative: str) -> bytes:
     return encoded
 
 
-def _read_regular_once(path: Path, label: str) -> bytes:
+def _fingerprint(result: os.stat_result) -> _Fingerprint:
+    return (
+        result.st_dev,
+        result.st_ino,
+        stat.S_IFMT(result.st_mode),
+        result.st_size,
+        result.st_mtime_ns,
+        result.st_ctime_ns,
+    )
+
+
+def _identity(result: os.stat_result) -> tuple[int, int]:
+    return result.st_dev, result.st_ino
+
+
+def _directory_inventory_fd(
+    descriptor: int,
+    label: str,
+) -> _DirectoryInventory:
+    try:
+        before = os.fstat(descriptor)
+        scanner = os.scandir(descriptor)
+        try:
+            scanned = list(scanner)
+        finally:
+            close = getattr(scanner, "close", None)
+            if close is not None:
+                close()
+        entries: dict[str, _Fingerprint] = {}
+        for entry in scanned:
+            if entry.name in entries:
+                raise ProducerBuildError(f"{label} contains a duplicate entry")
+            result = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+            entries[entry.name] = _fingerprint(result)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} changed while being inventoried") from error
+    if not stat.S_ISDIR(before.st_mode) or not stat.S_ISDIR(after.st_mode):
+        raise ProducerBuildError(f"{label} type changed while being inventoried")
+    if _fingerprint(before) != _fingerprint(after):
+        raise ProducerBuildError(f"{label} changed while being inventoried")
+    return _fingerprint(before), dict(
+        sorted(entries.items(), key=lambda item: item[0].encode("utf-8"))
+    )
+
+
+def _directory_inventory(
+    path: Path,
+    label: str,
+) -> _DirectoryInventory:
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise ProducerBuildError(f"{label} must be a non-symlink directory")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} cannot be opened safely") from error
+    try:
+        opened, entries = _directory_inventory_fd(descriptor, label)
+    finally:
+        os.close(descriptor)
+    try:
+        path_after = os.lstat(path)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} changed while being inventoried") from error
+    if not (
+        _fingerprint(before)
+        == opened
+        == _fingerprint(path_after)
+    ):
+        raise ProducerBuildError(f"{label} changed while being inventoried")
+    return opened, entries
+
+
+def _read_regular_once(
+    path: Path,
+    label: str,
+    expected: _Fingerprint | None = None,
+) -> bytes:
     try:
         before = os.lstat(path)
     except OSError as error:
         raise ProducerBuildError(f"{label} is unavailable") from error
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise ProducerBuildError(f"{label} must be a non-symlink regular file")
+    if expected is not None and _fingerprint(before) != expected:
+        raise ProducerBuildError(f"{label} identity changed before reading")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -195,20 +392,10 @@ def _read_regular_once(path: Path, label: str) -> bytes:
         path_after = os.lstat(path)
     except OSError as error:
         raise ProducerBuildError(f"{label} changed while reading") from error
-    identity = lambda item: (item.st_dev, item.st_ino)
-    stable = lambda item: (
-        item.st_size,
-        item.st_mtime_ns,
-        item.st_ctime_ns,
-        stat.S_IFMT(item.st_mode),
-    )
     if (
-        identity(before) != identity(opened)
-        or identity(opened) != identity(after)
-        or identity(after) != identity(path_after)
-        or stable(before) != stable(opened)
-        or stable(opened) != stable(after)
-        or stable(after) != stable(path_after)
+        _fingerprint(before) != _fingerprint(opened)
+        or _fingerprint(opened) != _fingerprint(after)
+        or _fingerprint(after) != _fingerprint(path_after)
         or total != after.st_size
     ):
         raise ProducerBuildError(f"{label} changed while reading")
@@ -224,55 +411,151 @@ def _excluded_source(relative: str) -> bool:
     )
 
 
-def _walk_source_directory(
+def _source_inventory(
     source_root: Path,
-    directory: Path,
-    snapshot: dict[str, bytes],
+    package_root: Path,
+    expected_package: _Fingerprint,
+) -> dict[str, _Fingerprint]:
+    inventory: dict[str, _Fingerprint] = {}
+
+    def visit(directory: Path, expected_directory: _Fingerprint) -> None:
+        directory_fingerprint, entries = _directory_inventory(
+            directory,
+            "producer source directory",
+        )
+        if directory_fingerprint != expected_directory:
+            raise ProducerBuildError("producer source directory identity changed")
+        relative_directory = directory.relative_to(source_root).as_posix()
+        _checked_relative(relative_directory)
+        inventory[relative_directory] = directory_fingerprint
+        for name, entry_fingerprint in entries.items():
+            path = directory / name
+            relative = path.relative_to(source_root).as_posix()
+            _checked_relative(relative)
+            if relative in inventory:
+                raise ProducerBuildError("producer source contains a duplicate path")
+            inventory[relative] = entry_fingerprint
+            entry_type = entry_fingerprint[2]
+            if entry_type == stat.S_IFLNK:
+                raise ProducerBuildError("producer source must not contain a symlink")
+            if entry_type == stat.S_IFDIR:
+                visit(path, entry_fingerprint)
+            elif entry_type != stat.S_IFREG:
+                raise ProducerBuildError("producer source must contain only regular files")
+
+    visit(package_root, expected_package)
+    return dict(sorted(inventory.items(), key=lambda item: item[0].encode("utf-8")))
+
+
+def _source_attestation(source_root: Path) -> _SourceAttestation:
+    root_before, entries_before = _directory_inventory(source_root, "source root")
+    selected_before: dict[str, _Fingerprint] = {}
+    for filename in ("pyproject.toml", "requirements.lock"):
+        entry = entries_before.get(filename)
+        if entry is None or entry[2] != stat.S_IFREG:
+            raise ProducerBuildError(f"{filename} must be a regular file")
+        selected_before[filename] = entry
+    package_before = entries_before.get("equipment_quality")
+    if package_before is None or package_before[2] != stat.S_IFDIR:
+        raise ProducerBuildError("equipment_quality source directory is unavailable")
+    inventory_before = _source_inventory(
+        source_root,
+        source_root / "equipment_quality",
+        package_before,
+    )
+    root_after, entries_after = _directory_inventory(source_root, "source root")
+    package_after = entries_after.get("equipment_quality")
+    selected_after = {
+        filename: entries_after.get(filename)
+        for filename in selected_before
+    }
+    if package_after is None or package_after[2] != stat.S_IFDIR:
+        raise ProducerBuildError("equipment_quality source directory changed")
+    inventory_after = _source_inventory(
+        source_root,
+        source_root / "equipment_quality",
+        package_after,
+    )
+    if (
+        root_before != root_after
+        or entries_before != entries_after
+        or selected_before != selected_after
+        or package_before != package_after
+        or inventory_before != inventory_after
+    ):
+        raise ProducerBuildError("producer source changed while being attested")
+    return root_after[:3], selected_before, inventory_before
+
+
+def _recheck_source_attestation(
+    source_root: Path,
+    expected: _SourceAttestation,
 ) -> None:
-    try:
-        entries = list(os.scandir(directory))
-    except OSError as error:
-        raise ProducerBuildError("producer source directory cannot be read") from error
-    keyed: list[tuple[bytes, os.DirEntry[str]]] = []
-    for entry in entries:
-        relative = (directory / entry.name).relative_to(source_root).as_posix()
-        keyed.append((_checked_relative(relative), entry))
-    for _encoded, entry in sorted(keyed, key=lambda item: item[0]):
-        path = Path(entry.path)
-        relative = path.relative_to(source_root).as_posix()
-        try:
-            result = entry.stat(follow_symlinks=False)
-        except OSError as error:
-            raise ProducerBuildError("producer source entry is unavailable") from error
-        if stat.S_ISLNK(result.st_mode):
-            raise ProducerBuildError("producer source must not contain a symlink")
-        if stat.S_ISDIR(result.st_mode):
-            _walk_source_directory(source_root, path, snapshot)
-            continue
-        if not stat.S_ISREG(result.st_mode):
-            raise ProducerBuildError("producer source must contain only regular files")
-        if relative == _PROVENANCE_PATH:
-            raise ProducerBuildError("generated provenance must not exist in source")
-        if _excluded_source(relative):
-            continue
-        if relative in snapshot:
-            raise ProducerBuildError("producer source contains a duplicate path")
-        snapshot[relative] = _read_regular_once(path, "producer source file")
+    if _source_attestation(source_root) != expected:
+        raise ProducerBuildError("producer source changed after authentication")
 
 
 def _source_snapshot(source_root: Path) -> dict[str, bytes]:
     _require_directory(source_root, "source root")
     package_root = source_root / "equipment_quality"
-    _require_directory(package_root, "equipment_quality source directory")
+    root_before, root_entries_before = _directory_inventory(source_root, "source root")
+    pyproject_fingerprint = root_entries_before.get("pyproject.toml")
+    package_fingerprint = root_entries_before.get("equipment_quality")
+    if pyproject_fingerprint is None or pyproject_fingerprint[2] != stat.S_IFREG:
+        raise ProducerBuildError("pyproject.toml must be a regular file")
+    if package_fingerprint is None or package_fingerprint[2] != stat.S_IFDIR:
+        raise ProducerBuildError("equipment_quality source directory is unavailable")
+    inventory_before = _source_inventory(
+        source_root,
+        package_root,
+        package_fingerprint,
+    )
     snapshot = {
         "pyproject.toml": _read_regular_once(
-            source_root / "pyproject.toml", "pyproject.toml"
+            source_root / "pyproject.toml",
+            "pyproject.toml",
+            pyproject_fingerprint,
         )
     }
-    _walk_source_directory(source_root, package_root, snapshot)
+    for relative, entry_fingerprint in inventory_before.items():
+        if entry_fingerprint[2] == stat.S_IFDIR:
+            continue
+        if relative == _PROVENANCE_PATH:
+            raise ProducerBuildError("generated provenance must not exist in source")
+        if _excluded_source(relative):
+            continue
+        snapshot[relative] = _read_regular_once(
+            source_root.joinpath(*PurePosixPath(relative).parts),
+            "producer source file",
+            entry_fingerprint,
+        )
+    root_after, root_entries_after = _directory_inventory(source_root, "source root")
+    inventory_after = _source_inventory(
+        source_root,
+        package_root,
+        package_fingerprint,
+    )
+    if (
+        root_before != root_after
+        or root_entries_before != root_entries_after
+        or inventory_before != inventory_after
+    ):
+        raise ProducerBuildError("producer source inventory changed while reading")
     if len(snapshot) < 2:
         raise ProducerBuildError("producer source snapshot is empty")
     return snapshot
+
+
+def _read_source_root_file(source_root: Path, filename: str, label: str) -> bytes:
+    root_before, entries_before = _directory_inventory(source_root, "source root")
+    expected = entries_before.get(filename)
+    if expected is None:
+        raise ProducerBuildError(f"{label} is unavailable")
+    payload = _read_regular_once(source_root / filename, label, expected)
+    root_after, entries_after = _directory_inventory(source_root, "source root")
+    if root_before != root_after or entries_before != entries_after:
+        raise ProducerBuildError("source root inventory changed while reading")
+    return payload
 
 
 def _source_digest(snapshot: dict[str, bytes]) -> str:
@@ -371,30 +654,34 @@ def _materialize_stage(
     os.utime(stage, (_SOURCE_DATE_EPOCH, _SOURCE_DATE_EPOCH), follow_symlinks=False)
 
 
-def _build_environment(build_python: Path) -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"PYTHONHOME", "PYTHONPATH", "SOURCE_DATE_EPOCH", "PYTHONHASHSEED"}
-    }
-    environment.update({
+def _build_environment(build_python: Path, safe_root: Path) -> dict[str, str]:
+    safe_root.mkdir(mode=0o700)
+    home = safe_root / "home"
+    temporary = safe_root / "tmp"
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
+    return {
+        "HOME": os.fspath(home),
         "SOURCE_DATE_EPOCH": str(_SOURCE_DATE_EPOCH),
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_NO_INDEX": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "LC_ALL": "C",
         "LANG": "C",
         "TZ": "UTC",
+        "TMPDIR": os.fspath(temporary),
         "PATH": os.pathsep.join((os.fspath(build_python.parent), "/usr/bin", "/bin")),
-    })
-    return environment
+    }
 
 
 def _build_once(build_python: Path, stage: Path, output: Path) -> bytes:
     output.mkdir(mode=0o755)
     command = [
         os.fspath(build_python),
+        "-P",
+        "-s",
         "-m",
         "build",
         "--wheel",
@@ -411,7 +698,8 @@ def _build_once(build_python: Path, stage: Path, output: Path) -> bytes:
             capture_output=True,
             text=True,
             shell=False,
-            env=_build_environment(build_python),
+            cwd=stage,
+            env=_build_environment(build_python, output.parent / f"env-{output.name}"),
         )
     finally:
         os.umask(previous_umask)
@@ -419,57 +707,296 @@ def _build_once(build_python: Path, stage: Path, output: Path) -> bytes:
         detail = completed.stderr.strip().splitlines()
         suffix = f": {detail[-1]}" if detail else ""
         raise ProducerBuildError(f"wheel build failed{suffix}")
-    try:
-        entries = list(os.scandir(output))
-    except OSError as error:
-        raise ProducerBuildError("wheel build output cannot be inspected") from error
-    if len(entries) != 1 or entries[0].name != _PRODUCER_FILENAME:
+    output_before, entries_before = _directory_inventory(
+        output,
+        "wheel build output",
+    )
+    if set(entries_before) != {_PRODUCER_FILENAME}:
         raise ProducerBuildError("wheel build did not produce the expected archive")
-    result = entries[0].stat(follow_symlinks=False)
-    if stat.S_ISLNK(result.st_mode) or not stat.S_ISREG(result.st_mode):
+    expected = entries_before[_PRODUCER_FILENAME]
+    if expected[2] != stat.S_IFREG:
         raise ProducerBuildError("wheel build output is not a regular archive")
-    return _read_regular_once(Path(entries[0].path), "producer wheel")
+    payload = _read_regular_once(
+        output / _PRODUCER_FILENAME,
+        "producer wheel",
+        expected,
+    )
+    output_after, entries_after = _directory_inventory(output, "wheel build output")
+    if output_before != output_after or entries_before != entries_after:
+        raise ProducerBuildError("wheel build output inventory changed while reading")
+    return payload
 
 
-def _publish_pair(work_root: Path, wheel: bytes) -> None:
-    created: list[Path] = []
+def _write_frozen_file_at(
+    directory_descriptor: int,
+    filename: str,
+    payload: bytes,
+) -> tuple[int, _Fingerprint]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(
+        filename,
+        flags,
+        0o644,
+        dir_fd=directory_descriptor,
+    )
     try:
-        for directory_name in ("wheel-a", "wheel-b"):
-            directory = work_root / directory_name
-            directory.mkdir(mode=0o755)
-            created.append(directory)
-            _write_frozen_file(directory / _PRODUCER_FILENAME, wheel)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ProducerBuildError("producer wheel output could not be written")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o644)
+        os.utime(descriptor, (_SOURCE_DATE_EPOCH, _SOURCE_DATE_EPOCH))
+        os.fsync(descriptor)
+        fingerprint = _authenticate_open_file(
+            descriptor,
+            payload,
+            "producer wheel output",
+        )
+        path_result = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if _fingerprint(path_result) != fingerprint:
+            raise ProducerBuildError("producer wheel output identity changed")
+        return descriptor, fingerprint
     except Exception:
-        for directory in reversed(created):
-            shutil.rmtree(directory, ignore_errors=True)
+        try:
+            path_result = os.stat(
+                filename,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(descriptor)
+            if _identity(path_result) == _identity(opened):
+                os.unlink(filename, dir_fd=directory_descriptor)
+        except OSError:
+            pass
+        os.close(descriptor)
         raise
 
 
-def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, str, int]:
-    _require_directory(source_root, "source root")
-    _require_build_python(build_python)
-    _prepare_work_root(work_root, source_root)
-    snapshot = _source_snapshot(source_root)
-    _validate_pyproject(snapshot["pyproject.toml"])
-    requirements = _read_regular_once(
-        source_root / "requirements.lock", "requirements.lock"
-    )
-    _validate_requirements_lock(requirements)
-    provenance = _provenance(snapshot, requirements)
+def _authenticate_open_file(
+    descriptor: int,
+    expected: bytes,
+    label: str,
+) -> _Fingerprint:
+    try:
+        before = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ProducerBuildError(f"{label} cannot be authenticated") from error
+    if (
+        _fingerprint(before) != _fingerprint(after)
+        or b"".join(chunks) != expected
+        or after.st_size != len(expected)
+    ):
+        raise ProducerBuildError(f"{label} changed during publication")
+    return _fingerprint(after)
 
-    work_root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".sfep-build-", dir=work_root) as temporary:
-        temporary_root = Path(temporary)
-        stage_a = temporary_root / "stage-a"
-        stage_b = temporary_root / "stage-b"
-        _materialize_stage(stage_a, snapshot, provenance)
-        _materialize_stage(stage_b, snapshot, provenance)
-        wheel_a = _build_once(build_python, stage_a, temporary_root / "out-a")
-        wheel_b = _build_once(build_python, stage_b, temporary_root / "out-b")
-        if wheel_a != wheel_b:
-            raise ProducerBuildError("independent producer wheel bytes differ")
-    _publish_pair(work_root, wheel_a)
-    return _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
+
+def _cleanup_published_pair(
+    work_descriptor: int,
+    created: list[tuple[str, int, int | None]],
+) -> None:
+    for directory_name, directory_descriptor, file_descriptor in reversed(created):
+        if file_descriptor is not None:
+            try:
+                current_file = os.stat(
+                    _PRODUCER_FILENAME,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                opened_file = os.fstat(file_descriptor)
+                if _identity(current_file) == _identity(opened_file):
+                    os.unlink(
+                        _PRODUCER_FILENAME,
+                        dir_fd=directory_descriptor,
+                    )
+                    os.fsync(directory_descriptor)
+            except OSError:
+                pass
+            os.close(file_descriptor)
+        try:
+            current = os.stat(
+                directory_name,
+                dir_fd=work_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(directory_descriptor)
+            if _identity(current) == _identity(opened):
+                os.rmdir(directory_name, dir_fd=work_descriptor)
+        except OSError:
+            pass
+        os.close(directory_descriptor)
+    try:
+        os.fsync(work_descriptor)
+    except OSError:
+        pass
+
+
+def _publish_pair(
+    work_descriptor: int,
+    work_pin: _DirectoryPin,
+    empty_inventory: _DirectoryInventory,
+    wheel: bytes,
+    source_root: Path,
+    source_attestation: _SourceAttestation,
+) -> None:
+    _recheck_work_root(work_descriptor, work_pin, empty_inventory)
+    _recheck_source_attestation(source_root, source_attestation)
+    created: list[tuple[str, int, int | None]] = []
+    expected_files: dict[str, _Fingerprint] = {}
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        for directory_name in ("wheel-a", "wheel-b"):
+            os.mkdir(directory_name, mode=0o755, dir_fd=work_descriptor)
+            try:
+                directory_descriptor = os.open(
+                    directory_name,
+                    flags,
+                    dir_fd=work_descriptor,
+                )
+            except Exception:
+                os.rmdir(directory_name, dir_fd=work_descriptor)
+                raise
+            created.append((directory_name, directory_descriptor, None))
+            os.fchmod(directory_descriptor, 0o755)
+            file_descriptor, expected_file = _write_frozen_file_at(
+                directory_descriptor,
+                _PRODUCER_FILENAME,
+                wheel,
+            )
+            created[-1] = (directory_name, directory_descriptor, file_descriptor)
+            expected_files[directory_name] = expected_file
+            _directory, entries = _directory_inventory_fd(
+                directory_descriptor,
+                f"{directory_name} output",
+            )
+            if entries != {_PRODUCER_FILENAME: expected_file}:
+                raise ProducerBuildError(
+                    "producer wheel output inventory changed during publication"
+                )
+        _recheck_work_root_identity(work_descriptor, work_pin)
+        _work, work_entries = _directory_inventory_fd(work_descriptor, "work root")
+        if set(work_entries) != {"wheel-a", "wheel-b"}:
+            raise ProducerBuildError("work root inventory changed during publication")
+        for directory_name, directory_descriptor, file_descriptor in created:
+            if file_descriptor is None:
+                raise ProducerBuildError("producer output file was not pinned")
+            opened = os.fstat(directory_descriptor)
+            entry = work_entries[directory_name]
+            if entry[2] != stat.S_IFDIR or entry[:2] != _identity(opened):
+                raise ProducerBuildError(
+                    "producer output directory identity changed during publication"
+                )
+            _directory, entries = _directory_inventory_fd(
+                directory_descriptor,
+                f"{directory_name} output",
+            )
+            authenticated = _authenticate_open_file(
+                file_descriptor,
+                wheel,
+                f"{directory_name} producer wheel",
+            )
+            current = os.stat(
+                _PRODUCER_FILENAME,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                entries != {_PRODUCER_FILENAME: expected_files[directory_name]}
+                or authenticated != expected_files[directory_name]
+                or _fingerprint(current) != authenticated
+            ):
+                raise ProducerBuildError(
+                    "producer wheel output changed during publication"
+                )
+        os.fsync(work_descriptor)
+        _recheck_work_root_identity(work_descriptor, work_pin)
+        _recheck_source_attestation(source_root, source_attestation)
+    except Exception:
+        _cleanup_published_pair(work_descriptor, created)
+        raise
+    for _directory_name, directory_descriptor, file_descriptor in created:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(directory_descriptor)
+
+
+def _run(source_root: Path, build_python: Path, work_root: Path) -> tuple[str, str, int]:
+    source_identity = _identity(_require_directory(source_root, "source root"))
+    _require_build_python(build_python)
+    work_descriptor, work_pin, empty_inventory = _prepare_work_root(
+        work_root,
+        source_root,
+    )
+    try:
+        source_attestation = _source_attestation(source_root)
+        snapshot = _source_snapshot(source_root)
+        _recheck_source_attestation(source_root, source_attestation)
+        _recheck_work_root(work_descriptor, work_pin, empty_inventory)
+        if _identity(_require_directory(source_root, "source root")) != source_identity:
+            raise ProducerBuildError("source root identity changed during snapshot")
+        _validate_pyproject(snapshot["pyproject.toml"])
+        requirements = _read_source_root_file(
+            source_root,
+            "requirements.lock",
+            "requirements.lock",
+        )
+        _recheck_source_attestation(source_root, source_attestation)
+        _recheck_work_root(work_descriptor, work_pin, empty_inventory)
+        if _identity(_require_directory(source_root, "source root")) != source_identity:
+            raise ProducerBuildError("source root identity changed during snapshot")
+        _validate_requirements_lock(requirements)
+        provenance = _provenance(snapshot, requirements)
+
+        with tempfile.TemporaryDirectory(
+            prefix=".sfep-build-",
+            dir="/tmp",
+        ) as temporary:
+            temporary_root = Path(temporary)
+            stage_a = temporary_root / "stage-a"
+            stage_b = temporary_root / "stage-b"
+            _materialize_stage(stage_a, snapshot, provenance)
+            _materialize_stage(stage_b, snapshot, provenance)
+            wheel_a = _build_once(build_python, stage_a, temporary_root / "out-a")
+            wheel_b = _build_once(build_python, stage_b, temporary_root / "out-b")
+            if wheel_a != wheel_b:
+                raise ProducerBuildError("independent producer wheel bytes differ")
+        _recheck_source_attestation(source_root, source_attestation)
+        _publish_pair(
+            work_descriptor,
+            work_pin,
+            empty_inventory,
+            wheel_a,
+            source_root,
+            source_attestation,
+        )
+        return _source_digest(snapshot), _sha256_uri(wheel_a), len(wheel_a)
+    finally:
+        os.close(work_descriptor)
 
 
 def main(argv: list[str] | None = None) -> int:

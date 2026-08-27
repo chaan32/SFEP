@@ -10,10 +10,13 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import tempfile
 from typing import Callable
 import warnings
 import zipfile
@@ -238,6 +241,8 @@ def _rewrite_wheel(
 
 
 def _mutated_wheel(wheel: Path, case: str) -> bytes:
+    if case.startswith(("local-", "eocd-", "central-")) or case == "unclaimed-gap":
+        return _mutated_raw_zip(wheel, case)
     metadata_path = "sfep_equipment_quality-1.0.0.dist-info/METADATA"
     wheel_path = "sfep_equipment_quality-1.0.0.dist-info/WHEEL"
     record_path = "sfep_equipment_quality-1.0.0.dist-info/RECORD"
@@ -327,6 +332,95 @@ def _mutated_wheel(wheel: Path, case: str) -> bytes:
         archive_comment=archive_comment,
         mutate_info=mutate_info,
     )
+
+
+def _mutated_raw_zip(wheel: Path, case: str) -> bytes:
+    payload = bytearray(wheel.read_bytes())
+    assert payload[:4] == b"PK\x03\x04"
+    if case == "local-timestamp":
+        struct.pack_into("<H", payload, 12, 0)
+    elif case == "local-method":
+        struct.pack_into("<H", payload, 8, zipfile.ZIP_STORED)
+    elif case == "local-crc":
+        crc = struct.unpack_from("<I", payload, 14)[0]
+        struct.pack_into("<I", payload, 14, crc ^ 1)
+    elif case == "local-compressed-size":
+        size = struct.unpack_from("<I", payload, 18)[0]
+        struct.pack_into("<I", payload, 18, size + 1)
+    elif case == "local-uncompressed-size":
+        size = struct.unpack_from("<I", payload, 22)[0]
+        struct.pack_into("<I", payload, 22, size + 1)
+    elif case == "local-data-descriptor":
+        flags = struct.unpack_from("<H", payload, 6)[0]
+        struct.pack_into("<H", payload, 6, flags | 0x0008)
+    elif case == "local-encryption":
+        flags = struct.unpack_from("<H", payload, 6)[0]
+        struct.pack_into("<H", payload, 6, flags | 0x0001)
+    elif case == "unclaimed-gap":
+        eocd_offset = len(payload) - 22
+        assert payload[eocd_offset:eocd_offset + 4] == b"PK\x05\x06"
+        central_offset = struct.unpack_from("<I", payload, eocd_offset + 16)[0]
+        gap = b"unclaimed"
+        payload[central_offset:central_offset] = gap
+        struct.pack_into(
+            "<I",
+            payload,
+            eocd_offset + len(gap) + 16,
+            central_offset + len(gap),
+        )
+    elif case == "eocd-disk":
+        struct.pack_into("<H", payload, len(payload) - 22 + 4, 1)
+    elif case == "eocd-central-size":
+        eocd_offset = len(payload) - 22
+        central_size = struct.unpack_from("<I", payload, eocd_offset + 12)[0]
+        struct.pack_into("<I", payload, eocd_offset + 12, central_size + 1)
+    elif case == "central-needed-version":
+        central_offset = struct.unpack_from("<I", payload, len(payload) - 22 + 16)[0]
+        struct.pack_into("<H", payload, 4, 21)
+        struct.pack_into("<H", payload, central_offset + 6, 21)
+    elif case == "central-internal-attribute":
+        central_offset = struct.unpack_from("<I", payload, len(payload) - 22 + 16)[0]
+        struct.pack_into("<H", payload, central_offset + 36, 1)
+    elif case == "central-external-low-bits":
+        central_offset = struct.unpack_from("<I", payload, len(payload) - 22 + 16)[0]
+        attributes = struct.unpack_from("<I", payload, central_offset + 38)[0]
+        struct.pack_into("<I", payload, central_offset + 38, attributes | 1)
+    else:
+        raise AssertionError(f"unknown raw ZIP mutation: {case}")
+    return bytes(payload)
+
+
+def _zip_with_false_end_signature_in_compressed_data() -> bytes:
+    data = bytearray(b"A" * 80)
+    data[8:12] = b"PK\x05\x06"
+
+    def render() -> bytes:
+        output = io.BytesIO()
+        info = _new_zip_info("x")
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=0,
+        ) as archive:
+            archive.writestr(
+                info,
+                bytes(data),
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=0,
+            )
+        return output.getvalue()
+
+    payload = render()
+    false_offset = payload.index(b"PK\x05\x06")
+    assert false_offset != len(payload) - 22
+    pseudo_comment_size = len(payload) - false_offset - 22
+    data[28:30] = struct.pack("<H", pseudo_comment_size)
+    payload = render()
+    assert struct.unpack_from("<H", payload, false_offset + 20)[0] == (
+        len(payload) - false_offset - 22
+    )
+    return payload
 
 
 @pytest.fixture(scope="module")
@@ -432,6 +526,16 @@ def test_producer_tools_import_only_the_standard_library() -> None:
         assert imported <= sys.stdlib_module_names
 
 
+def test_raw_zip_layout_uses_the_exact_tail_end_record() -> None:
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    payload = _zip_with_false_end_signature_in_compressed_data()
+
+    records = namespace["_raw_zip_layout"](payload)
+
+    assert len(records) == 1
+    assert records[0]["filename"] == b"x"
+
+
 def test_build_stages_one_snapshot_twice_without_mutating_source(
     tmp_path: Path,
     build_python: Path,
@@ -484,6 +588,88 @@ def test_build_stages_one_snapshot_twice_without_mutating_source(
             assert stat.S_IMODE(mode) == expected_mode
 
 
+def test_build_uses_safe_interpreter_cwd_and_allowlisted_environment(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    caller_cwd = tmp_path / "caller-cwd"
+    caller_pythonpath = tmp_path / "caller-pythonpath"
+    caller_cwd.mkdir()
+    caller_pythonpath.mkdir()
+    cwd_marker = tmp_path / "cwd-build-imported"
+    pythonpath_marker = tmp_path / "pythonpath-build-imported"
+    for directory, marker in (
+        (caller_cwd, cwd_marker),
+        (caller_pythonpath, pythonpath_marker),
+    ):
+        (directory / "build.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('imported', encoding='utf-8')\n"
+            "raise SystemExit(97)\n",
+            encoding="utf-8",
+        )
+    invocation_log = tmp_path / "build-python-invocations.jsonl"
+    wrapper = build_python.parent / "recording-python"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"with Path({str(invocation_log)!r}).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), "
+        "'environment': dict(os.environ)}, sort_keys=True) + '\\n')\n"
+        f"os.execv({str(build_python)!r}, [{str(build_python)!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    caller_environment = {
+        **os.environ,
+        "PYTHONPATH": str(caller_pythonpath),
+        "SFEP_AMBIENT_BUILD_VARIABLE": "must-not-leak",
+        "SETUPTOOLS_SCM_PRETEND_VERSION": "9.9.9",
+    }
+    work_root = tmp_path / "isolated-work"
+
+    result = run_producer_build(
+        source,
+        wrapper,
+        work_root,
+        cwd=caller_cwd,
+        env=caller_environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not cwd_marker.exists()
+    assert not pythonpath_marker.exists()
+    invocations = [
+        json.loads(line)
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(invocations) == 2
+    allowed_environment = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "PIP_NO_INDEX",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "SOURCE_DATE_EPOCH",
+        "TMPDIR",
+        "TZ",
+    }
+    for invocation in invocations:
+        assert invocation["argv"][:4] == ["-P", "-s", "-m", "build"]
+        assert Path(invocation["cwd"]).name in {"stage-a", "stage-b"}
+        assert set(invocation["environment"]) <= allowed_environment
+        assert invocation["environment"]["PYTHONHASHSEED"] == "0"
+        assert invocation["environment"]["SOURCE_DATE_EPOCH"] == "1735689600"
+
+
 def test_source_mutation_changes_provenance_not_the_source_tree(
     tmp_path: Path,
     build_python: Path,
@@ -504,6 +690,68 @@ def test_source_mutation_changes_provenance_not_the_source_tree(
     assert not (source / PROVENANCE_PATH).exists()
 
 
+@pytest.mark.parametrize("tool", ("build_producer.py", "seal_producer_build.py"))
+@pytest.mark.parametrize(
+    "case",
+    ("post-scandir-addition", "file-replacement", "directory-replacement"),
+)
+def test_source_snapshot_rejects_persistent_inventory_and_identity_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    case: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    package = source / "equipment_quality"
+    namespace = runpy.run_path(str(TOOLS_ROOT / tool))
+    module_globals = namespace["_source_snapshot"].__globals__
+    error_type = module_globals[
+        "ProducerBuildError" if tool == "build_producer.py" else "ProducerSealError"
+    ]
+    injected = False
+    if case == "post-scandir-addition":
+        real_scandir = os.scandir
+        package_identity = (os.lstat(package).st_dev, os.lstat(package).st_ino)
+
+        def adding_scandir(path: os.PathLike[str] | str | int):
+            nonlocal injected
+            scanner = real_scandir(path)
+            result = os.fstat(path) if isinstance(path, int) else os.lstat(path)
+            if not injected and (result.st_dev, result.st_ino) == package_identity:
+                entries = list(scanner)
+                scanner.close()
+                (package / "late.py").write_bytes(b"LATE = True\n")
+                injected = True
+                return iter(entries)
+            return scanner
+
+        monkeypatch.setattr(module_globals["os"], "scandir", adding_scandir)
+    else:
+        real_read = module_globals["_read_regular_once"]
+        target = package / "__init__.py"
+
+        def replacing_read(path: Path, label: str, *arguments: object) -> bytes:
+            nonlocal injected
+            if not injected and Path(path) == target:
+                if case == "file-replacement":
+                    replacement = package / ".replacement"
+                    shutil.copy2(target, replacement)
+                    os.replace(replacement, target)
+                else:
+                    original = source / "equipment_quality-original"
+                    package.rename(original)
+                    shutil.copytree(original, package)
+                injected = True
+            return real_read(path, label, *arguments)
+
+        module_globals["_read_regular_once"] = replacing_read
+
+    with pytest.raises(error_type, match="changed|inventory|identity"):
+        namespace["_source_snapshot"](source)
+
+    assert injected
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     (
@@ -512,6 +760,7 @@ def test_source_mutation_changes_provenance_not_the_source_tree(
         ("symlink-python", "build Python"),
         ("nonempty-work", "empty"),
         ("source-overlap", "overlap"),
+        ("case-aliased-source-overlap", "overlap"),
         ("source-symlink-entry", "symlink"),
         ("source-provenance", "provenance"),
     ),
@@ -541,6 +790,14 @@ def test_build_rejects_unsafe_inputs_without_claimed_wheel_pair(
         (work_root / "occupied").write_bytes(b"occupied")
     elif case == "source-overlap":
         work_root = source / "work"
+    elif case == "case-aliased-source-overlap":
+        aliased_source = source.with_name(source.name.swapcase())
+        if not aliased_source.exists() or not os.path.samefile(
+            aliased_source,
+            source,
+        ):
+            pytest.skip("requires a case-insensitive filesystem")
+        work_root = aliased_source / "work"
     elif case == "source-symlink-entry":
         (source / "equipment_quality/link.py").symlink_to(
             source / "equipment_quality/__init__.py"
@@ -558,6 +815,147 @@ def test_build_rejects_unsafe_inputs_without_claimed_wheel_pair(
     assert result.returncode != 0
     assert message.casefold() in result.stderr.casefold()
     assert not (work_root / "wheel-a" / PRODUCER_FILENAME).exists()
+    assert not (work_root / "wheel-b" / PRODUCER_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("symlink-to-source", "directory-replacement", "persistent-addition"),
+)
+def test_build_rechecks_the_pinned_work_root_before_any_output_write(
+    tmp_path: Path,
+    build_python: Path,
+    case: str,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = tmp_path / "work"
+    if case != "symlink-to-source":
+        work_root.mkdir()
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    real_snapshot = module_globals["_source_snapshot"]
+    mutated = False
+
+    def mutating_snapshot(path: Path) -> dict[str, bytes]:
+        nonlocal mutated
+        snapshot = real_snapshot(path)
+        if case == "persistent-addition":
+            (work_root / "late").write_bytes(b"late")
+        else:
+            if work_root.exists() or work_root.is_symlink():
+                work_root.rename(tmp_path / "original-work")
+            if case == "symlink-to-source":
+                work_root.symlink_to(source, target_is_directory=True)
+            else:
+                work_root.mkdir()
+        mutated = True
+        return snapshot
+
+    module_globals["_source_snapshot"] = mutating_snapshot
+
+    with pytest.raises(error_type, match="changed|empty|identity|safe|symlink"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert mutated
+    assert not (source / "wheel-a" / PRODUCER_FILENAME).exists()
+    assert not (source / "wheel-b" / PRODUCER_FILENAME).exists()
+    assert not list(tmp_path.rglob(".sfep-build-*"))
+
+
+def test_build_rejects_an_ancestor_symlink_retargeted_into_the_source(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    link = tmp_path / "work-link"
+    link.symlink_to(safe, target_is_directory=True)
+    work_root = link / "work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    real_paths_overlap = module_globals["_paths_overlap"]
+    retargeted = False
+
+    def retargeting_paths_overlap(first: Path, second: Path) -> bool:
+        nonlocal retargeted
+        overlap = real_paths_overlap(first, second)
+        if not retargeted and not overlap:
+            link.unlink()
+            link.symlink_to(source / "equipment_quality", target_is_directory=True)
+            retargeted = True
+        return overlap
+
+    module_globals["_paths_overlap"] = retargeting_paths_overlap
+
+    with pytest.raises(error_type, match="overlap|safe|symlink"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert retargeted
+    assert not (source / "equipment_quality/work").exists()
+    assert not list(tmp_path.rglob(".sfep-build-*"))
+
+
+def test_build_rechecks_the_authenticated_source_before_publishing(
+    tmp_path: Path,
+    build_python: Path,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = tmp_path / "work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    target = source / "equipment_quality/__init__.py"
+    builds = 0
+
+    def mutating_build(*_arguments: object) -> bytes:
+        nonlocal builds
+        builds += 1
+        if builds == 2:
+            target.write_bytes(target.read_bytes() + b"# late mutation\n")
+        return b"identical test wheel"
+
+    module_globals["_build_once"] = mutating_build
+
+    with pytest.raises(error_type, match="source|changed|inventory|identity"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert builds == 2
+    assert not (work_root / "wheel-a").exists()
+    assert not (work_root / "wheel-b").exists()
+
+
+def test_build_rejects_replaced_output_instead_of_adopting_its_fingerprint(
+    tmp_path: Path,
+    build_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_source_root(tmp_path / "analysis-copy")
+    work_root = tmp_path / "work"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "build_producer.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerBuildError"]
+    real_utime = os.utime
+    injected = False
+
+    def replacing_utime(*arguments: object, **keywords: object) -> None:
+        nonlocal injected
+        target = work_root / "wheel-a" / PRODUCER_FILENAME
+        if not injected and target.exists():
+            replacement = target.with_name("replacement.whl")
+            replacement.write_bytes(b"attacker replacement")
+            os.replace(replacement, target)
+            injected = True
+        real_utime(*arguments, **keywords)
+
+    monkeypatch.setattr(module_globals["os"], "utime", replacing_utime)
+
+    with pytest.raises(error_type, match="changed|identity|output"):
+        module_globals["_run"](source, build_python, work_root)
+
+    assert injected
     assert not (work_root / "wheel-b" / PRODUCER_FILENAME).exists()
 
 
@@ -619,6 +1017,72 @@ def test_build_seal_publishes_only_an_authenticated_identical_pair(
     )
 
 
+def test_build_seal_rechecks_the_authenticated_source_through_publication(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+) -> None:
+    source = _copy_seal_source_root(tmp_path / "analysis-copy")
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    producer_lock = tmp_path / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_authenticate_locks = module_globals["_authenticate_locks"]
+    target = source / "equipment_quality/__init__.py"
+    mutated = False
+
+    def mutating_authenticate_locks(path: Path) -> dict[str, bytes]:
+        nonlocal mutated
+        locks = real_authenticate_locks(path)
+        target.write_bytes(target.read_bytes() + b"# late mutation\n")
+        mutated = True
+        return locks
+
+    module_globals["_authenticate_locks"] = mutating_authenticate_locks
+
+    with pytest.raises(error_type, match="source|changed|inventory|identity"):
+        module_globals["_run"](
+            source,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert mutated
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+    assert not producer_lock.exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+def test_publication_normalizes_output_modes_under_a_restrictive_umask(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    previous_umask = os.umask(0o777)
+    try:
+        namespace["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(os.lstat(wheelhouse / PRODUCER_FILENAME).st_mode) == 0o644
+    assert stat.S_IMODE(os.lstat(producer_lock).st_mode) == 0o644
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     (
@@ -634,6 +1098,19 @@ def test_build_seal_publishes_only_an_authenticated_identical_pair(
         ("timestamp", "timestamp"),
         ("mode", "mode"),
         ("archive-comment", "comment"),
+        ("local-timestamp", "local"),
+        ("local-method", "local"),
+        ("local-crc", "local"),
+        ("local-compressed-size", "local"),
+        ("local-uncompressed-size", "local"),
+        ("local-data-descriptor", "local"),
+        ("local-encryption", "local"),
+        ("unclaimed-gap", "unclaimed"),
+        ("eocd-disk", "disk"),
+        ("eocd-central-size", "unclaimed"),
+        ("central-needed-version", "version"),
+        ("central-internal-attribute", "attribute"),
+        ("central-external-low-bits", "attribute"),
         ("metadata-name", "metadata"),
         ("metadata-version", "metadata"),
         ("wheel-tag", "wheel metadata"),
@@ -760,6 +1237,460 @@ def test_build_seal_requires_physically_independent_wheel_inputs(
 
 
 @pytest.mark.parametrize(
+    "case",
+    (
+        "lock-in-wheelhouse",
+        "lock-in-wheel-a",
+        "lock-equals-wheel-b",
+        "lock-in-source-package",
+        "wheelhouse-is-wheel-a",
+        "wheelhouse-under-wheel-a",
+        "wheelhouse-under-case-aliased-wheel-a",
+    ),
+)
+def test_build_seal_rejects_overlapping_input_and_lock_paths_before_mutation(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    source = ANALYSIS_ROOT
+    producer_lock = tmp_path / "producer.lock"
+    if case == "lock-in-wheelhouse":
+        producer_lock = wheelhouse / "producer.lock"
+    elif case == "lock-in-wheel-a":
+        producer_lock = wheel_a.parent / "producer.lock"
+    elif case == "lock-equals-wheel-b":
+        producer_lock = wheel_b.parent
+    elif case == "lock-in-source-package":
+        source = _copy_seal_source_root(tmp_path / "analysis-copy")
+        producer_lock = source / "equipment_quality/producer.lock"
+    elif case == "wheelhouse-is-wheel-a":
+        wheelhouse = wheel_a.parent
+    elif case == "wheelhouse-under-wheel-a":
+        wheelhouse = _copy_third_party_wheelhouse(wheel_a.parent / "wheelhouse")
+    elif case == "wheelhouse-under-case-aliased-wheel-a":
+        aliased_wheel_dir = wheel_a.parent.with_name(wheel_a.parent.name.swapcase())
+        if not aliased_wheel_dir.exists() or not os.path.samefile(
+            aliased_wheel_dir,
+            wheel_a.parent,
+        ):
+            pytest.skip("requires a case-insensitive filesystem")
+        wheelhouse = _copy_third_party_wheelhouse(aliased_wheel_dir / "wheelhouse")
+    wheel_a_before = wheel_a.read_bytes()
+    wheel_b_before = wheel_b.read_bytes()
+    wheelhouse_before = sorted(path.name for path in wheelhouse.iterdir())
+
+    result = run_build_seal(
+        source,
+        wheel_a.parent,
+        wheel_b.parent,
+        wheelhouse,
+        producer_lock,
+    )
+
+    assert result.returncode != 0
+    assert "disjoint" in result.stderr.casefold()
+    assert wheel_a.read_bytes() == wheel_a_before
+    assert wheel_b.read_bytes() == wheel_b_before
+    assert sorted(path.name for path in wheelhouse.iterdir()) == wheelhouse_before
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+def test_build_seal_allows_the_normal_lock_inside_the_source_root(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+) -> None:
+    source = _copy_seal_source_root(tmp_path / "analysis-copy")
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    producer_lock = source / "producer.lock"
+
+    result = run_build_seal(
+        source,
+        wheel_a.parent,
+        wheel_b.parent,
+        wheelhouse,
+        producer_lock,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert producer_lock.read_bytes() == _expected_producer_lock(wheel_a)
+    assert (wheelhouse / PRODUCER_FILENAME).read_bytes() == wheel_a.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wheel-a-directory-replacement",
+        "wheelhouse-directory-replacement",
+        "lock-parent-directory-replacement",
+        "wheel-a-addition",
+        "wheel-b-file-replacement",
+        "wheelhouse-file-replacement",
+        "lock-parent-addition",
+    ),
+)
+def test_build_seal_rechecks_directory_pins_immediately_before_publication(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_preflight = module_globals["_preflight_outputs"]
+    mutated = False
+
+    def replacing_preflight(*arguments: object) -> bool:
+        nonlocal mutated
+        result = real_preflight(*arguments)
+        if case.endswith("directory-replacement"):
+            target = {
+                "wheel-a-directory-replacement": wheel_a.parent,
+                "wheelhouse-directory-replacement": wheelhouse,
+                "lock-parent-directory-replacement": lock_parent,
+            }[case]
+            original = target.with_name(target.name + "-original")
+            target.rename(original)
+            shutil.copytree(original, target)
+        elif case == "wheel-a-addition":
+            (wheel_a.parent / "late.whl").write_bytes(b"late")
+        elif case == "wheel-b-file-replacement":
+            replacement = wheel_b.with_name("replacement.whl")
+            shutil.copy2(wheel_b, replacement)
+            os.replace(replacement, wheel_b)
+        elif case == "wheelhouse-file-replacement":
+            target = wheelhouse / THIRD_PARTY_WHEELS[0][2]
+            replacement = wheelhouse / "replacement.whl"
+            shutil.copy2(target, replacement)
+            os.replace(replacement, target)
+        else:
+            (lock_parent / "late").write_bytes(b"late")
+        mutated = True
+        return result
+
+    module_globals["_preflight_outputs"] = replacing_preflight
+
+    with pytest.raises(error_type, match="changed|identity|inventory|physical"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert mutated
+    assert not producer_lock.exists()
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("wheelhouse", "lock-parent", "wheel-a-addition", "wheel-b-file-replacement"),
+)
+def test_build_seal_binds_publication_to_the_verified_parent_directories(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_publish = module_globals["_publish_no_clobber"]
+    target = {
+        "wheelhouse": wheelhouse,
+        "lock-parent": lock_parent,
+    }.get(case)
+    original = (
+        target.with_name(target.name + "-original")
+        if target is not None
+        else None
+    )
+    swapped = False
+
+    def swapping_publish(*arguments: object, **keywords: object) -> None:
+        nonlocal swapped
+        if case in {"wheelhouse", "lock-parent"}:
+            assert target is not None and original is not None
+            target.rename(original)
+            shutil.copytree(original, target)
+        elif case == "wheel-a-addition":
+            (wheel_a.parent / "late.whl").write_bytes(b"late")
+        else:
+            replacement = wheel_b.with_name("replacement.whl")
+            shutil.copy2(wheel_b, replacement)
+            os.replace(replacement, wheel_b)
+        swapped = True
+        real_publish(*arguments, **keywords)
+
+    module_globals["_publish_no_clobber"] = swapping_publish
+
+    with pytest.raises(error_type, match="changed|identity|physical"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert swapped
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+    if case == "wheelhouse":
+        assert original is not None
+        assert not (original / PRODUCER_FILENAME).exists()
+    assert not producer_lock.exists()
+    if case == "lock-parent":
+        assert original is not None
+        assert not (original / "producer.lock").exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+def test_build_seal_rechecks_authenticated_outputs_before_reporting_reuse(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    producer_lock = tmp_path / "producer.lock"
+    created = run_build_seal(
+        ANALYSIS_ROOT,
+        wheel_a.parent,
+        wheel_b.parent,
+        wheelhouse,
+        producer_lock,
+    )
+    assert created.returncode == 0, created.stderr
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_preflight = module_globals["_preflight_outputs"]
+    published = wheelhouse / PRODUCER_FILENAME
+    replaced = False
+
+    def replacing_preflight(*arguments: object) -> bool:
+        nonlocal replaced
+        result = real_preflight(*arguments)
+        replacement = wheelhouse / "replacement.whl"
+        replacement.write_bytes(b"stale")
+        os.replace(replacement, published)
+        replaced = True
+        return result
+
+    module_globals["_preflight_outputs"] = replacing_preflight
+
+    with pytest.raises(error_type, match="changed|identity|inventory"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert replaced
+    assert published.read_bytes() == b"stale"
+    assert producer_lock.read_bytes() == _expected_producer_lock(wheel_a)
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+@pytest.mark.parametrize("case", ("wheel-temp", "lock-temp"))
+def test_publication_rejects_a_temp_inode_mutated_after_link(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_link = os.link
+    calls = 0
+
+    def mutating_link(
+        source_name: str,
+        target_name: str,
+        *arguments: object,
+        **keywords: object,
+    ) -> None:
+        nonlocal calls
+        real_link(source_name, target_name, *arguments, **keywords)
+        calls += 1
+        expected_call = 1 if case == "wheel-temp" else 2
+        if calls == expected_call:
+            descriptor = os.open(
+                source_name,
+                os.O_WRONLY | os.O_TRUNC,
+                dir_fd=keywords["src_dir_fd"],
+            )
+            try:
+                os.write(descriptor, b"corrupt")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    monkeypatch.setattr(module_globals["os"], "link", mutating_link)
+
+    with pytest.raises(error_type, match="changed|authenticated|payload|temporary"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert calls >= (1 if case == "wheel-temp" else 2)
+    assert not (wheelhouse / PRODUCER_FILENAME).exists()
+    assert not producer_lock.exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+def test_publication_rollback_does_not_delete_a_replaced_target(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_link = os.link
+    calls = 0
+    wheelhouse_descriptor: int | None = None
+
+    def replacing_link(
+        source_name: str,
+        target_name: str,
+        *arguments: object,
+        **keywords: object,
+    ) -> None:
+        nonlocal calls, wheelhouse_descriptor
+        real_link(source_name, target_name, *arguments, **keywords)
+        calls += 1
+        if calls == 1:
+            wheelhouse_descriptor = int(keywords["dst_dir_fd"])
+        elif calls == 2:
+            assert wheelhouse_descriptor is not None
+            external = ".external-replacement"
+            descriptor = os.open(
+                external,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=wheelhouse_descriptor,
+            )
+            try:
+                os.write(descriptor, b"external")
+            finally:
+                os.close(descriptor)
+            os.replace(
+                external,
+                PRODUCER_FILENAME,
+                src_dir_fd=wheelhouse_descriptor,
+                dst_dir_fd=wheelhouse_descriptor,
+            )
+
+    monkeypatch.setattr(module_globals["os"], "link", replacing_link)
+
+    with pytest.raises(error_type, match="changed|collision|identity"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert (wheelhouse / PRODUCER_FILENAME).read_bytes() == b"external"
+    assert not producer_lock.exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+@pytest.mark.parametrize("case", ("wheel-content", "wheelhouse-swap"))
+def test_publication_rechecks_paths_and_payloads_after_temp_cleanup(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    lock_parent.mkdir()
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_run"].__globals__
+    error_type = module_globals["ProducerSealError"]
+    real_unlink_owned = module_globals["_unlink_owned_name"]
+    original_wheelhouse = tmp_path / "wheelhouse-original"
+    injected = False
+
+    def injecting_unlink(
+        parent_descriptor: int,
+        name: str,
+        owner_descriptor: int,
+    ) -> bool:
+        nonlocal injected
+        result = real_unlink_owned(parent_descriptor, name, owner_descriptor)
+        if not injected and name.startswith(".sfep-producer-"):
+            if case == "wheel-content":
+                descriptor = os.open(
+                    PRODUCER_FILENAME,
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    os.write(descriptor, b"corrupt after cleanup")
+                finally:
+                    os.close(descriptor)
+            else:
+                wheelhouse.rename(original_wheelhouse)
+                shutil.copytree(original_wheelhouse, wheelhouse)
+            injected = True
+        return result
+
+    module_globals["_unlink_owned_name"] = injecting_unlink
+
+    with pytest.raises(error_type, match="changed|identity|physical|payload"):
+        module_globals["_run"](
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+
+    assert injected
+    if case == "wheel-content":
+        assert not (wheelhouse / PRODUCER_FILENAME).exists()
+    else:
+        assert not (original_wheelhouse / PRODUCER_FILENAME).exists()
+    assert not producer_lock.exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
+
+
+@pytest.mark.parametrize(
     ("case", "message"),
     (
         ("missing-wheel", "inventory"),
@@ -856,3 +1787,101 @@ def test_build_seal_refuses_stale_outputs_without_overwrite(
     assert "existing producer" in result.stderr.casefold()
     assert (producer_lock.read_bytes() if producer_lock.exists() else None) == lock_before
     assert (published.read_bytes() if published.exists() else None) == wheel_before
+
+
+@pytest.mark.parametrize("failure", ("second-mkstemp", "second-write", "second-fsync"))
+def test_publication_cleans_both_temps_when_the_second_temp_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    wheelhouse = tmp_path / "wheelhouse"
+    lock_parent = tmp_path / "lock-parent"
+    wheelhouse.mkdir()
+    lock_parent.mkdir()
+    target_wheel = wheelhouse / PRODUCER_FILENAME
+    producer_lock = lock_parent / "producer.lock"
+    namespace = runpy.run_path(str(TOOLS_ROOT / "seal_producer_build.py"))
+    module_globals = namespace["_publish_no_clobber"].__globals__
+    calls = 0
+    if failure == "second-mkstemp":
+        real_operation = tempfile.mkstemp
+
+        def failing_operation(*arguments: object, **keywords: object):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PermissionError("injected second mkstemp failure")
+            return real_operation(*arguments, **keywords)
+
+        monkeypatch.setattr(module_globals["tempfile"], "mkstemp", failing_operation)
+    elif failure == "second-write":
+        real_operation = os.write
+
+        def failing_operation(*arguments: object, **keywords: object):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected second write failure")
+            return real_operation(*arguments, **keywords)
+
+        monkeypatch.setattr(module_globals["os"], "write", failing_operation)
+    else:
+        real_operation = os.fsync
+
+        def failing_operation(*arguments: object, **keywords: object):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected second fsync failure")
+            return real_operation(*arguments, **keywords)
+
+        monkeypatch.setattr(module_globals["os"], "fsync", failing_operation)
+
+    with pytest.raises(OSError, match="injected"):
+        module_globals["_publish_no_clobber"](
+            target_wheel,
+            producer_lock,
+            b"wheel bytes",
+            b"lock bytes\n",
+        )
+
+    assert calls >= 2
+    assert not target_wheel.exists()
+    assert not producer_lock.exists()
+    assert not list(wheelhouse.glob(".sfep-producer-*"))
+    assert not list(lock_parent.glob(".sfep-producer-*"))
+
+
+@pytest.mark.parametrize("case", ("read-only", "missing", "file-parent"))
+def test_build_seal_bad_lock_parent_leaves_no_temp_or_output_residue(
+    tmp_path: Path,
+    producer_wheel_pair: tuple[Path, Path],
+    case: str,
+) -> None:
+    wheel_a, wheel_b = _copy_wheel_pair(tmp_path / "pair", producer_wheel_pair)
+    wheelhouse = _copy_third_party_wheelhouse(tmp_path / "wheelhouse")
+    lock_parent = tmp_path / "lock-parent"
+    if case == "read-only":
+        lock_parent.mkdir(mode=0o555)
+    elif case == "file-parent":
+        lock_parent.write_bytes(b"not a directory\n")
+    producer_lock = lock_parent / "producer.lock"
+    wheelhouse_before = sorted(path.name for path in wheelhouse.iterdir())
+
+    try:
+        result = run_build_seal(
+            ANALYSIS_ROOT,
+            wheel_a.parent,
+            wheel_b.parent,
+            wheelhouse,
+            producer_lock,
+        )
+    finally:
+        if case == "read-only":
+            lock_parent.chmod(0o755)
+
+    assert result.returncode != 0
+    assert sorted(path.name for path in wheelhouse.iterdir()) == wheelhouse_before
+    assert not producer_lock.exists()
+    assert not list(tmp_path.rglob(".sfep-producer-*"))
