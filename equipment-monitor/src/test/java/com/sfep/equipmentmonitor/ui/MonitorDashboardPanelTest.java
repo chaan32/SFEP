@@ -29,13 +29,16 @@ import com.sfep.equipmentmonitor.state.MonitorUpdate;
 import org.junit.jupiter.api.Test;
 
 import javax.swing.AbstractButton;
+import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JPanel;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.SwingUtilities;
 import javax.swing.event.TableModelEvent;
+import java.awt.Color;
 import java.awt.Component;
 import java.awt.Container;
 import java.time.Duration;
@@ -51,6 +54,87 @@ import static org.junit.jupiter.api.Assertions.assertTimeout;
 class MonitorDashboardPanelTest {
     private static final String BUNDLE = "sha256:" + "a".repeat(64);
     private static final String CRITERIA = "sha256:" + "b".repeat(64);
+
+    @Test
+    void presentsRiskSummaryCardsThatUpdateFromTheLatestMaterialStates() throws Exception {
+        Fixture fixture = panel();
+
+        fixture.panel.acceptUpdate(overviewRiskUpdate());
+        onEdt(() -> { });
+
+        assertThat(onEdt(() -> component(
+                fixture.panel, "summary-severe-value", JLabel.class).getText())).isEqualTo("1");
+        assertThat(onEdt(() -> component(
+                fixture.panel, "summary-caution-value", JLabel.class).getText())).isEqualTo("1");
+        assertThat(onEdt(() -> component(
+                fixture.panel, "summary-quality-danger-value", JLabel.class).getText())).isEqualTo("1");
+        assertThat(onEdt(() -> component(
+                fixture.panel, "summary-material-value", JLabel.class).getText())).isEqualTo("4");
+        assertThat(onEdt(() -> visibleText(component(
+                fixture.panel, "priority-risk-panel", JPanel.class))))
+                .contains("■ 심한 설비 편차", "▲ 주의 설비 편차", "■ 조기 품질 위험", "재생된 소재");
+    }
+
+    @Test
+    void putsTheMostUrgentMaterialAtTheTopWithoutChangingOverviewColumns() throws Exception {
+        Fixture fixture = panel();
+        fixture.panel.acceptUpdate(overviewRiskUpdate());
+        onEdt(() -> { });
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+
+        assertThat(onEdt(() -> overview.getValueAt(0, columnOf(overview, "소재"))))
+                .isEqualTo("mat-danger");
+        assertThat(columnNames(overview)).containsExactly(
+                "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
+                "소재", "공정 단계", "설비", "재생 시각");
+    }
+
+    @Test
+    void explainsTheSelectedMaterialWithPlainLanguageAndAnExplicitAction() throws Exception {
+        Fixture fixture = panel();
+        fixture.panel.acceptUpdate(overviewRiskUpdate());
+        onEdt(() -> { });
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+
+        onEdt(() -> overview.setRowSelectionInterval(0, 0));
+
+        String detail = onEdt(() -> component(
+                fixture.panel, "overview-selection-detail", JLabel.class).getText());
+        assertThat(detail).contains(
+                "mat-danger", "즉시 확인 필요", "설비 운전범위: 심한 편차", "조기 품질 위험: 위험");
+    }
+
+    @Test
+    void treatsMissingApFeedbackAsEvidenceThatNeedsReview() throws Exception {
+        Fixture fixture = panel();
+        fixture.panel.acceptUpdate(overviewRiskUpdate());
+        onEdt(() -> { });
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+
+        int normalRow = rowOf(overview, "소재", "mat-normal");
+        onEdt(() -> overview.setRowSelectionInterval(normalRow, normalRow));
+
+        String detail = onEdt(() -> component(
+                fixture.panel, "overview-selection-detail", JLabel.class).getText());
+        assertThat(detail).contains(
+                "mat-normal", "판정 근거 확인 필요", "AP 후행 품질: 근거 부족");
+    }
+
+    @Test
+    void appliesPoscoPrimaryColourAndComfortableTableDensity() throws Exception {
+        Fixture fixture = panel();
+        JButton start = onEdt(() -> componentWithText(fixture.panel, "시작", JButton.class));
+        JPanel brandHeader = onEdt(() -> component(
+                fixture.panel, "brand-header", JPanel.class));
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+
+        assertThat(onEdt(() -> start.getBackground())).isEqualTo(Color.decode("#05507D"));
+        assertThat(onEdt(() -> start.getForeground())).isEqualTo(Color.WHITE);
+        assertThat(onEdt(() -> brandHeader.getBackground())).isEqualTo(Color.decode("#05507D"));
+        assertThat(onEdt(() -> overview.getRowHeight())).isGreaterThanOrEqualTo(36);
+        assertThat(onEdt(() -> overview.getShowHorizontalLines())).isFalse();
+        assertThat(onEdt(() -> overview.getShowVerticalLines())).isFalse();
+    }
 
     @Test
     void rendersHistoricalReplayModeFiveTabsAndSealedManagementMetadataWithoutLiveClaims() throws Exception {
@@ -268,6 +352,59 @@ class MonitorDashboardPanelTest {
     }
 
     @Test
+    void publishesOneOverviewModelEventForOneCoalescedMaterialBatch() throws Exception {
+        RecordingUpdateScheduler scheduler = new RecordingUpdateScheduler();
+        Fixture fixture = panel(scheduler);
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+        List<TableModelEvent> modelEvents = new CopyOnWriteArrayList<>();
+        onEdt(() -> overview.getModel().addTableModelListener(modelEvents::add));
+
+        for (int sequence = 1; sequence <= 100; sequence++) {
+            fixture.panel.acceptUpdate(sequencedUpdate(sequence, List.of()));
+        }
+        onEdt(scheduler::runNext);
+
+        assertThat(modelEvents).hasSize(1);
+        assertThat(modelEvents.getFirst().getType()).isEqualTo(TableModelEvent.INSERT);
+        assertThat(modelEvents.getFirst().getFirstRow()).isZero();
+        assertThat(modelEvents.getFirst().getLastRow()).isEqualTo(99);
+    }
+
+    @Test
+    void preservesSelectedMaterialAndSorterWhenABatchChangesItsPriority() throws Exception {
+        RecordingUpdateScheduler scheduler = new RecordingUpdateScheduler();
+        Fixture fixture = panel(scheduler);
+        fixture.panel.acceptUpdate(sequencedUpdate(1, RiskGrade.NORMAL));
+        fixture.panel.acceptUpdate(sequencedUpdate(2, RiskGrade.NORMAL));
+        onEdt(scheduler::runNext);
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+        Object originalModel = overview.getModel();
+        Object originalSorter = overview.getRowSorter();
+        int selectedRow = rowOf(overview, "소재", "mat-00002");
+        onEdt(() -> overview.setRowSelectionInterval(selectedRow, selectedRow));
+        List<TableModelEvent> modelEvents = new CopyOnWriteArrayList<>();
+        onEdt(() -> overview.getModel().addTableModelListener(modelEvents::add));
+
+        fixture.panel.acceptUpdate(sequencedUpdate(2, RiskGrade.DANGER));
+        for (int sequence = 3; sequence <= 52; sequence++) {
+            fixture.panel.acceptUpdate(sequencedUpdate(sequence, RiskGrade.NORMAL));
+        }
+        onEdt(scheduler::runNext);
+
+        assertThat(modelEvents).hasSize(1);
+        assertThat(modelEvents.getFirst().getType()).isEqualTo(TableModelEvent.UPDATE);
+        assertThat(modelEvents.getFirst().getFirstRow()).isZero();
+        assertThat(modelEvents.getFirst().getLastRow()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(overview.getModel()).isSameAs(originalModel);
+        assertThat(overview.getRowSorter()).isSameAs(originalSorter);
+        assertThat(overview.getValueAt(
+                overview.getSelectedRow(), columnOf(overview, "소재"))).isEqualTo("mat-00002");
+        assertThat(overview.getValueAt(0, columnOf(overview, "소재"))).isEqualTo("mat-00002");
+        assertThat(rowOf(overview, "소재", "mat-00003"))
+                .isLessThan(rowOf(overview, "소재", "mat-00052"));
+    }
+
+    @Test
     void preservesFirstSeenUnitOrderWhenCoalescingLatestMaterialState() throws Exception {
         RecordingUpdateScheduler scheduler = new RecordingUpdateScheduler();
         Fixture fixture = panel(scheduler);
@@ -482,21 +619,33 @@ class MonitorDashboardPanelTest {
         ReplayUnit unit = new ReplayUnit(
                 "batch-1", "FURNACE_CHARGED", "2025-02-03", 14,
                 "HOUR", "HOUR", events, false);
-        return new MonitorUpdate(unit, 1, 4, Map.of(
-                "mat-normal", material("mat-normal", List.of(range(RangeStatus.TYPICAL)),
-                        List.of(), RiskGrade.NORMAL, RiskGrade.INSUFFICIENT_EVIDENCE),
-                "mat-missing", material("mat-missing", List.of(range(RangeStatus.DATA_MISSING)),
-                        List.of(), RiskGrade.INSUFFICIENT_EVIDENCE, RiskGrade.INSUFFICIENT_EVIDENCE),
-                "mat-caution", material("mat-caution", List.of(
-                                range(RangeStatus.DATA_MISSING), range(RangeStatus.CAUTION)),
-                        List.of(), RiskGrade.CAUTION, RiskGrade.NORMAL),
-                "mat-danger", material("mat-danger", List.of(
-                                range(RangeStatus.DATA_MISSING), range(RangeStatus.CAUTION),
-                                range(RangeStatus.SEVERE)),
-                        List.of(), RiskGrade.DANGER, RiskGrade.CAUTION)), Map.of(), List.of());
+        Map<String, MaterialSnapshot> materials = new java.util.LinkedHashMap<>();
+        materials.put("mat-normal", material("mat-normal", List.of(range(RangeStatus.TYPICAL)),
+                List.of(), RiskGrade.NORMAL, RiskGrade.INSUFFICIENT_EVIDENCE));
+        materials.put("mat-missing", material("mat-missing", List.of(range(RangeStatus.DATA_MISSING)),
+                List.of(), RiskGrade.INSUFFICIENT_EVIDENCE, RiskGrade.INSUFFICIENT_EVIDENCE));
+        materials.put("mat-caution", material("mat-caution", List.of(
+                        range(RangeStatus.DATA_MISSING), range(RangeStatus.CAUTION)),
+                List.of(), RiskGrade.CAUTION, RiskGrade.NORMAL));
+        materials.put("mat-danger", material("mat-danger", List.of(
+                        range(RangeStatus.DATA_MISSING), range(RangeStatus.CAUTION),
+                        range(RangeStatus.SEVERE)),
+                List.of(), RiskGrade.DANGER, RiskGrade.CAUTION));
+        return new MonitorUpdate(unit, 1, 4, materials, Map.of(), List.of());
     }
 
     private static MonitorUpdate sequencedUpdate(int sequence, List<HistoricalAlert> alerts) {
+        return sequencedUpdate(sequence, RiskGrade.NORMAL, alerts);
+    }
+
+    private static MonitorUpdate sequencedUpdate(int sequence, RiskGrade grade) {
+        return sequencedUpdate(sequence, grade, List.of());
+    }
+
+    private static MonitorUpdate sequencedUpdate(
+            int sequence,
+            RiskGrade grade,
+            List<HistoricalAlert> alerts) {
         String materialKey = "mat-" + String.format("%05d", sequence);
         ReplayEvent event = event("evt-" + sequence, materialKey, "FURNACE_1");
         ReplayUnit unit = new ReplayUnit(
@@ -504,7 +653,7 @@ class MonitorDashboardPanelTest {
                 "HOUR", "HOUR", List.of(event), false);
         return new MonitorUpdate(
                 unit, sequence, sequence,
-                Map.of(materialKey, material(materialKey, RiskGrade.NORMAL)), Map.of(), alerts);
+                Map.of(materialKey, material(materialKey, grade)), Map.of(), alerts);
     }
 
     private static MonitorUpdate evidenceUpdate() {

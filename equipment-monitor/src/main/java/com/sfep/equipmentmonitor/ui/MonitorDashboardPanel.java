@@ -30,15 +30,19 @@ import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
+import javax.swing.RowSorter;
+import javax.swing.SortOrder;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.GridLayout;
 import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -74,7 +78,7 @@ public final class MonitorDashboardPanel extends JPanel {
     private final JLabel unitNotice = new JLabel("시간대 데이터를 재생하면 처리 묶음이 표시됩니다.");
     private final ReadOnlyTableModel overviewModel = model(
             "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
-            "소재", "공정 단계", "설비", "재생 시각");
+            "소재", "공정 단계", "설비", "재생 시각", "우선순위");
     private final ReadOnlyTableModel equipmentModel = model(
             "설비 유형", "설비 ID", "공정 단계", "재생 시각", "시간대 소재 수", "소재별 대표 관측값");
     private final ReadOnlyTableModel equipmentMaterialModel = model(
@@ -90,6 +94,7 @@ public final class MonitorDashboardPanel extends JPanel {
     private final ReadOnlyTableModel definitionModel = model(
             "구분", "규칙 ID", "최초 공개 단계", "설비", "대상", "기준 수준", "정의/위험구간");
     private final Map<String, Integer> overviewRows = new LinkedHashMap<>();
+    private final Map<String, MaterialSnapshot> latestMaterials = new LinkedHashMap<>();
     private final LinkedHashMap<String, EvidenceRow> retainedEvidenceRows = new LinkedHashMap<>();
     private final List<HistoricalAlert> allAlerts = new ArrayList<>();
     private final Set<String> historyDates = new LinkedHashSet<>();
@@ -100,12 +105,19 @@ public final class MonitorDashboardPanel extends JPanel {
     private final JComboBox<String> historyEquipmentFilter = new JComboBox<>(new String[]{ALL});
     private final JComboBox<String> historyMaterialFilter = new JComboBox<>(new String[]{ALL});
     private final JComboBox<String> historyGradeFilter = new JComboBox<>(new String[]{ALL});
+    private final JLabel severeSummary = summaryValue("summary-severe-value");
+    private final JLabel cautionSummary = summaryValue("summary-caution-value");
+    private final JLabel qualityDangerSummary = summaryValue("summary-quality-danger-value");
+    private final JLabel materialSummary = summaryValue("summary-material-value");
+    private final JLabel overviewSelectionDetail = new JLabel(
+            "표에서 소재를 선택하면 판정 의미와 우선 확인 항목을 쉽게 설명합니다.");
     private final Timer stateRefreshTimer;
     private boolean updatingHistoryFilters;
     private PendingUpdates pendingUpdates;
     private boolean updateDrainScheduled;
     private boolean acceptingUpdates = true;
     private int replayedMaterialCountRow = -1;
+    private JTable overviewTable;
 
     public MonitorDashboardPanel(MonitorDashboardMetadata metadata, ReplayControl replayControl) {
         this(metadata, replayControl, SwingUtilities::invokeLater);
@@ -115,18 +127,16 @@ public final class MonitorDashboardPanel extends JPanel {
             MonitorDashboardMetadata metadata,
             ReplayControl replayControl,
             UpdateScheduler updateScheduler) {
-        super(new BorderLayout(0, 10));
+        super(new BorderLayout(0, 14));
         this.replayControl = Objects.requireNonNull(replayControl, "replayControl");
         this.updateScheduler = Objects.requireNonNull(updateScheduler, "updateScheduler");
         Objects.requireNonNull(metadata, "metadata");
-        setBorder(BorderFactory.createEmptyBorder(14, 16, 14, 16));
-        setBackground(new Color(245, 247, 250));
+        setBorder(BorderFactory.createEmptyBorder(18, 20, 16, 20));
+        setBackground(MonitorUiTheme.PAGE);
 
         add(header(), BorderLayout.NORTH);
         add(tabs(metadata), BorderLayout.CENTER);
-        add(new JLabel("운전범위 · ● 전형 범위   ▲ 주의 편차   ■ 심한 편차   ? 근거 부족"
-                        + "    품질 · ● 정상   ▲ 주의   ■ 위험   ? 근거 부족   ! 데이터 오류"),
-                BorderLayout.SOUTH);
+        add(legend(), BorderLayout.SOUTH);
 
         refreshReplayState();
         stateRefreshTimer = new Timer(300, ignored -> refreshReplayState());
@@ -179,15 +189,26 @@ public final class MonitorDashboardPanel extends JPanel {
         header.setOpaque(false);
         header.setLayout(new BoxLayout(header, BoxLayout.Y_AXIS));
 
-        JPanel title = new JPanel(new BorderLayout());
-        title.setOpaque(false);
-        JLabel mode = new JLabel("과거 데이터 재생 · HISTORICAL_REPLAY");
-        mode.setFont(mode.getFont().deriveFont(Font.BOLD, 21f));
-        title.add(mode, BorderLayout.WEST);
+        JPanel title = MonitorUiTheme.brandCard(new BorderLayout(20, 0));
+        title.setName("brand-header");
+        title.setBorder(MonitorUiTheme.cardPadding(18, 22, 18, 22));
+        JPanel titleCopy = new JPanel();
+        titleCopy.setOpaque(false);
+        titleCopy.setLayout(new BoxLayout(titleCopy, BoxLayout.Y_AXIS));
+        titleCopy.add(MonitorUiTheme.label("SFEP 설비·품질 모니터", 23, Font.BOLD, Color.WHITE));
+        titleCopy.add(Box.createVerticalStrut(5));
+        titleCopy.add(MonitorUiTheme.label(
+                "과거 데이터 재생 · HISTORICAL_REPLAY", 13, Font.BOLD,
+                new Color(0xD7, 0xEB, 0xF5)));
+        title.add(titleCopy, BorderLayout.WEST);
         replayStatus.setName("replay-status");
         replayStatus.setHorizontalAlignment(SwingConstants.RIGHT);
+        replayStatus.setForeground(Color.WHITE);
+        replayStatus.setFont(MonitorUiTheme.preferredFont(Font.BOLD, 14));
         title.add(replayStatus, BorderLayout.EAST);
 
+        JPanel controlCard = MonitorUiTheme.card(new BorderLayout());
+        controlCard.setBorder(MonitorUiTheme.cardPadding(12, 16, 12, 16));
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 7, 5));
         controls.setOpaque(false);
         controls.add(button("시작", replayControl::start));
@@ -196,38 +217,119 @@ public final class MonitorDashboardPanel extends JPanel {
         controls.add(button("한 단계", replayControl::step));
         controls.add(button("정지", replayControl::stop));
         controls.add(Box.createHorizontalStrut(8));
-        controls.add(new JLabel("속도"));
+        controls.add(MonitorUiTheme.label("재생 속도", 13, Font.BOLD, MonitorUiTheme.TEXT_MUTED));
         JComboBox<ReplaySpeed> speed = new JComboBox<>(ReplaySpeed.values());
         speed.setName("replay-speed");
         speed.setSelectedItem(ReplaySpeed.X1);
         speed.addActionListener(ignored -> runControl(
                 () -> replayControl.setSpeed((ReplaySpeed) speed.getSelectedItem())));
+        MonitorUiTheme.combo(speed);
         controls.add(speed);
         controls.add(Box.createHorizontalStrut(8));
         controls.add(button("다음 날짜", replayControl::advanceToNextDate));
+        styleTimelineLabel(replayDate);
         controls.add(replayDate);
         controls.add(Box.createHorizontalStrut(16));
+        styleTimelineLabel(progress);
         controls.add(progress);
 
-        unitNotice.setBorder(BorderFactory.createEmptyBorder(3, 5, 3, 5));
+        JPanel context = new JPanel(new BorderLayout(12, 0));
+        context.setOpaque(false);
+        context.setBorder(BorderFactory.createEmptyBorder(2, 8, 0, 8));
+        unitNotice.setForeground(MonitorUiTheme.TEXT_MUTED);
+        unitNotice.setFont(MonitorUiTheme.preferredFont(Font.PLAIN, 13));
         replayFailureDetails.setName("replay-failure-details");
-        replayFailureDetails.setBorder(BorderFactory.createEmptyBorder(3, 5, 3, 5));
+        replayFailureDetails.setForeground(MonitorUiTheme.DANGER);
+        replayFailureDetails.setFont(MonitorUiTheme.preferredFont(Font.BOLD, 13));
+        context.add(unitNotice, BorderLayout.WEST);
+        context.add(replayFailureDetails, BorderLayout.EAST);
+        controlCard.add(controls, BorderLayout.CENTER);
+        controlCard.add(context, BorderLayout.SOUTH);
         header.add(title);
-        header.add(controls);
-        header.add(unitNotice);
-        header.add(replayFailureDetails);
+        header.add(Box.createVerticalStrut(12));
+        header.add(controlCard);
         return header;
     }
 
     private JTabbedPane tabs(MonitorDashboardMetadata metadata) {
         JTabbedPane tabs = new JTabbedPane();
         tabs.setName("monitor-tabs");
-        tabs.addTab("전체 현황", tablePanel("소재별 최근 공개 공정 상태", overviewModel, "overview-table"));
+        MonitorUiTheme.tabs(tabs);
+        tabs.addTab("전체 현황", overviewTab());
         tabs.addTab("설비 상세", equipmentTab());
         tabs.addTab("위험 근거", evidenceTab());
         tabs.addTab("이력 조회", historyTab());
         tabs.addTab("관리 기준", managementTab(metadata));
         return tabs;
+    }
+
+    private JPanel overviewTab() {
+        JPanel panel = new JPanel(new BorderLayout(0, 12));
+        panel.setOpaque(false);
+        panel.add(summaryCards(), BorderLayout.NORTH);
+        panel.add(tablePanel(
+                "확인이 필요한 소재가 위에 표시됩니다. 행을 선택하면 아래에서 의미를 설명합니다.",
+                overviewModel,
+                "overview-table"), BorderLayout.CENTER);
+
+        JPanel explanation = MonitorUiTheme.card(new BorderLayout(12, 0));
+        explanation.setBorder(MonitorUiTheme.cardPadding(14, 18, 14, 18));
+        JLabel title = MonitorUiTheme.label("선택 항목 해석", 14, Font.BOLD, MonitorUiTheme.POSCO_BLUE);
+        overviewSelectionDetail.setName("overview-selection-detail");
+        overviewSelectionDetail.setForeground(MonitorUiTheme.TEXT);
+        overviewSelectionDetail.setFont(MonitorUiTheme.preferredFont(Font.PLAIN, 13));
+        explanation.add(title, BorderLayout.WEST);
+        explanation.add(overviewSelectionDetail, BorderLayout.CENTER);
+        panel.add(explanation, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JPanel summaryCards() {
+        JPanel cards = new JPanel(new GridLayout(1, 4, 12, 0));
+        cards.setName("priority-risk-panel");
+        cards.setOpaque(false);
+        cards.add(summaryCard(
+                "■ 심한 설비 편차", severeSummary,
+                "즉시 설비 상태 확인", MonitorUiTheme.DANGER, MonitorUiTheme.DANGER_TINT));
+        cards.add(summaryCard(
+                "▲ 주의 설비 편차", cautionSummary,
+                "변화 추이를 계속 관찰", MonitorUiTheme.CAUTION, MonitorUiTheme.CAUTION_TINT));
+        cards.add(summaryCard(
+                "■ 조기 품질 위험", qualityDangerSummary,
+                "과거 품질 결과와 연결", MonitorUiTheme.DANGER, MonitorUiTheme.DANGER_TINT));
+        cards.add(summaryCard(
+                "재생된 소재", materialSummary,
+                "현재까지 공개된 고유 소재", MonitorUiTheme.POSCO_BLUE,
+                new Color(0xE8, 0xF4, 0xFA)));
+        return cards;
+    }
+
+    private static JPanel summaryCard(
+            String title,
+            JLabel value,
+            String caption,
+            Color accent,
+            Color tint) {
+        JPanel card = MonitorUiTheme.card(new BorderLayout(8, 0));
+        card.setBorder(MonitorUiTheme.cardPadding(14, 16, 14, 16));
+        JPanel marker = new JPanel();
+        marker.setBackground(accent);
+        marker.setPreferredSize(new Dimension(5, 1));
+        card.add(marker, BorderLayout.WEST);
+        JPanel copy = new JPanel();
+        copy.setOpaque(false);
+        copy.setLayout(new BoxLayout(copy, BoxLayout.Y_AXIS));
+        JLabel heading = MonitorUiTheme.label(title, 13, Font.BOLD, accent);
+        heading.setOpaque(true);
+        heading.setBackground(tint);
+        heading.setBorder(BorderFactory.createEmptyBorder(3, 7, 3, 7));
+        copy.add(heading);
+        copy.add(Box.createVerticalStrut(8));
+        copy.add(value);
+        copy.add(Box.createVerticalStrut(3));
+        copy.add(MonitorUiTheme.label(caption, 12, Font.PLAIN, MonitorUiTheme.TEXT_MUTED));
+        card.add(copy, BorderLayout.CENTER);
+        return card;
     }
 
     private JPanel evidenceTab() {
@@ -238,13 +340,16 @@ public final class MonitorDashboardPanel extends JPanel {
                 "evidence-table");
         JLabel note = new JLabel(
                 "설비 관측 범위와 품질 위험 연결 근거는 서로 다른 축이며 직접 원인을 뜻하지 않습니다.");
-        note.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+        note.setBorder(BorderFactory.createEmptyBorder(8, 4, 2, 4));
+        note.setForeground(MonitorUiTheme.TEXT_MUTED);
+        note.setFont(MonitorUiTheme.preferredFont(Font.PLAIN, 12));
         panel.add(note, BorderLayout.SOUTH);
         return panel;
     }
 
     private JPanel equipmentTab() {
-        JPanel panel = new JPanel(new java.awt.GridLayout(2, 1, 0, 8));
+        JPanel panel = new JPanel(new GridLayout(2, 1, 0, 12));
+        panel.setOpaque(false);
         panel.add(tablePanel(
                 "현재 시간대 설비 요약이며 시간대 내부 소재 순서를 뜻하지 않습니다.",
                 equipmentModel, "equipment-table"));
@@ -257,9 +362,13 @@ public final class MonitorDashboardPanel extends JPanel {
     private JPanel historyTab() {
         JPanel panel = tablePanel(ASSOCIATION_NOTICE, historyModel, "history-table");
         JPanel header = new JPanel();
+        header.setOpaque(false);
         header.setLayout(new BoxLayout(header, BoxLayout.Y_AXIS));
-        header.add(new JLabel(ASSOCIATION_NOTICE));
+        JLabel notice = MonitorUiTheme.label(
+                ASSOCIATION_NOTICE, 12, Font.PLAIN, MonitorUiTheme.TEXT_MUTED);
+        header.add(notice);
         JPanel filters = new JPanel(new FlowLayout(FlowLayout.LEFT, 7, 3));
+        filters.setOpaque(false);
         configureFilter(historyDateFilter, "history-date-filter", "날짜", filters);
         configureFilter(historyEquipmentFilter, "history-equipment-filter", "설비", filters);
         configureFilter(historyMaterialFilter, "history-material-filter", "소재", filters);
@@ -275,10 +384,11 @@ public final class MonitorDashboardPanel extends JPanel {
             String label,
             JPanel parent) {
         filter.setName(name);
+        MonitorUiTheme.combo(filter);
         filter.addActionListener(ignored -> {
             if (!updatingHistoryFilters) rebuildHistory();
         });
-        parent.add(new JLabel(label));
+        parent.add(MonitorUiTheme.label(label, 13, Font.BOLD, MonitorUiTheme.TEXT_MUTED));
         parent.add(filter);
     }
 
@@ -314,7 +424,8 @@ public final class MonitorDashboardPanel extends JPanel {
                 })
                 .toList());
 
-        JPanel panel = new JPanel(new java.awt.GridLayout(2, 1, 0, 8));
+        JPanel panel = new JPanel(new GridLayout(2, 1, 0, 12));
+        panel.setOpaque(false);
         panel.add(tablePanel(
                 "화면의 식별자·해시·감사 집계는 로드 시 검증된 봉인 번들의 값입니다.",
                 managementModel, "management-table"));
@@ -324,17 +435,22 @@ public final class MonitorDashboardPanel extends JPanel {
         return panel;
     }
 
-    private static JPanel tablePanel(String description, DefaultTableModel model, String name) {
-        JPanel panel = new JPanel(new BorderLayout(0, 8));
-        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
-        JLabel label = new JLabel(description);
+    private JPanel tablePanel(String description, DefaultTableModel model, String name) {
+        JPanel panel = MonitorUiTheme.card(new BorderLayout(0, 10));
+        panel.setBorder(MonitorUiTheme.cardPadding(14, 16, 16, 16));
+        JLabel label = MonitorUiTheme.label(description, 13, Font.PLAIN, MonitorUiTheme.TEXT_MUTED);
         panel.add(label, BorderLayout.NORTH);
         JTable table = new JTable(model);
         table.setName(name);
-        table.setAutoCreateRowSorter(true);
+        table.setAutoCreateRowSorter(!"overview-table".equals(name));
         table.setFillsViewportHeight(true);
-        table.setRowHeight(24);
+        table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        table.getTableHeader().setReorderingAllowed(false);
+        MonitorUiTheme.table(table);
+        configureColumnWidths(table);
+        if ("overview-table".equals(name)) configureOverviewTable(table);
         JScrollPane scroll = new JScrollPane(table);
+        MonitorUiTheme.scrollPane(scroll);
         scroll.setPreferredSize(new Dimension(1100, 500));
         panel.add(scroll, BorderLayout.CENTER);
         return panel;
@@ -342,8 +458,82 @@ public final class MonitorDashboardPanel extends JPanel {
 
     private JButton button(String text, Runnable operation) {
         JButton button = new JButton(text);
+        switch (text) {
+            case "시작" -> MonitorUiTheme.primaryButton(button);
+            case "일시정지", "재개", "다음 날짜" -> MonitorUiTheme.secondaryButton(button);
+            default -> MonitorUiTheme.quietButton(button);
+        }
         button.addActionListener(ignored -> runControl(operation));
         return button;
+    }
+
+    private JPanel legend() {
+        JPanel legend = MonitorUiTheme.card(new FlowLayout(FlowLayout.LEFT, 14, 7));
+        legend.setBorder(MonitorUiTheme.cardPadding(5, 12, 5, 12));
+        legend.add(MonitorUiTheme.label("판정 안내", 12, Font.BOLD, MonitorUiTheme.POSCO_BLUE));
+        legend.add(legendItem("운전범위 · ● 전형 범위", MonitorUiTheme.SUCCESS));
+        legend.add(legendItem("▲ 주의 편차", MonitorUiTheme.CAUTION));
+        legend.add(legendItem("■ 심한 편차", MonitorUiTheme.DANGER));
+        legend.add(legendItem("품질 · ● 정상", MonitorUiTheme.SUCCESS));
+        legend.add(legendItem("▲ 주의", MonitorUiTheme.CAUTION));
+        legend.add(legendItem("■ 위험", MonitorUiTheme.DANGER));
+        legend.add(legendItem("? 근거 부족", MonitorUiTheme.TEXT_MUTED));
+        legend.add(legendItem("! 데이터 오류", MonitorUiTheme.DANGER));
+        return legend;
+    }
+
+    private static JLabel legendItem(String text, Color colour) {
+        JLabel label = MonitorUiTheme.label(text, 12, Font.BOLD, colour);
+        label.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+        return label;
+    }
+
+    private static JLabel summaryValue(String name) {
+        JLabel value = MonitorUiTheme.label("0", 27, Font.BOLD, MonitorUiTheme.TEXT);
+        value.setName(name);
+        return value;
+    }
+
+    private static void styleTimelineLabel(JLabel label) {
+        label.setForeground(MonitorUiTheme.TEXT);
+        label.setFont(MonitorUiTheme.preferredFont(Font.BOLD, 13));
+        label.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(MonitorUiTheme.LINE, 1, true),
+                BorderFactory.createEmptyBorder(7, 10, 7, 10)));
+    }
+
+    private void configureOverviewTable(JTable table) {
+        overviewTable = table;
+        int priorityModelColumn = overviewModel.findColumn("우선순위");
+        TableRowSorter<DefaultTableModel> sorter = new TableRowSorter<>(overviewModel);
+        sorter.setComparator(priorityModelColumn,
+                Comparator.comparingInt(value -> ((Number) value).intValue()));
+        sorter.setSortKeys(List.of(
+                new RowSorter.SortKey(priorityModelColumn, SortOrder.ASCENDING)));
+        sorter.setSortsOnUpdates(true);
+        table.setRowSorter(sorter);
+        table.removeColumn(table.getColumn("우선순위"));
+        table.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
+        table.getSelectionModel().addListSelectionListener(event -> {
+            if (!event.getValueIsAdjusting()) renderSelectedMaterial(table);
+        });
+    }
+
+    private static void configureColumnWidths(JTable table) {
+        for (int column = 0; column < table.getColumnCount(); column++) {
+            String name = table.getColumnName(column);
+            int width = switch (name) {
+                case "상태", "판정", "운전범위 판정", "설비 운전범위",
+                        "조기 품질 위험", "AP 후행 품질 확인" -> 145;
+                case "소재", "규칙 ID", "필드", "항목/규칙", "대상" -> 170;
+                case "설비", "설비 유형", "설비 ID", "공정 단계", "최초 공개 단계" -> 175;
+                case "재생 시각", "기준 수준", "시간대 내부 순서" -> 160;
+                case "공개 대표값", "소재별 대표 관측값", "정의/위험구간" -> 280;
+                case "발견구간 통계", "확인구간 통계", "해석", "설명", "봉인된 값" -> 360;
+                default -> 130;
+            };
+            table.getColumnModel().getColumn(column).setPreferredWidth(width);
+        }
     }
 
     private void runControl(Runnable operation) {
@@ -408,7 +598,8 @@ public final class MonitorDashboardPanel extends JPanel {
                 + " 시간대 / " + number(update.eventsProcessed) + " 이벤트");
         unitNotice.setText(unitNotice(update.lastUnit));
 
-        update.changedMaterials.values().forEach(this::upsertMaterial);
+        upsertMaterials(update.changedMaterials.values());
+        refreshSummaryCards();
         replaceCurrentEquipmentDetails(update.lastChangedMaterials, update.lastChangedEquipment);
         retainEvidence(update.evidenceRows.values());
         retainAlertEvidence(update.alerts);
@@ -417,21 +608,95 @@ public final class MonitorDashboardPanel extends JPanel {
         renderReplayState(state);
     }
 
-    private void upsertMaterial(MaterialSnapshot material) {
-        Object[] row = {
-                operatingRangeSymbol(material.rangeEvaluations()),
-                symbol(material.qualityRisk()),
-                symbol(material.historicalEvidenceRisk()),
-                material.materialKey(),
-                stageLabel(material.eventStage()),
-                equipmentLabel(material.equipmentType(), material.equipmentId()),
-                replayTime(material.replayDate(), material.replayHour())
-        };
-        upsert(overviewModel, overviewRows, material.materialKey(), row);
+    private void upsertMaterials(Iterable<MaterialSnapshot> materials) {
+        String selectedMaterial = selectedOverviewMaterial();
+        Map<Integer, Object[]> replacements = new LinkedHashMap<>();
+        List<Object[]> additions = new ArrayList<>();
+        for (MaterialSnapshot material : materials) {
+            Object[] row = {
+                    operatingRangeSymbol(material.rangeEvaluations()),
+                    symbol(material.qualityRisk()),
+                    symbol(material.historicalEvidenceRisk()),
+                    material.materialKey(),
+                    stageLabel(material.eventStage()),
+                    equipmentLabel(material.equipmentType(), material.equipmentId()),
+                    replayTime(material.replayDate(), material.replayHour()),
+                    actionPriority(material)
+            };
+            Integer modelRow = overviewRows.get(material.materialKey());
+            if (modelRow == null) {
+                overviewRows.put(material.materialKey(), overviewRows.size());
+                additions.add(row);
+            } else {
+                replacements.put(modelRow, row);
+            }
+            latestMaterials.put(material.materialKey(), material);
+        }
+        overviewModel.applyRows(replacements, additions);
+        restoreOverviewSelection(selectedMaterial);
         if (replayedMaterialCountRow >= 0) {
             managementModel.setValueAt(
                     number(overviewRows.size()), replayedMaterialCountRow, 2);
         }
+    }
+
+    private String selectedOverviewMaterial() {
+        if (overviewTable == null || overviewTable.getSelectedRow() < 0) return null;
+        int modelRow = overviewTable.convertRowIndexToModel(overviewTable.getSelectedRow());
+        return String.valueOf(overviewModel.getValueAt(modelRow, 3));
+    }
+
+    private void restoreOverviewSelection(String materialKey) {
+        if (materialKey == null || overviewTable == null) return;
+        Integer modelRow = overviewRows.get(materialKey);
+        if (modelRow == null) return;
+        int viewRow = overviewTable.convertRowIndexToView(modelRow);
+        if (viewRow >= 0) overviewTable.setRowSelectionInterval(viewRow, viewRow);
+    }
+
+    private void refreshSummaryCards() {
+        long severe = latestMaterials.values().stream()
+                .filter(material -> material.rangeEvaluations().stream()
+                        .anyMatch(value -> value.status() == RangeStatus.SEVERE))
+                .count();
+        long caution = latestMaterials.values().stream()
+                .filter(material -> material.rangeEvaluations().stream()
+                        .noneMatch(value -> value.status() == RangeStatus.SEVERE))
+                .filter(material -> material.rangeEvaluations().stream()
+                        .anyMatch(value -> value.status() == RangeStatus.CAUTION))
+                .count();
+        long qualityDanger = latestMaterials.values().stream()
+                .filter(material -> material.qualityRisk() == RiskGrade.DANGER)
+                .count();
+        severeSummary.setText(number(severe));
+        cautionSummary.setText(number(caution));
+        qualityDangerSummary.setText(number(qualityDanger));
+        materialSummary.setText(number(latestMaterials.size()));
+    }
+
+    private void renderSelectedMaterial(JTable table) {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
+            overviewSelectionDetail.setText(
+                    "표에서 소재를 선택하면 판정 의미와 우선 확인 항목을 쉽게 설명합니다.");
+            return;
+        }
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        String range = String.valueOf(overviewModel.getValueAt(modelRow, 0));
+        String quality = String.valueOf(overviewModel.getValueAt(modelRow, 1));
+        String ap = String.valueOf(overviewModel.getValueAt(modelRow, 2));
+        String material = String.valueOf(overviewModel.getValueAt(modelRow, 3));
+        int priority = ((Number) overviewModel.getValueAt(modelRow, 7)).intValue();
+        String action = switch (priority) {
+            case 0 -> "즉시 확인 필요";
+            case 1 -> "주의 관찰 필요";
+            case 2 -> "판정 근거 확인 필요";
+            default -> "현재 우선 확인 대상 아님";
+        };
+        overviewSelectionDetail.setText("<html><b>" + html(material) + " · " + action + "</b>"
+                + " &nbsp; 설비 운전범위: " + html(plainStatus(range))
+                + " &nbsp; 조기 품질 위험: " + html(plainStatus(quality))
+                + " &nbsp; AP 후행 품질: " + html(plainStatus(ap)) + "</html>");
     }
 
     private void replaceCurrentEquipmentDetails(
@@ -568,22 +833,6 @@ public final class MonitorDashboardPanel extends JPanel {
                 ASSOCIATION_NOTICE));
     }
 
-    private static void upsert(
-            DefaultTableModel model,
-            Map<String, Integer> rows,
-            String key,
-            Object[] values) {
-        Integer row = rows.get(key);
-        if (row == null) {
-            rows.put(key, model.getRowCount());
-            model.addRow(values);
-            return;
-        }
-        for (int column = 0; column < values.length; column++) {
-            model.setValueAt(values[column], row, column);
-        }
-    }
-
     private static String unitNotice(ReplayUnit unit) {
         int materials = unit.events().size();
         if (!unit.orderedWithinUnit()) {
@@ -669,6 +918,44 @@ public final class MonitorDashboardPanel extends JPanel {
             return "● 전형 범위";
         }
         return "? 근거 부족";
+    }
+
+    private static int actionPriority(MaterialSnapshot material) {
+        boolean severe = material.rangeEvaluations().stream()
+                .anyMatch(value -> value.status() == RangeStatus.SEVERE);
+        boolean caution = material.rangeEvaluations().stream()
+                .anyMatch(value -> value.status() == RangeStatus.CAUTION);
+        if (severe || material.qualityRisk() == RiskGrade.DANGER
+                || material.historicalEvidenceRisk() == RiskGrade.DANGER) return 0;
+        if (caution || material.qualityRisk() == RiskGrade.CAUTION
+                || material.historicalEvidenceRisk() == RiskGrade.CAUTION) return 1;
+        boolean insufficient = material.rangeEvaluations().isEmpty()
+                || material.rangeEvaluations().stream().anyMatch(value -> switch (value.status()) {
+                    case REFERENCE_ONLY, DATA_MISSING, UNREGISTERED_CONDITION, INSUFFICIENT_EVIDENCE -> true;
+                    default -> false;
+                })
+                || material.qualityRisk() == RiskGrade.UNCONFIRMED
+                || material.qualityRisk() == RiskGrade.INSUFFICIENT_EVIDENCE
+                || material.historicalEvidenceRisk() == RiskGrade.UNCONFIRMED
+                || material.historicalEvidenceRisk() == RiskGrade.INSUFFICIENT_EVIDENCE;
+        return insufficient ? 2 : 3;
+    }
+
+    private static String plainStatus(String status) {
+        if (status == null || status.length() < 3) return value(status);
+        if (status.startsWith("● ") || status.startsWith("▲ ")
+                || status.startsWith("■ ") || status.startsWith("? ")
+                || status.startsWith("! ")) {
+            return status.substring(2);
+        }
+        return status;
+    }
+
+    private static String html(String value) {
+        return value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;");
     }
 
     private static String rangeCriteria(RangeEvaluation range) {
@@ -1038,14 +1325,28 @@ public final class MonitorDashboardPanel extends JPanel {
             fireTableRowsInserted(first, getRowCount() - 1);
         }
 
+        private void applyRows(Map<Integer, Object[]> replacements, List<Object[]> additions) {
+            if (replacements.isEmpty() && additions.isEmpty()) return;
+            replacements.forEach((row, values) -> dataVector.set(row, vector(values)));
+            int firstAddition = getRowCount();
+            additions.forEach(values -> dataVector.add(vector(values)));
+            if (replacements.isEmpty()) {
+                fireTableRowsInserted(firstAddition, getRowCount() - 1);
+            } else {
+                fireTableDataChanged();
+            }
+        }
+
         private void replaceRows(List<Object[]> rows) {
             dataVector.clear();
-            for (Object[] row : rows) {
-                Vector<Object> values = new Vector<>(row.length);
-                java.util.Collections.addAll(values, row);
-                dataVector.add(values);
-            }
+            for (Object[] row : rows) dataVector.add(vector(row));
             fireTableDataChanged();
+        }
+
+        private static Vector<Object> vector(Object[] row) {
+            Vector<Object> values = new Vector<>(row.length);
+            java.util.Collections.addAll(values, row);
+            return values;
         }
     }
 }
