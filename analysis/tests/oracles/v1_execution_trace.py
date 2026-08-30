@@ -48,6 +48,44 @@ _BUNDLE_KEYS = {
 _SOURCE_NAMES = {
     "ap": "sts_3ap_3.csv", "fur_hr": "sts_2fur_hr_2.csv", "sm_cc": "sts_1sm_cc_1.csv",
 }
+_APPROVED_ANCHORS = {
+    "sha256:8c88d3109bd6945b76317ee415c7821524f515c9bd79d36b8072c285c6434af7": {
+        "label": "golden",
+        "bundle_id": "sha256:4f40427690116f0defcbe609d9e5e1ef4025bb4193cdf099386659a26dd9f8bc",
+        "manifest": (3676, "sha256:d717b150fcd7cf80065e2a71744091da387d38243f30d816f4cc83e63d605a33"),
+        "artifacts": (
+            ("analysis_config", 13830, "sha256:bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b"),
+            ("producer_runtime", 5537, "sha256:3c1daabb3e868fc6cebc75023980fcb71d947996170de6d8e58cd06b18231407"),
+            ("equipment_operating_ranges", 164, "sha256:bd8ab5dc79a1a7e97d64132dd3669befbe3fa28493a57eff5918818933526200"),
+            ("quality_risk_intervals", 260330, "sha256:3b0a85925ab1ae7b42d70989c32fad3ea3b881cf9647a6a13a72db3d42b7eb30"),
+            ("replay_events", 59114, "sha256:10b39aac41f317210074e42b44a0e1ab6f521b7c432647edf72be80a4e0fef8c"),
+            ("analysis_summary", 383818, "sha256:aec581bca1e6b4eaed1ddae36c53cd3d5c70e2afb582589e1bc299dd2743876e"),
+        ),
+        "sources": (
+            ("ap", "sts_3ap_3.csv", "sha256:efaef9f283a28e63dff54b26bc3dd42c6a72e20f0b75d2fa13a6ab47f41405c9", "711"),
+            ("fur_hr", "sts_2fur_hr_2.csv", "sha256:973e864ed996ca48c44a00943efc0ea51a878b94b8aac7452c7254a572fe7e67", "1866"),
+            ("sm_cc", "sts_1sm_cc_1.csv", "sha256:c3bba5c7235166b6693ff657a25797933ea9d83c6392437af9b5141f4e56a68c", "1056"),
+        ),
+    },
+    "sha256:c0a9d1f3f0d655c24d2eeddc58f1905672d2f72d7ffd0d14e87bdecb118a2a26": {
+        "label": "actual",
+        "bundle_id": "sha256:65d535350ef2d7c5abf6372fdfe7b364c62a6c0af60b01946a23c4659c1ee82a",
+        "manifest": (3695, "sha256:c5f2c9d167fa82e1e7ca3347d401b0591c40b6dbd74a215ef9e77960dec4bd3a"),
+        "artifacts": (
+            ("analysis_config", 13830, "sha256:bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b"),
+            ("producer_runtime", 5537, "sha256:3c1daabb3e868fc6cebc75023980fcb71d947996170de6d8e58cd06b18231407"),
+            ("equipment_operating_ranges", 187344, "sha256:8bd1e05d4b33a0d6e4fda59d135cfa0b6a5b8f00779a6c82c307d09d95751682"),
+            ("quality_risk_intervals", 622603, "sha256:bd2e2f6fa8c0233e6d658d7fb84b2a717d17a7fbdc74bd47733024f412cb0954"),
+            ("replay_events", 119700523, "sha256:d2b5a8029b98f60181460c75bf5e55d8568c4dd46f32752e3dfd5e200ecbd599"),
+            ("analysis_summary", 90097180, "sha256:fc3bd17615f1500e36da11394a48acdffab53e18935a600a0257814fd41caadc"),
+        ),
+        "sources": (
+            ("ap", "sts_3ap_3.csv", "sha256:ff4572a1302459787ddca7458857864182d969e45b6a81edc4241bc47549801d", "1277032"),
+            ("fur_hr", "sts_2fur_hr_2.csv", "sha256:c2bb0b503ec30b0e01e00d2bd88fde536479de59aebf1eae84131380d58f3bcf", "3578800"),
+            ("sm_cc", "sts_1sm_cc_1.csv", "sha256:0cd3e91428c005dae1785b9af01d30e3d08230e2058c68693c9aa7ffee043075", "1883100"),
+        ),
+    },
+}
 _REPLAY_HEADER = (
     "schema_version", "bundle_id", "criteria_id", "event_id", "replay_date",
     "replay_hour", "batch_kind", "batch_id", "equipment_batch_id", "batch_step",
@@ -63,15 +101,25 @@ _STAGE_RANK = {
 
 @dataclass(frozen=True)
 class EventSemantic:
+    schema_version: str
+    bundle_id: str
+    criteria_id: str
     event_id: str
+    replay_date: str
+    replay_hour: int | None
+    batch_kind: str
     batch_id: str
+    equipment_batch_id: str | None
     batch_step: str
+    time_precision: str
     material_key: str
     equipment_type: str
     equipment_id: str
-    replay_date: str
-    replay_hour: int | None
-    values_sha256: str
+    charge_id: str
+    slab_no: str
+    hr_coil_id: str | None
+    ap_prod_id: str | None
+    values_json: bytes
 
 
 @dataclass(frozen=True)
@@ -217,6 +265,13 @@ def _canonical_float(number: float) -> str:
     return best
 
 
+def canonical_v1_number(number: float) -> str:
+    """Return the independent v1 canonical spelling for one finite binary64."""
+    if type(number) is not float:
+        raise TypeError("canonical v1 number input must be a float")
+    return _canonical_float(number)
+
+
 def _canonical_text(value: object) -> str:
     if value is None:
         return "null"
@@ -276,8 +331,8 @@ def _verify_schema_fields(criteria: dict[str, object], bundle: dict[str, object]
             raise ValueError(f"bundle identity {key} does not match fixed v1 schema")
 
 
-def _verify_manifest(root: Path) -> tuple[dict[str, object], dict[str, bytes]]:
-    _manifest_bytes, manifest = _read_json(root / "bundle_manifest.json")
+def _verify_manifest(root: Path) -> tuple[bytes, dict[str, object], dict[str, bytes]]:
+    manifest_bytes, manifest = _read_json(root / "bundle_manifest.json")
     if manifest.get("schemaVersion") != "sfep-equipment-bundle/v1":
         raise ValueError("manifest schemaVersion is not v1")
     entries = manifest.get("artifacts")
@@ -296,7 +351,44 @@ def _verify_manifest(root: Path) -> tuple[dict[str, object], dict[str, bytes]]:
         if entry.get("sha256") != _sha(payload):
             raise ValueError(f"artifact {role} digest does not match manifest")
         payloads[role] = payload
-    return manifest, payloads
+    return manifest_bytes, manifest, payloads
+
+
+def _approved_anchor(criteria_id: str) -> dict[str, object]:
+    anchor = _APPROVED_ANCHORS.get(criteria_id)
+    if anchor is None:
+        raise ValueError("criteriaId is not an approved frozen v1 anchor")
+    return anchor
+
+
+def _verify_approved_identity_anchor(
+    manifest: dict[str, object], criteria_id: str, bundle_id: str,
+) -> dict[str, object]:
+    anchor = _approved_anchor(criteria_id)
+    if bundle_id != anchor["bundle_id"]:
+        raise ValueError(f"approved {anchor['label']} v1 anchor bundle/source identity does not match")
+    identity = manifest["identity"]
+    sources = tuple(
+        (role, identity[f"source.{role}.name"], identity[f"source.{role}.sha256"],
+         identity[f"source.{role}.size_bytes"])
+        for role in ("ap", "fur_hr", "sm_cc")
+    )
+    if sources != anchor["sources"]:
+        raise ValueError("approved v1 anchor source metadata does not match")
+    return anchor
+
+
+def _verify_approved_content_anchor(
+    manifest_bytes: bytes, manifest: dict[str, object], anchor: dict[str, object],
+) -> None:
+    if (len(manifest_bytes), _sha(manifest_bytes)) != anchor["manifest"]:
+        raise ValueError("approved v1 anchor manifest bytes do not match")
+    artifacts = tuple(
+        (item["role"], item["sizeBytes"], item["sha256"])
+        for item in manifest["artifacts"]
+    )
+    if artifacts != anchor["artifacts"]:
+        raise ValueError("approved v1 anchor artifact metadata does not match")
 
 
 def _verify_identities(manifest: dict[str, object], payloads: dict[str, bytes]) -> tuple[str, str]:
@@ -411,9 +503,12 @@ def _verify_rule_ids(rules: dict[str, object]) -> tuple[str, ...]:
 
 def _read_replay(
     root: Path, criteria_id: str, bundle_id: str,
-) -> tuple[tuple[EventSemantic, ...], dict[str, dict[str, object]]]:
+) -> tuple[
+    tuple[EventSemantic, ...], dict[str, dict[str, object]], dict[str, dict[str, object]],
+]:
     semantics: list[EventSemantic] = []
     material_values: dict[str, dict[str, object]] = {}
+    material_bindings: dict[str, dict[str, object]] = {}
     seen_events: set[str] = set()
     with (root / "replay_events.csv").open("r", encoding="utf-8", newline="") as stream:
         reader = csv.reader(stream)
@@ -471,12 +566,27 @@ def _read_replay(
                 raise ValueError("replay event_id values must be unique")
             seen_events.add(event)
             semantics.append(EventSemantic(
-                event, batch, row["batch_step"], material, row["equipment_type"], row["equipment_id"],
-                row["replay_date"], replay_hour, _sha(row["values_json"].encode()),
+                row["schema_version"], row["bundle_id"], row["criteria_id"], event,
+                row["replay_date"], replay_hour, row["batch_kind"], batch,
+                equipment_batch, row["batch_step"], row["time_precision"], material,
+                row["equipment_type"], row["equipment_id"], row["charge_id"], row["slab_no"],
+                row["hr_coil_id"] or None, row["ap_prod_id"] or None,
+                row["values_json"].encode("utf-8"),
             ))
             current = material_values.setdefault(material, {"charge_id": row["charge_id"]})
             current.update(values)
-    return tuple(semantics), material_values
+            binding = material_bindings.setdefault(material, {
+                "chargeId": row["charge_id"], "slabNo": row["slab_no"],
+                "hrCoilId": None, "apProdId": None,
+            })
+            if binding["chargeId"] != row["charge_id"] or binding["slabNo"] != row["slab_no"]:
+                raise ValueError(f"replay material {material} has inconsistent identity columns")
+            for output, column in (("hrCoilId", "hr_coil_id"), ("apProdId", "ap_prod_id")):
+                if row[column]:
+                    if binding[output] not in (None, row[column]):
+                        raise ValueError(f"replay material {material} has inconsistent {column}")
+                    binding[output] = row[column]
+    return tuple(semantics), material_values, material_bindings
 
 
 def _lineage_paths(value: object, prefix: str, target: set[str]) -> None:
@@ -490,6 +600,85 @@ def _lineage_paths(value: object, prefix: str, target: set[str]) -> None:
         target.add(array_path)
         for item in value:
             _lineage_paths(item, array_path, target)
+
+
+def _verify_lineage_bindings(
+    summary: dict[str, object], material_bindings: dict[str, dict[str, object]],
+    rule_ids: tuple[str, ...], range_ids: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    lineage = summary.get("lineage")
+    if type(lineage) is not dict:
+        raise ValueError("summary lineage must be an object")
+    materials = lineage.get("materials")
+    populations = lineage.get("populations")
+    aggregates = lineage.get("aggregates")
+    if type(materials) is not list or type(populations) is not list or type(aggregates) is not list:
+        raise ValueError("summary lineage material/population/aggregate collections must be lists")
+
+    lineage_materials: dict[str, dict[str, object]] = {}
+    for item in materials:
+        if type(item) is not dict:
+            raise ValueError("summary lineage material must be an object")
+        key = _require_sha(item.get("materialKey"), "lineage materialKey")
+        if key in lineage_materials:
+            raise ValueError("summary lineage materialKey values must be unique")
+        recomputed = _digest_json_id(
+            "sfep-material-key/v1", {"chargeId": item.get("chargeId"), "slabNo": item.get("slabNo")},
+        )
+        if key != recomputed:
+            raise ValueError("summary lineage materialKey does not match material identity")
+        replay = material_bindings.get(key)
+        if replay is None:
+            raise ValueError("summary lineage materialKey is missing from replay")
+        if any(item.get(field) != replay[field] for field in ("chargeId", "slabNo", "hrCoilId")):
+            raise ValueError("summary lineage material identity does not match replay")
+        lineage_materials[key] = item
+    if set(lineage_materials) != set(material_bindings):
+        raise ValueError("summary lineage materials do not exactly cover replay materials")
+
+    population_map: dict[str, tuple[str, ...]] = {}
+    for item in populations:
+        if type(item) is not dict or type(item.get("populationRef")) is not str:
+            raise ValueError("summary lineage population is invalid")
+        reference = item["populationRef"]
+        keys = item.get("materialKeys")
+        if reference in population_map or type(keys) is not list or any(type(key) is not str for key in keys):
+            raise ValueError("summary lineage population references/keys are invalid")
+        if item.get("split") != reference or len(keys) != len(set(keys)):
+            raise ValueError("summary lineage population split/keys are inconsistent")
+        if not set(keys) <= set(lineage_materials):
+            raise ValueError("summary lineage population materialKey is missing from replay")
+        population_map[reference] = tuple(keys)
+    if set(population_map) != {"REFERENCE", "DISCOVERY", "CONFIRMATION", "HOLDOUT"}:
+        raise ValueError("summary lineage population references are not exact")
+    reference = set(population_map["REFERENCE"])
+    discovery = set(population_map["DISCOVERY"])
+    confirmation = set(population_map["CONFIRMATION"])
+    holdout = set(population_map["HOLDOUT"])
+    if not discovery <= reference or not confirmation <= reference:
+        raise ValueError("summary lineage discovery/confirmation is not bound to reference")
+    if not discovery.isdisjoint(confirmation) or not holdout.isdisjoint(reference):
+        raise ValueError("summary lineage population partitions overlap")
+
+    authenticated_ids = {
+        "quality_risk_intervals": set(rule_ids),
+        "equipment_operating_ranges": set(range_ids),
+    }
+    for item in aggregates:
+        if type(item) is not dict:
+            raise ValueError("summary lineage aggregate must be an object")
+        role = item.get("artifactRole")
+        if role not in authenticated_ids or item.get("ruleId") not in authenticated_ids[role]:
+            raise ValueError("summary lineage aggregate ruleId is not authenticated by its artifact")
+        population_ref = item.get("populationRef")
+        if population_ref not in population_map or item.get("split") != population_ref:
+            raise ValueError("summary lineage aggregate population reference is inconsistent")
+        keys = item.get("inputMaterialKeys")
+        if type(keys) is not list or any(type(key) is not str for key in keys) or len(keys) != len(set(keys)):
+            raise ValueError("summary lineage aggregate inputMaterialKeys are invalid")
+        if not set(keys) <= set(population_map[population_ref]):
+            raise ValueError("summary lineage aggregate inputMaterialKeys are not bound to replay population")
+    return population_map
 
 
 def _type1(values: list[float], q: float) -> float:
@@ -527,13 +716,33 @@ def _sample_indices(seed: bytes, replicate: int, size: int) -> tuple[int, ...]:
     )
 
 
+def _mh_relative_risk(cells_by_stratum: dict[str, list[int]]) -> float | None:
+    if not cells_by_stratum:
+        return None
+    numerator_terms: list[float] = []
+    denominator_terms: list[float] = []
+    for key in sorted(cells_by_stratum, key=str.encode):
+        raw = cells_by_stratum[key]
+        correction = 0.5 if 0 in raw else 0.0
+        a, b, c, d = (value + correction for value in raw)
+        candidate_total = a + b
+        comparator_total = c + d
+        total = candidate_total + comparator_total
+        numerator_terms.append(a * comparator_total / total)
+        denominator_terms.append(c * candidate_total / total)
+    denominator = math.fsum(denominator_terms)
+    if denominator <= 0.0:
+        return None
+    result = math.fsum(numerator_terms) / denominator
+    return float(result) if math.isfinite(result) else None
+
+
 def _rule_bootstrap_trace(
-    config: dict[str, object], rules: dict[str, object], summary: dict[str, object],
+    config: dict[str, object], rules: dict[str, object], populations: dict[str, tuple[str, ...]],
     criteria_id: str, material_values: dict[str, dict[str, object]],
 ) -> tuple[RuleBootstrapTrace, ...]:
-    populations = {item["populationRef"]: item["materialKeys"] for item in summary["lineage"]["populations"]}
     discovery_ids = populations["DISCOVERY"]
-    rows = [(key, material_values[key]) for key in discovery_ids if key in material_values]
+    rows = [(key, material_values[key]) for key in discovery_ids]
     hierarchies = {item["equipmentType"]: item["levels"] for item in config["riskAdjustmentHierarchies"]}
     stages = {item["field"]: item["firstAvailableStage"] for item in config["fields"]}
     band_names = {field for levels in hierarchies.values() for level in levels for field in level if field.endswith("_band")}
@@ -546,8 +755,9 @@ def _rule_bootstrap_trace(
     replicates = int(config["bootstrap"]["replicates"])
     minimum_support = int(config["qualityRisk"]["minimumDiscoverySupport"])
     minimum_defects = int(config["qualityRisk"]["minimumCautionDefects"])
-    traces = []
-    for rule in rules["rules"]:
+    # One fully replayed UTF-8-first applicable rule is the deterministic
+    # bootstrap sentinel; rule_ids independently freezes the complete rule set.
+    for rule in sorted(rules["rules"], key=lambda item: item["ruleId"].encode()):
         metric = rule["discovery"]
         applicable = (
             metric["support"] >= minimum_support and metric["defects"] >= minimum_defects
@@ -595,19 +805,37 @@ def _rule_bootstrap_trace(
         if not charges:
             continue
         seed = hashlib.sha256((criteria_id + "\0" + rule["ruleId"] + "\0rule-ci-v1").encode()).digest()
-        first_sample = _sample_indices(seed, 0, len(charges))
-        first_confusion_values = [0, 0, 0, 0]
-        for charge_index in first_sample:
-            for cells in by_charge[charges[charge_index]].values():
-                for index, value in enumerate(cells):
-                    first_confusion_values[index] += value
-        first_confusion = tuple(first_confusion_values)
-        ci = (metric["relativeRiskCiLower"], metric["relativeRiskCiUpper"])
-        valid_replicates = replicates if ci != (None, None) else 0
-        traces.append(RuleBootstrapTrace(
-            rule["ruleId"], 0, first_sample, first_confusion, valid_replicates, ci,
-        ))
-    return tuple(sorted(traces, key=lambda item: item.rule_id.encode()))
+        valid: list[float] = []
+        first_sample: tuple[int, ...] = ()
+        first_confusion: tuple[int, int, int, int] = (0, 0, 0, 0)
+        for replicate in range(replicates):
+            sample = _sample_indices(seed, replicate, len(charges))
+            cells_by_stratum: dict[str, list[int]] = {}
+            confusion = [0, 0, 0, 0]
+            for charge_index in sample:
+                for key, cells in by_charge[charges[charge_index]].items():
+                    target = cells_by_stratum.setdefault(key, [0, 0, 0, 0])
+                    for index, value in enumerate(cells):
+                        target[index] += value
+                        confusion[index] += value
+            if replicate == 0:
+                first_sample = sample
+                first_confusion = tuple(confusion)
+            relative_risk = _mh_relative_risk(cells_by_stratum)
+            if relative_risk is not None and relative_risk > 0.0:
+                valid.append(relative_risk)
+        computed_ci: tuple[float | None, float | None]
+        if len(valid) < 1900:
+            computed_ci = (None, None)
+        else:
+            computed_ci = (_type1(valid, .025), _type1(valid, .975))
+        artifact_ci = (metric["relativeRiskCiLower"], metric["relativeRiskCiUpper"])
+        if computed_ci != artifact_ci:
+            raise ValueError("rule bootstrap trace CI does not match authenticated artifact")
+        return (RuleBootstrapTrace(
+            rule["ruleId"], 0, first_sample, first_confusion, len(valid), computed_ci,
+        ),)
+    return ()
 
 
 def _holdout_trace(summary: dict[str, object]) -> tuple[HoldoutMetricTrace, ...]:
@@ -627,11 +855,14 @@ def _build_trace(
 ) -> V1ExecutionTrace:
     range_ids = _verify_range_ids(ranges)
     rule_ids = _verify_rule_ids(rules)
-    event_semantics, material_values = _read_replay(root, criteria_id, bundle_id)
+    event_semantics, material_values, material_bindings = _read_replay(root, criteria_id, bundle_id)
+    populations = _verify_lineage_bindings(
+        summary, material_bindings, rule_ids, range_ids,
+    )
     lineage_keys: set[str] = set()
     _lineage_paths(summary.get("lineage"), "lineage", lineage_keys)
     return V1ExecutionTrace(
-        _rule_bootstrap_trace(config, rules, summary, criteria_id, material_values),
+        _rule_bootstrap_trace(config, rules, populations, criteria_id, material_values),
         _holdout_trace(summary), rule_ids, range_ids,
         tuple(item.event_id for item in event_semantics), event_semantics,
         tuple(sorted(lineage_keys, key=str.encode)),
@@ -643,12 +874,14 @@ def verify_v1_bundle(bundle_root: Path) -> VerifiedV1Bundle:
     root = Path(bundle_root)
     if not root.is_absolute() or not root.is_dir():
         raise ValueError("v1 bundle root must be an absolute existing directory")
-    manifest, payloads = _verify_manifest(root)
+    manifest_bytes, manifest, payloads = _verify_manifest(root)
     criteria_id, bundle_id = _verify_identities(manifest, payloads)
+    anchor = _verify_approved_identity_anchor(manifest, criteria_id, bundle_id)
     config, ranges, rules, summary = _verify_json_bindings(
         manifest, payloads, criteria_id, bundle_id,
     )
     trace = _build_trace(root, config, ranges, rules, summary, criteria_id, bundle_id)
+    _verify_approved_content_anchor(manifest_bytes, manifest, anchor)
     return VerifiedV1Bundle(root, criteria_id, bundle_id, trace)
 
 
