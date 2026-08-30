@@ -4,9 +4,11 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import textwrap
+import time
 
 import pytest
 
@@ -14,6 +16,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = PROJECT_ROOT / "scripts" / "restore-sfep-python312.sh"
 LOCK = PROJECT_ROOT / "analysis" / "python312-conda.lock"
+REAL_PACKAGE_CACHE = Path("/opt/homebrew/Caskroom/miniconda/base/pkgs")
 
 EXPECTED_LOCK = """\
 0a0544cf95f64394fe4959286f5c71f5444ad58feb0602e53becb27448d24da6  ca-certificates-2026.7.22-hbd8a1cb_0.conda
@@ -81,21 +84,14 @@ def _write_runtime(prefix: Path, mode: str) -> Path:
 def _make_case(tmp_path: Path, *, runtime_mode: str = "valid") -> dict[str, Path]:
     package_cache = tmp_path / "package-cache"
     package_cache.mkdir()
-    packages = {
-        "alpha-1.0-0.conda": b"authenticated alpha archive\n",
-        "python-3.12.10-test_0.conda": b"authenticated python archive\n",
-    }
-    for name, payload in packages.items():
-        (package_cache / name).write_bytes(payload)
+    for entry in EXPECTED_LOCK.splitlines():
+        _, name = entry.split("  ", maxsplit=1)
+        source = REAL_PACKAGE_CACHE / name
+        assert source.is_file(), f"required local archive is missing: {source}"
+        (package_cache / name).symlink_to(source)
 
     lock = tmp_path / "python312-conda.lock"
-    lock.write_text(
-        "".join(
-            f"{hashlib.sha256(payload).hexdigest()}  {name}\n"
-            for name, payload in packages.items()
-        ),
-        encoding="ascii",
-    )
+    lock.write_text(EXPECTED_LOCK, encoding="ascii")
 
     runtime_template = tmp_path / "runtime-template"
     _write_runtime(runtime_template, runtime_mode)
@@ -143,6 +139,16 @@ def _make_case(tmp_path: Path, *, runtime_mode: str = "valid") -> dict[str, Path
               mkdir -p "$prefix"
               printf '%s\\n' partial > "$prefix/partial-marker"
             fi
+            if [[ "${FAKE_CONDA_WAIT_FOR_SIGNAL:-0}" == "1" ]]; then
+              : "${FAKE_CONDA_SIGNAL_READY:?}"
+              printf '%s\\n' ready > "$FAKE_CONDA_SIGNAL_READY"
+              trap 'exit 129' HUP
+              trap 'exit 130' INT
+              trap 'exit 143' TERM
+              while :; do
+                /bin/sleep 1
+              done
+            fi
             if [[ "${FAKE_CONDA_EXIT:-0}" != "0" ]]; then
               exit "$FAKE_CONDA_EXIT"
             fi
@@ -162,13 +168,25 @@ def _make_case(tmp_path: Path, *, runtime_mode: str = "valid") -> dict[str, Path
     }
 
 
-def _run_restore(
+def _restore_argv(case: dict[str, Path], output: Path | str) -> list[str]:
+    return [
+        str(SCRIPT),
+        "--conda",
+        str(case["conda"]),
+        "--package-cache",
+        str(case["package_cache"]),
+        "--lock",
+        str(case["lock"]),
+        "--output",
+        str(output),
+    ]
+
+
+def _restore_env(
     case: dict[str, Path],
-    output: Path,
     *,
     extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    assert SCRIPT.is_file(), "restore script is missing"
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
@@ -178,22 +196,22 @@ def _run_restore(
     )
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def _run_restore(
+    case: dict[str, Path],
+    output: Path | str,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    assert SCRIPT.is_file(), "restore script is missing"
     return subprocess.run(
-        [
-            str(SCRIPT),
-            "--conda",
-            str(case["conda"]),
-            "--package-cache",
-            str(case["package_cache"]),
-            "--lock",
-            str(case["lock"]),
-            "--output",
-            str(output),
-        ],
+        _restore_argv(case, output),
         check=False,
         capture_output=True,
         text=True,
-        env=env,
+        env=_restore_env(case, extra_env=extra_env),
     )
 
 
@@ -213,12 +231,44 @@ def test_checked_in_lock_is_the_exact_pinned_archive_set() -> None:
 
 
 @pytest.mark.parametrize(
+    "manifest_change",
+    ["missing", "extra", "substituted", "reordered"],
+)
+def test_rejects_noncanonical_manifest_before_conda(
+    tmp_path: Path, manifest_change: str
+) -> None:
+    case = _make_case(tmp_path)
+    lines = EXPECTED_LOCK.splitlines()
+    if manifest_change == "missing":
+        del lines[5]
+    elif manifest_change == "extra":
+        payload = b"unapproved archive\n"
+        name = "unapproved-1.0-0.conda"
+        (case["package_cache"] / name).write_bytes(payload)
+        lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
+    elif manifest_change == "substituted":
+        payload = b"substituted archive\n"
+        name = "substituted-1.0-0.conda"
+        (case["package_cache"] / name).write_bytes(payload)
+        lines[5] = f"{hashlib.sha256(payload).hexdigest()}  {name}"
+    elif manifest_change == "reordered":
+        lines[4], lines[5] = lines[5], lines[4]
+    case["lock"].write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    result = _run_restore(case, tmp_path / "restored")
+
+    assert result.returncode != 0
+    assert "canonical pinned manifest" in result.stderr
+    assert not case["conda_log"].exists()
+
+
+@pytest.mark.parametrize(
     "lock_bytes",
     [
         b"",
         b"0" * 64 + b"\n",
         b"0" * 64 + b"  alpha-1.0-0.conda unexpected\n",
-        (b"0" * 64 + b"  alpha-1.0-0.conda\n") * 2,
+        ((EXPECTED_LOCK.splitlines()[0] + "\n") * 2).encode("ascii"),
         b"0" * 64 + b"\talpha-1.0-0.conda\n",
         b"0" * 64 + b"  alpha-1.0-0.conda\r\n",
         b"0" * 64 + b"  alpha-1.0-0.conda\x00\n",
@@ -254,7 +304,9 @@ def test_rejects_malformed_lock_before_conda_or_output_mutation(
 
 def test_rejects_tampered_archive_before_conda_or_output_mutation(tmp_path: Path) -> None:
     case = _make_case(tmp_path)
-    (case["package_cache"] / "alpha-1.0-0.conda").write_bytes(b"tampered\n")
+    archive = case["package_cache"] / "ca-certificates-2026.7.22-hbd8a1cb_0.conda"
+    archive.unlink()
+    archive.write_bytes(b"tampered\n")
     output = tmp_path / "damaged-output"
     output.mkdir()
     marker = output / "keep-me"
@@ -270,7 +322,7 @@ def test_rejects_tampered_archive_before_conda_or_output_mutation(tmp_path: Path
 
 def test_rejects_missing_archive_before_conda_or_output_mutation(tmp_path: Path) -> None:
     case = _make_case(tmp_path)
-    (case["package_cache"] / "alpha-1.0-0.conda").unlink()
+    (case["package_cache"] / "ca-certificates-2026.7.22-hbd8a1cb_0.conda").unlink()
     output = tmp_path / "damaged-output"
     output.mkdir()
     marker = output / "keep-me"
@@ -303,8 +355,10 @@ def test_conda_receives_only_locked_archives_and_required_offline_flags(tmp_path
         "--offline",
         "--copy",
         "--no-default-packages",
-        str(case["package_cache"] / "alpha-1.0-0.conda"),
-        str(case["package_cache"] / "python-3.12.10-test_0.conda"),
+        *[
+            str(case["package_cache"] / entry.split("  ", maxsplit=1)[1])
+            for entry in EXPECTED_LOCK.splitlines()
+        ],
     ]
     assert str(extra) not in arguments
 
@@ -396,6 +450,62 @@ def test_conda_failure_preserves_original_and_partial_prefixes(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
+    ("signal_number", "signal_name"),
+    [
+        (signal.SIGHUP, "HUP"),
+        (signal.SIGINT, "INT"),
+        (signal.SIGTERM, "TERM"),
+    ],
+)
+def test_signal_preserves_and_reports_partial_prefix(
+    tmp_path: Path, signal_number: signal.Signals, signal_name: str
+) -> None:
+    case = _make_case(tmp_path)
+    output = tmp_path / "restored"
+    ready = tmp_path / "signal-ready"
+    env = _restore_env(
+        case,
+        extra_env={
+            "FAKE_CONDA_LEAVE_PARTIAL": "1",
+            "FAKE_CONDA_WAIT_FOR_SIGNAL": "1",
+            "FAKE_CONDA_SIGNAL_READY": str(ready),
+        },
+    )
+    process = subprocess.Popen(
+        _restore_argv(case, output),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    recoveries: list[Path] = []
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.is_file() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail("fake Conda did not reach its signal wait state")
+            time.sleep(0.02)
+        assert process.poll() is None
+
+        os.killpg(process.pid, signal_number)
+        _, stderr = process.communicate(timeout=10)
+        recoveries = _recovery_targets(stderr)
+
+        assert process.returncode == 128 + signal_number
+        assert len(recoveries) == 1
+        assert recoveries[0].parent.parent == Path("/private/tmp")
+        assert (recoveries[0] / "partial-marker").is_file()
+        assert not output.exists()
+        assert signal_name in stderr
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        _remove_fake_recoveries(recoveries)
+
+
+@pytest.mark.parametrize(
     ("runtime_mode", "diagnostic"),
     [
         ("wrong_version", "expected Python 3.12.10"),
@@ -440,6 +550,46 @@ def test_each_cli_argument_is_required(tmp_path: Path, missing_flag: str) -> Non
 
     assert result.returncode != 0
     assert "Usage:" in result.stderr
+    assert not case["conda_log"].exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_suffix",
+    [
+        "/child/.",
+        "/child/..",
+        "/../child",
+        "/child/",
+        "/child//nested",
+        "/bad\nname",
+        "/bad\tname",
+        "/bad\rname",
+        "/bad\x7fname",
+    ],
+    ids=[
+        "dot-component",
+        "dotdot-tail",
+        "dotdot-middle",
+        "trailing-separator",
+        "repeated-separator",
+        "newline-control",
+        "tab-control",
+        "carriage-return-control",
+        "delete-control",
+    ],
+)
+def test_rejects_unsafe_output_before_input_validation(
+    tmp_path: Path, unsafe_suffix: str
+) -> None:
+    case = _make_case(tmp_path)
+    case["conda"] = tmp_path / "missing-conda"
+    output = f"{tmp_path}{unsafe_suffix}"
+
+    result = _run_restore(case, output)
+
+    assert result.returncode != 0
+    assert "Unsafe --output" in result.stderr
+    assert case["package_cache"].is_dir()
     assert not case["conda_log"].exists()
 
 
