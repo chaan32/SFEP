@@ -2,7 +2,7 @@
 
 - 작성일: 2026-08-30
 - 최종 수정일: 2026-08-31
-- 상태: v1 보존·v2 고정 통계 seed 설계 대화 승인 완료, 구현 전 사용자 문서 검토 대기
+- 상태: v1 보존·v2 고정 통계 seed 설계 사용자 승인 완료, 구현 계획 작성 완료
 - 대상 저장소: `/Users/haechan/Desktop/SFEP`
 - 대상 모듈: `analysis`, `contracts/equipment-monitor/v2`
 - 원격 저장소 정책: 로컬 커밋만 수행하고 자동 Push하지 않음

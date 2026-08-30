@@ -2,7 +2,7 @@
 
 - 작성일: 2026-08-30
 - 최종 수정일: 2026-08-31
-- 상태: v1/v2 Bundle 호환·최적화 설계 대화 승인 완료, 구현 전 사용자 문서 검토 대기
+- 상태: v1/v2 Bundle 호환·최적화 설계 사용자 승인 완료, 구현 계획 작성 완료
 - 대상 저장소: `/Users/haechan/Desktop/SFEP`
 - 대상 모듈: `equipment-monitor`
 - 원격 저장소 정책: 로컬 커밋만 수행하고 자동 Push하지 않음
@@ -168,7 +168,7 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 7.2 최신순 계약
 
-`ReplayUnit.events()`는 의미상 순서를 주장하지 않으므로 event list index나 현재 alert insertion order를 최신순 근거로 사용하지 않는다. `ReplayCursor`가 검증된 canonical CSV row를 읽을 때 0부터 증가하는 내부 `replayOrdinal`을 붙이고, cursor→monitor→history projection 경계의 내부 sequenced record가 이를 보존한다. 이 값은 표시·내보내기 정렬 전용이며 동일 unit 안의 처리 순서나 판정 결과에는 영향을 주지 않는다.
+`ReplayUnit.events()`는 의미상 순서를 주장하지 않으므로 event list index나 현재 alert insertion order를 최신순 근거로 사용하지 않는다. `ReplayCursor`가 검증된 canonical CSV row를 읽을 때 0부터 증가하는 내부 `replayOrdinal`을 붙이고, cursor→monitor→history projection 경계의 내부 sequenced record가 이를 보존한다. raw event 목록에서 ordinal을 합성하지 않으며, 수동 fixture도 명시적인 sequenced record와 ordinal을 제공한다. 이 값은 표시·내보내기 정렬 전용이며 동일 unit 안의 처리 순서나 판정 결과에는 영향을 주지 않는다.
 
 모든 시간 기반 투영은 `replayOrdinal` 내림차순 comparator를 공통으로 사용한다. 한 event에서 여러 alert가 생기면 기존 안정 alert key 오름차순으로 tie를 끊는다. 날짜·시간 문자열이나 hash인 event ID만으로 순서를 추정하지 않는다. overview의 동률 항목은 마지막 변경 ordinal 내림차순, 기존 안정 식별자 오름차순으로 정렬한다. `AlertHistory`는 alert와 ordinal을 묶은 내부 history record를 저장하되 공개 `HistoricalAlert`와 CSV column 계약은 유지한다.
 
@@ -186,7 +186,7 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 7.5 시작 화면과 접근성
 
-프레임은 1초 이내에 로딩 상태로 표시하고 Bundle 로딩·재생은 백그라운드에서 수행한다. 진행 단계는 `Bundle 검증`, `이벤트 재생`, `화면 준비`로만 표시해 거짓 백분율을 만들지 않는다. 성공 전에 정상 상태를 표시하지 않는다.
+프레임은 1초 이내에 로딩 상태로 표시하고 Bundle 검증과 화면 준비는 백그라운드에서 수행한다. 시작 shell은 `Bundle 검증` 다음 `화면 준비`만 표시하고, 검증 성공 뒤 dashboard는 기존 제어 의미대로 일시정지 상태로 열린다. `이벤트 재생`은 사용자가 `시작`을 누른 뒤 dashboard 상태로만 표시하며 자동 재생하지 않는다. 이 세 단계명 외의 거짓 백분율은 만들지 않고, 성공 전에 정상 상태를 표시하지 않는다.
 
 검색 입력, page controls, 새 데이터 버튼과 표에는 accessible name·description과 label association을 제공한다. 주요 동작에는 mnemonic 또는 keyboard action을 제공한다.
 
