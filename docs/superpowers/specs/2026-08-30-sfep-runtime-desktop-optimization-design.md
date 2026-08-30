@@ -1,7 +1,8 @@
 # SFEP Java 실행 엔진·Swing 화면 최적화 설계
 
 - 작성일: 2026-08-30
-- 상태: 대화 승인 완료, 구현 전 사용자 문서 검토 대기
+- 최종 수정일: 2026-08-31
+- 상태: v1/v2 Bundle 호환·최적화 설계 대화 승인 완료, 구현 전 사용자 문서 검토 대기
 - 대상 저장소: `/Users/haechan/Desktop/SFEP`
 - 대상 모듈: `equipment-monitor`
 - 원격 저장소 정책: 로컬 커밋만 수행하고 자동 Push하지 않음
@@ -12,22 +13,26 @@
 
 이번 변경의 목적은 다음과 같다.
 
-1. Bundle, 판정 의미, 규칙 ID, 근거와 집계 건수를 유지하면서 Java 처리량을 높인다.
-2. 전체 이력을 보존하면서 화면에는 필요한 부분만 투영해 메모리와 EDT 작업량을 줄인다.
-3. 모든 시간 기반 목록과 내보내기를 최신순으로 통일한다.
-4. 로딩·검색·갱신 중에도 Swing이 응답하도록 만든다.
-5. 최적화 전후 정확성과 성능을 재현 가능한 수치로 증명한다.
+1. 기존 v1 Bundle과 고정 통계 seed를 사용하는 새 v2 Bundle을 모두 실패 폐쇄 방식으로 검증한다.
+2. 각 Bundle 안의 판정 의미, 규칙 ID, 근거와 집계 건수를 유지하면서 Java 처리량을 높인다.
+3. 전체 이력을 보존하면서 화면에는 필요한 부분만 투영해 메모리와 EDT 작업량을 줄인다.
+4. 모든 시간 기반 목록과 내보내기를 최신순으로 통일한다.
+5. 로딩·검색·갱신 중에도 Swing이 응답하도록 만든다.
+6. 최적화 전후 정확성과 성능을 재현 가능한 수치로 증명한다.
 
 ## 2. 변경 불가 계약
 
 다음 항목은 최적화가 변경할 수 없다.
 
-- 봉인 Bundle 파일의 바이트, SHA-256, `bundleId`, `criteriaId`
+- 승인된 실제·golden v1 Bundle 및 `contracts/equipment-monitor/v1`의 파일 바이트, SHA-256, `bundleId`, `criteriaId`
+- v1과 v2 각각의 manifest version, role별 artifact version과 embedded schema digest 조합
 - 규칙의 적용 가능성, 규칙 우선순위, 판정 등급, 근거와 집계 건수
 - 이벤트의 정규 순서와 전체 이력의 내용
-- Bundle 경로·심볼릭 링크·스키마·ID·artifact digest 검증 순서와 실패 폐쇄 원칙
+- Bundle 경로·심볼릭 링크·스키마·ID·artifact digest 검증과 실패 폐쇄 원칙
 - 전체 CSV 내보내기 가능성
 - 과거 재생 모니터라는 제품 범위
+
+새 v2 Bundle은 정직한 producer provenance 때문에 새 `criteriaId`와 `bundleId`를 가진다. 따라서 alert key와 화면 metadata의 bundle binding 값은 달라질 수 있지만, 이를 정규화한 rule grade·evidence·count·history·alert 의미는 v1과 같아야 한다.
 
 사용자가 추가 승인한 표시 계약은 다음과 같다.
 
@@ -39,7 +44,9 @@
 
 ## 3. 비대상
 
-- Bundle schema v2 또는 artifact 형식 변경
+- v1 schema·golden Bundle 수정 또는 삭제
+- 허용 목록 밖의 Bundle version이나 Bundle 내부 schema를 동적으로 신뢰하는 기능
+- `sfep-criteria-id/v1`·`sfep-bundle-id/v1` 계산식 변경
 - 검증·해시 계산 제거
 - 판정 임계치, 통계식 또는 설비 의미 변경
 - 전체 이력 삭제, 임의 상한 적용 또는 근거 축소
@@ -73,7 +80,13 @@
 ```text
 봉인 Bundle
     │
-    ├─ 기존 보안·계약 검증
+    ├─ 안전한 manifest version 추출
+    ▼
+불변 ContractProfile 선택
+├─ v1: 기존 config·summary·manifest
+└─ v2: seed-aware config·summary·manifest
+    │
+    ├─ profile별 schema digest·artifact version·ID 검증
     ▼
 불변 Runtime Index
 ├─ QualityRuleIndex
@@ -93,31 +106,57 @@ ReplayCursor → EventValueSnapshot → 판정기
                                             └─ 전체 최신순 export
 ```
 
-Bundle DTO와 판정 결과 DTO는 기존 공개 계약을 유지한다. 새 구성요소는 반복 탐색과 Swing 투영을 담당하는 내부 구현 단위다.
+Bundle DTO와 판정 결과 DTO는 기존 공개 계약을 유지한다. 새 `BundleContract`는 loader 내부에서만 version별 신뢰 기준을 제공하고, 나머지 새 구성요소는 반복 탐색과 Swing 투영을 담당한다.
 
 ## 6. Java 실행 엔진 설계
 
-### 6.1 불변 품질규칙 색인
+### 6.1 v1/v2 BundleContract loader
+
+기존 `contracts/equipment-monitor/v1`과 그 embedded bytes는 수정하지 않는다. `contracts/equipment-monitor/v2`에는 seed-aware config·summary·manifest schema를 추가하고, producer runtime·ranges·rules·replay는 신뢰된 v1 schema를 재사용한다. v2 artifact version 조합은 다음과 같이 고정한다.
+
+| artifact | v2 profile의 schema version |
+|---|---|
+| analysis config | `sfep-analysis-config/v2` |
+| producer runtime | `sfep-producer-runtime/v1` |
+| operating ranges | `sfep-operating-ranges/v1` |
+| quality rules | `sfep-quality-rules/v1` |
+| replay events | `sfep-replay-events/v1` |
+| analysis summary | `sfep-analysis-summary/v2` |
+
+`BundleLoader`는 안전한 layout preflight와 strict JSON parse 후 untrusted manifest의 `schemaVersion`을 정확한 allowlist로만 분기한다. 선택된 불변 `BundleContract`가 manifest schema bytes, role별 schema bytes·digest, artifact version과 identity namespace를 제공한다. 다음 순서를 지킨다.
+
+1. manifest version이 `sfep-equipment-bundle/v1` 또는 `/v2`인지 확인한다.
+2. 선택된 profile의 embedded manifest schema digest가 manifest identity claim과 같은지 확인한다.
+3. 모든 role의 schema digest와 artifact version 조합을 profile과 비교한다.
+4. 선택된 embedded schema로 Manifest와 각 artifact를 검증한다.
+5. 기존 여덟 필드 criteria ID와 열아홉 필드 bundle ID를 재계산하고 identity binding을 확인한다.
+6. 모든 artifact의 크기와 hash를 attestation한 뒤에만 Manifest·artifact schema validation과 DTO binding을 수행한다.
+
+검증 순서는 `layout preflight → strict manifest parse → allowlist profile 선택 → profile schema digest·descriptor version·identity 확인 → 모든 artifact size/hash attestation → manifest/artifact schema validation·DTO binding`이다. Bundle이 제공하는 schema를 읽거나, 한 profile의 검증 실패를 다른 profile로 fallback하지 않는다. config의 bootstrap은 DTO에서 이미 `JsonNode`이므로 Swing과 domain DTO에는 seed field를 추가하지 않아도 된다.
+
+각 `BundleContract`는 일곱 role 전체의 `role → embedded schema document` map을 직접 소유한다. v2에서 재사용하는 v1 schema도 profile map에 명시적으로 넣으며, 전역 `SchemaRole.fileName()`으로 암묵 추론하지 않는다.
+
+### 6.2 불변 품질규칙 색인
 
 `QualityRuleEvaluator`가 생성될 때 봉인된 규칙 순서를 보존한 불변 색인을 한 번 만든다. 1차 key는 `firstAvailableStage`, `equipmentType`, `applicationScope`이고 설비 전용 규칙은 `equipmentId`로 한 번 더 나눈다. 이벤트 판정 시에는 가능한 bucket만 결합한다.
 
 결합된 후보의 최종 순서는 원래 봉인 배열 ordinal로 안정 정렬한다. 따라서 탐색량은 줄지만 최초 일치 규칙, 표시 병합 순서와 근거 순서는 변하지 않는다. 중복 rule ID, 알 수 없는 scope 또는 색인 불변식 위반은 로딩 단계에서 실패한다.
 
-### 6.2 불변 운전범위 색인
+### 6.3 불변 운전범위 색인
 
-`OperatingRangeEvaluator`는 field, `firstAvailableStage`, `equipmentType`, `equipmentId`, context level 기준의 후보 색인을 생성한다. 기존의 context 완화 순서와 원래 range ordinal을 별도 metadata로 보존한다. 실제 판정은 기존 비교 함수 하나만 사용하고, 색인은 후보 축소에만 관여한다.
+`OperatingRangeEvaluator`는 field, `firstAvailableStage`, `equipmentType`, `equipmentId`, context level 기준의 후보 색인을 생성한다. 기존의 context 완화 순서를 metadata로 보존한다. 같은 context level 후보의 최종 선택은 기존 계약대로 `ruleId` 오름차순이며 source/range ordinal로 바꾸지 않는다. 실제 판정은 기존 비교 함수 하나만 사용하고, 색인은 후보 축소에만 관여한다.
 
-### 6.3 이벤트 값 1회 snapshot
+### 6.4 이벤트 값 1회 snapshot
 
 `HistoricalMonitor.process` 입구에서 이벤트 값을 불변 snapshot으로 한 번 얻는다. 품질규칙 판정과 운전범위 판정은 같은 snapshot을 읽는다. 호출자에게 수정 가능한 map을 노출하지 않으며 null, 숫자 타입과 문자열 비교 의미는 기존과 동일하다.
 
-### 6.4 증분 소재·설비 집계
+### 6.5 증분 소재·설비 집계
 
 소재별 assessment 목록은 근거와 상세보기를 위해 모두 보존한다. 단, grade별 건수와 최종 severity는 새 assessment가 추가될 때 갱신한다. 화면 snapshot 생성 시 전체 assessment를 다시 계산하지 않는다.
 
 설비 단위 상태도 재생 중에는 내부 mutable builder에 누적하고 외부 공개 시점에만 기존 불변 DTO로 고정한다. 내부 객체가 Swing이나 외부 코드로 누출되지 않도록 한다.
 
-### 6.5 반복 검증은 프로파일 후 판단
+### 6.6 반복 검증은 프로파일 후 판단
 
 Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재해시는 보안 및 TOCTOU 방어와 연결되어 있다. 프로파일 없이 제거하지 않는다. 하나의 인증된 file descriptor로 동일 검증을 합칠 수 있고 공격면이 늘지 않는다는 테스트가 있을 때만 별도 단계에서 변경한다. 이 조건을 충족하지 못하면 현재 검증을 유지한다.
 
@@ -129,7 +168,9 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 7.2 최신순 계약
 
-모든 시간 기반 투영은 정규 replay ordinal 내림차순 comparator를 공통으로 사용한다. 날짜·시간 문자열만으로 재정렬하지 않아 같은 시간 버킷의 결정론을 보장한다. overview의 동률 항목은 마지막 변경 ordinal 내림차순, 기존 안정 식별자 오름차순으로 정렬한다.
+`ReplayUnit.events()`는 의미상 순서를 주장하지 않으므로 event list index나 현재 alert insertion order를 최신순 근거로 사용하지 않는다. `ReplayCursor`가 검증된 canonical CSV row를 읽을 때 0부터 증가하는 내부 `replayOrdinal`을 붙이고, cursor→monitor→history projection 경계의 내부 sequenced record가 이를 보존한다. 이 값은 표시·내보내기 정렬 전용이며 동일 unit 안의 처리 순서나 판정 결과에는 영향을 주지 않는다.
+
+모든 시간 기반 투영은 `replayOrdinal` 내림차순 comparator를 공통으로 사용한다. 한 event에서 여러 alert가 생기면 기존 안정 alert key 오름차순으로 tie를 끊는다. 날짜·시간 문자열이나 hash인 event ID만으로 순서를 추정하지 않는다. overview의 동률 항목은 마지막 변경 ordinal 내림차순, 기존 안정 식별자 오름차순으로 정렬한다. `AlertHistory`는 alert와 ordinal을 묶은 내부 history record를 저장하되 공개 `HistoricalAlert`와 CSV column 계약은 유지한다.
 
 새 이력이 들어왔을 때 viewport가 첫 행 부근이면 최신 page를 즉시 반영한다. 과거 page 또는 아래쪽을 보고 있으면 현재 selection과 viewport를 유지하고 대기 건수를 증가시킨다. 사용자가 `새 데이터 N건`을 실행하면 filter를 유지한 채 첫 page와 첫 행으로 이동한다.
 
@@ -156,6 +197,7 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 ## 8. 오류 처리
 
 - Bundle 검증 실패 시 Swing 정상 화면을 열지 않고 한국어 오류 요약과 안전한 상세 원인을 제공한다.
+- 알 수 없는 manifest version, profile과 다른 schema digest 또는 v1/v2 artifact 혼합은 fallback 없이 거부한다.
 - 손상된 replay 중간까지의 결과를 완전한 결과처럼 표시하지 않는다.
 - 색인 구성 불변식 위반은 조용히 전체 scan으로 우회하지 않고 테스트 또는 시작 단계에서 실패한다.
 - 비동기 filter 실패는 현재 정상 page를 유지하고 오류 상태를 표시한다.
@@ -166,12 +208,18 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 9.1 동일성 테스트
 
+- 기존 실제·golden v1 Bundle이 변경된 loader에서 같은 ID와 내용으로 통과한다.
+- 별도 v2 fixture와 실제 v2 Bundle이 선택된 v2 profile로 통과한다.
+- manifest version, config/summary artifact version, schema digest 또는 seed를 교차 조작한 Bundle은 모두 실패한다.
+- v1과 v2 실제 Bundle을 재생했을 때 bundle/criteria binding만 정규화한 rule grade, evidence, count, material history와 alert가 같다.
 - 색인 경로와 기존 reference scan이 모든 fixture에서 같은 적용 규칙 순서를 반환한다.
+- 같은 context level에 여러 운전범위가 있으면 indexed path와 reference scan이 모두 `ruleId` 오름차순 후보를 선택한다.
 - 증분 집계와 전체 재계산 oracle이 이벤트 prefix마다 같은 상태를 반환한다.
 - 같은 이벤트 snapshot을 두 판정기가 공유해도 기존 판정과 동일하다.
 - 실제 Bundle에서 규칙 ID, grade, evidence, count와 전체 history 내용이 동일하다.
 - 최신순 page를 이어 붙이면 canonical 전체 이력을 정확히 한 번씩 역순으로 복원한다.
-- 같은 시간 버킷 tie와 filter·page 조합도 결정론적이다.
+- `ReplayUnit.events()` 순서를 섞어도 보존된 replay ordinal 기반 history·export 순서는 같고 판정 의미도 같다.
+- 같은 시간 버킷과 한 event의 다중 alert tie, filter·page 조합도 결정론적이다.
 - CSV 내보내기는 전체 건수와 내용을 보존하고 최신순이다.
 
 ### 9.2 Swing 동작 테스트
@@ -186,7 +234,7 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 9.3 성능 측정
 
-동일한 장비·JDK·actual Bundle에서 최적화 전후를 측정한다. 짧은 경로는 warm-up 후 3회 중앙값을 쓰고, 긴 실제 경로는 1회 cold와 2회 warm 값을 모두 기록한다. 시간과 최대 RSS를 함께 남긴다.
+동일한 장비·JDK·actual v1 Bundle에서 Java 최적화 전후를 측정해 계약 migration 효과와 섞지 않는다. 짧은 경로는 warm-up 후 3회 중앙값을 쓰고, 긴 실제 경로는 1회 cold와 2회 warm 값을 모두 기록한다. 시간과 최대 RSS를 함께 남긴다. 별도로 actual v2 Bundle의 load·replay가 v1과 같은 의미 결과를 내는지 검증한다.
 
 | 지표 | 기준 | 완료 목표 |
 |---|---:|---:|
@@ -200,30 +248,36 @@ Bundle 로더, replay validator와 cursor에 존재하는 파일 재읽기·재�
 
 ### 9.4 Gradle 검증 lane
 
-로컬 actual Bundle을 사용하는 네 테스트에는 공통 JUnit tag를 부여한다. 기본 `test` 계약은 유지하되 다음 보조 task를 제공한다.
+로컬 actual Bundle을 사용하는 테스트는 v1 단독 회귀와 v1↔v2 비교에 서로 다른 JUnit tag를 부여한다. 기본 `test` 계약은 유지하되 다음 보조 task를 제공한다.
 
 - `fastTest`: actual Bundle tag를 제외한 빠른 개발 검증
 - `actualBundleTest`: actual Bundle tag만 실행하며 `SFEP_ACTUAL_BUNDLE`이 없으면 skip이 아니라 명확히 실패
+- `actualBundleV2Test`: `SFEP_ACTUAL_BUNDLE`과 `SFEP_ACTUAL_BUNDLE_V2`를 모두 요구해 v2 load·v1 대비 의미 동일성을 검증하며, 어느 하나라도 없으면 변수 이름을 포함해 명확히 실패
 - `test`: 현재처럼 전체 test class를 대상으로 하며 실제 Bundle 환경변수가 없으면 기존 assumption에 따라 actual test만 skip
 
-실행 명령은 기존 계약인 `./sfep-server/gradlew -p equipment-monitor ...`를 유지한다. 같은 저장소에 두 번째 Gradle wrapper를 복제하지 않는다. 최종 완료 전에는 `fastTest`, 기본 `test`, actual Bundle이 설정된 `actualBundleTest`를 모두 실행한다.
+`actualBundleTest`는 v1 tag만, `actualBundleV2Test`는 v1↔v2 비교 tag만 선택해 서로를 잘못 수집하지 않는다. 실행 명령은 기존 계약인 `./sfep-server/gradlew -p equipment-monitor ...`를 유지한다. 같은 저장소에 두 번째 Gradle wrapper를 복제하지 않는다. 최종 완료 전에는 `fastTest`, 기본 `test`, actual Bundle이 설정된 `actualBundleTest`와 `actualBundleV2Test`를 모두 실행한다.
 
 ## 10. 구현 순서와 커밋 경계
 
-1. benchmark·reference parity test 추가
-2. 이벤트 값 snapshot과 증분 집계
-3. 품질규칙·운전범위 불변 색인
-4. page 기반 최신순 history projection
-5. 비동기 filter·typeahead·새 데이터 동작
-6. 시작 화면·접근성·renderer 정리
-7. actual Bundle 회귀·성능 측정과 한국어 결과 문서
+1. v1 고정 회귀와 v2 profile·cross-version tamper test
+2. versioned embedded schema registry와 `BundleContract` loader
+3. benchmark·reference parity test 추가
+4. 이벤트 값 snapshot과 증분 집계
+5. 품질규칙·운전범위 불변 색인
+6. cursor replay ordinal과 내부 history record
+7. page 기반 최신순 history projection
+8. 비동기 filter·typeahead·새 데이터 동작
+9. 시작 화면·접근성·renderer 정리
+10. actual v1/v2 Bundle 회귀·성능 측정과 한국어 결과 문서
 
-각 단계는 테스트가 통과하는 작은 로컬 커밋으로 남긴다. Python producer 최적화와 파일 변경을 섞지 않는다.
+공유 v2 계약과 Python·Java 양쪽 contract support는 어느 한쪽만 남아 깨지지 않도록 하나의 별도 호환성 커밋 경계로 관리한다. 이후 Java/Swing 최적화는 Python 계산 최적화와 섞지 않고 테스트가 통과하는 작은 로컬 커밋으로 남긴다.
 
 ## 11. 완료 정의
 
 - 전체 Java 테스트와 새 동일성·UI 테스트가 통과한다.
-- 실제 Bundle의 판정 내용과 건수가 기존과 같다.
+- 기존 실제·golden v1 Bundle이 그대로 로드되고 고정 ID 검증을 통과한다.
+- 새 actual v2 Bundle의 새 ID·schema digest·artifact attestation이 검증된다.
+- actual v1/v2 Bundle의 판정 내용과 건수가 identity-normalized 비교에서 같다.
 - 모든 시간 기반 화면과 CSV가 최신순이다.
 - 전체 이력을 유지하면서 UI model 보유 row가 page 상한을 넘지 않는다.
 - 실제 Swing 프로그램을 실행해 로딩, 재생, 검색, page 이동과 새 데이터 동작을 확인한다.
