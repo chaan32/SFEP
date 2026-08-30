@@ -19,6 +19,21 @@ import threading
 import pytest
 
 
+@pytest.fixture(scope="session")
+def actual_v1_bundle() -> Path:
+    """Return only the explicitly selected local v1 bundle."""
+    variable = "SFEP_ACTUAL_BUNDLE"
+    configured = os.environ.get(variable)
+    if configured is None:
+        pytest.skip(f"{variable} is not set")
+    path = Path(configured)
+    if not path.is_absolute():
+        pytest.fail(f"{variable} must be an absolute path")
+    if not path.is_dir():
+        pytest.fail(f"{variable} must name an existing directory")
+    return path
+
+
 _BOOTSTRAP = r"""
 import json
 import sys
