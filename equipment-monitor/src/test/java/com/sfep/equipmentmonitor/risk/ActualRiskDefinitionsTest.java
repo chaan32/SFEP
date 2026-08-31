@@ -3,6 +3,7 @@ package com.sfep.equipmentmonitor.risk;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,12 +13,13 @@ import java.util.stream.StreamSupport;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+@Tag("actual-bundle-v1")
 class ActualRiskDefinitionsTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Test
     void compilesTheLocallySealedActualDefinitionsAndFindsTheCcrDangerRule() throws Exception {
-        String configured = System.getenv("SFEP_ACTUAL_BUNDLE");
+        String configured = System.getProperty("sfep.actual-bundle", System.getenv("SFEP_ACTUAL_BUNDLE"));
         assumeTrue(configured != null && !configured.isBlank(), "local-only actual bundle not configured");
         Path bundle = Path.of(configured);
         JsonNode rangesJson = JSON.readTree(Files.readAllBytes(bundle.resolve("equipment_operating_ranges.json")));

@@ -472,6 +472,29 @@ def holdout_metrics(
         or any(character not in "0123456789abcdef" for character in criteria_id[7:])
     ):
         raise ValueError("criteria_id must be a lowercase SHA-256 URI")
+    return _holdout_metrics(split, rules, criteria_id)
+
+
+def holdout_metrics_with_seed(
+    split,
+    rules,
+    bootstrap_seed,
+) -> list[dict[str, object]]:
+    """Evaluate holdout metrics from explicit authenticated seed material."""
+    from equipment_quality.models import BootstrapSeed, TimeSplitResult
+
+    if type(split) is not TimeSplitResult:
+        raise TypeError("split must be an exact TimeSplitResult")
+    if type(bootstrap_seed) is not BootstrapSeed:
+        raise TypeError("bootstrap_seed must be an exact BootstrapSeed")
+    return _holdout_metrics(split, rules, bootstrap_seed.material)
+
+
+def _holdout_metrics(
+    split,
+    rules,
+    seed_material: str,
+) -> list[dict[str, object]]:
     rule_snapshot = _rules_snapshot(rules)
     evaluated: list[dict[str, object]] = []
     for raw_row in split.holdout_rows.to_dict(orient="records"):
@@ -497,7 +520,7 @@ def holdout_metrics(
         for charge in charge_ids
     }
     seed = hashlib.sha256(
-        (criteria_id + "\0holdout-bootstrap-v1").encode("utf-8")
+        (seed_material + "\0holdout-bootstrap-v1").encode("utf-8")
     ).digest()
     result: list[dict[str, object]] = []
     for profile_name, grades in (
@@ -690,16 +713,6 @@ _ARTIFACT_ROLES = (
     "analysis_summary",
 )
 _PUBLISHED_ARTIFACT_ROLES = _ARTIFACT_ROLES[1:]
-_ARTIFACT_SCHEMA_VERSIONS = {
-    "analysis_config": "sfep-analysis-config/v1",
-    "producer_runtime": "sfep-producer-runtime/v1",
-    "equipment_operating_ranges": "sfep-operating-ranges/v1",
-    "quality_risk_intervals": "sfep-quality-rules/v1",
-    "replay_events": "sfep-replay-events/v1",
-    "analysis_summary": "sfep-analysis-summary/v1",
-}
-
-
 def _normalized_leaf_paths(value: object, prefix: str = "") -> set[str]:
     if isinstance(value, Mapping):
         if not value:
@@ -753,7 +766,7 @@ def _artifact_lineage_paths(
         "artifacts": [
             {
                 "role": role,
-                "schemaVersion": _ARTIFACT_SCHEMA_VERSIONS[role],
+                "schemaVersion": request.contract.artifact_versions[role],
                 "sha256": "sha256:" + "0" * 64,
                 "sizeBytes": 0,
             }
@@ -765,7 +778,7 @@ def _artifact_lineage_paths(
         "criteriaIdentity": request.criteria_identity.fields,
         "identity": request.bundle_identity.fields,
         "labelMaturityDays": request.analysis_config.label_maturity_days,
-        "schemaVersion": "sfep-equipment-bundle/v1",
+        "schemaVersion": request.contract.manifest_version,
         "timezone": request.analysis_config.timezone,
     }
     payloads: dict[str, object] = {
@@ -776,13 +789,17 @@ def _artifact_lineage_paths(
             "asOf": request.split.as_of.isoformat(),
             "criteriaId": request.criteria_identity.value,
             "ranges": request.operating_ranges.to_wire(),
-            "schemaVersion": "sfep-operating-ranges/v1",
+            "schemaVersion": request.contract.artifact_versions[
+                "equipment_operating_ranges"
+            ],
         },
         "quality_risk_intervals": {
             "asOf": request.split.as_of.isoformat(),
             "criteriaId": request.criteria_identity.value,
             "rules": request.quality_rules.to_wire(),
-            "schemaVersion": "sfep-quality-rules/v1",
+            "schemaVersion": request.contract.artifact_versions[
+                "quality_risk_intervals"
+            ],
         },
         "replay_events": [_replay_event_payload(event) for event in request.events],
         "analysis_summary": summary_payload,
@@ -978,6 +995,7 @@ def _quality_feature_node(field: str) -> str:
 def _concrete_quality_lineage(
     rules: QualityRulesResult,
     config: AnalysisConfig,
+    bootstrap_seed=None,
 ) -> dict[str, dict[str, list[str]]]:
     if type(rules) is not QualityRulesResult:
         raise TypeError("quality lineage requires a rich QualityRulesResult")
@@ -1272,10 +1290,15 @@ def _concrete_quality_lineage(
                 if split_name == "discovery"
                 else "config.qualityRisk.minimumConfirmationDefects"
             )
+            seed_lineage_dependencies = (
+                ("identity.criteria_id",)
+                if bootstrap_seed is None
+                else bootstrap_seed.lineage_dependencies
+            )
             bootstrap_seed_dependencies = {
                 "config.bootstrap.minimumValidReplicates",
                 "config.bootstrap.replicates",
-                "identity.criteria_id",
+                *seed_lineage_dependencies,
                 "quality_risk_intervals.rules[].ruleId",
                 "replay_events.charge_id",
             }
@@ -1507,6 +1530,11 @@ def _field_lineage(
         for role, paths in role_paths.items()
         if role != "bundle_manifest"
         for path in paths
+        if (role, path)
+        not in {
+            ("analysis_config", "bootstrap.seedMaterial"),
+            ("analysis_config", "bootstrap.seedProtocol"),
+        }
     }
     artifact_version_nodes = {
         role + ".schemaVersion"
@@ -1994,7 +2022,7 @@ def _field_lineage(
                     }
                     bootstrap_dependencies = {
                         "config.bootstrap.replicates",
-                        "identity.criteria_id",
+                        *request.bootstrap_seed.lineage_dependencies,
                         "replay_events.charge_id",
                     }
                     if leaf != "validReplicates":
@@ -2010,11 +2038,19 @@ def _field_lineage(
                             dependencies.update(bootstrap_dependencies)
                     else:
                         dependencies = set(metric_inputs[metric_name])
-                        if leaf != "pointEstimate" and metric_name in {
+                        bootstrap_metric_names = {
                             "alertRate",
                             "recall",
                             "falseAlertsPer100",
-                        }:
+                        }
+                        if request.contract.summary_version == (
+                            "sfep-analysis-summary/v2"
+                        ):
+                            bootstrap_metric_names.update({"precision", "lift"})
+                        if (
+                            leaf != "pointEstimate"
+                            and metric_name in bootstrap_metric_names
+                        ):
                             matching = (
                                 holdout_alert_dependencies
                                 if metric_name == "alertRate"
@@ -2262,7 +2298,11 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
         raise TypeError("request must be an exact SummaryBuildRequest")
     rules = request.quality_rules.to_wire()
     quality_lineage = _normalize_quality_lineage(
-        _concrete_quality_lineage(request.quality_rules, request.analysis_config)
+        _concrete_quality_lineage(
+            request.quality_rules,
+            request.analysis_config,
+            request.bootstrap_seed,
+        )
     )
     populations = _population_keys(request)
     replay_dates = [event.replay_date.isoformat() for event in request.events]
@@ -2277,10 +2317,10 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
         },
         "driftMetrics": _drift_metrics(request),
         "evaluationMode": "LOCKED_RETROSPECTIVE_HOLDOUT",
-        "holdoutMetrics": holdout_metrics(
+        "holdoutMetrics": holdout_metrics_with_seed(
             request.split,
             rules,
-            request.criteria_identity.value,
+            request.bootstrap_seed,
         ),
         "innerSplitDate": request.split.discovery_cutoff.isoformat(),
         "labelCensoringCounts": _observed_nonzero_counts(
@@ -2291,7 +2331,7 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
             request.genealogy.audit.get("quarantine"),
             "quarantine counts",
         ),
-        "schemaVersion": "sfep-analysis-summary/v1",
+        "schemaVersion": request.contract.summary_version,
         "sourceColumnProfiles": _source_profiles(request),
         "splitCounts": _split_counts(request),
     }
@@ -2302,7 +2342,7 @@ def build_summary(request: SummaryBuildRequest) -> dict[str, object]:
         "populations": [item.to_wire() for item in populations],
     }
     canonical_json_bytes(summary)
-    from equipment_quality.schema import validate_normative_instance
+    from equipment_quality.schema import validate_contract_instance
 
-    validate_normative_instance("analysis_summary.schema.json", summary)
+    validate_contract_instance(request.contract, "analysis_summary", summary)
     return summary

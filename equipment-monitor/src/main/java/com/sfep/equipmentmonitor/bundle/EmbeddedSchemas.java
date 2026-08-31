@@ -11,11 +11,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collections;
 import java.util.EnumMap;
-import java.util.List;
 import java.util.Map;
 
 public final class EmbeddedSchemas {
-    private static final String RESOURCE_ROOT = "contracts/equipment-monitor/v1/";
     private static final ObjectMapper JSON = new ObjectMapper();
     private final Map<SchemaRole, SchemaDocument> documents;
 
@@ -24,26 +22,35 @@ public final class EmbeddedSchemas {
     }
 
     public static EmbeddedSchemas load() {
+        return from(BundleContracts.require("sfep-equipment-bundle/v1"));
+    }
+
+    static EmbeddedSchemas from(BundleContract contract) {
+        return new EmbeddedSchemas(contract.schemas());
+    }
+
+    static SchemaDocument loadDocument(String resourceName, String expectedDigest) {
         SchemaRegistry registry = SchemaRegistry.withDefaultDialect(SpecificationVersion.DRAFT_2020_12);
-        EnumMap<SchemaRole, SchemaDocument> result = new EnumMap<>(SchemaRole.class);
-        for (SchemaRole role : SchemaRole.values()) {
-            String resourceName = RESOURCE_ROOT + role.fileName();
-            try (InputStream input = EmbeddedSchemas.class.getClassLoader().getResourceAsStream(resourceName)) {
-                if (input == null) {
-                    throw new BundleLoadException("EMBEDDED_SCHEMA_MISSING", resourceName);
-                }
-                byte[] bytes = input.readAllBytes();
-                JsonNode schemaNode = JSON.readTree(bytes);
-                Schema schema = registry.getSchema(schemaNode);
-                result.put(role, new SchemaDocument(bytes, Digests.sha256Uri(bytes), schema));
-            } catch (IOException | RuntimeException error) {
-                if (error instanceof BundleLoadException loadError) {
-                    throw loadError;
-                }
-                throw new BundleLoadException("EMBEDDED_SCHEMA_INVALID", resourceName, error);
+        try (InputStream input = EmbeddedSchemas.class.getClassLoader().getResourceAsStream(resourceName)) {
+            if (input == null) {
+                throw new BundleLoadException("EMBEDDED_SCHEMA_MISSING", resourceName);
             }
+            byte[] bytes = input.readAllBytes();
+            String actualDigest = Digests.sha256Uri(bytes);
+            if (!expectedDigest.equals(actualDigest)) {
+                throw new BundleLoadException(
+                        "EMBEDDED_SCHEMA_DIGEST_MISMATCH",
+                        resourceName + " expected " + expectedDigest + " but found " + actualDigest);
+            }
+            JsonNode schemaNode = JSON.readTree(bytes);
+            Schema schema = registry.getSchema(schemaNode);
+            return new SchemaDocument(bytes, actualDigest, schema);
+        } catch (IOException | RuntimeException error) {
+            if (error instanceof BundleLoadException loadError) {
+                throw loadError;
+            }
+            throw new BundleLoadException("EMBEDDED_SCHEMA_INVALID", resourceName, error);
         }
-        return new EmbeddedSchemas(result);
     }
 
     public Map<SchemaRole, SchemaDocument> documents() {
@@ -59,7 +66,7 @@ public final class EmbeddedSchemas {
     }
 
     public void validate(SchemaRole role, JsonNode instance, String errorCode) {
-        List<Error> errors = document(role).schema().validate(instance);
+        java.util.List<Error> errors = document(role).schema().validate(instance);
         if (!errors.isEmpty()) {
             throw new BundleLoadException(errorCode, role.identityRole() + " " + errors.getFirst());
         }

@@ -29,6 +29,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
 CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v1"
 PACKAGED_CONTRACT_ROOT = ANALYSIS_ROOT / "equipment_quality/contracts/v1"
+V2_CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v2"
+V2_PACKAGED_CONTRACT_ROOT = ANALYSIS_ROOT / "equipment_quality/contracts/v2"
 SCHEMA_NAMES = (
     "bundle_manifest.schema.json",
     "analysis_config.schema.json",
@@ -49,6 +51,11 @@ LITERAL_ROOT_SHA256 = {
 }
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
+V2_SCHEMA_NAMES = (
+    "bundle_manifest.schema.json",
+    "analysis_config.schema.json",
+    "analysis_summary.schema.json",
+)
 
 
 def _valid_replay_row() -> dict[str, object]:
@@ -130,6 +137,12 @@ def _lineage_field(
     )
 
 
+def _v2_validator(name: str) -> Draft202012Validator:
+    schema = json.loads((V2_CONTRACT_ROOT / name).read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
 def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schemas():
     assert not (ANALYSIS_ROOT / "equipment_quality/analysis_config.schema.json").exists()
     assert sorted(path.name for path in PACKAGED_CONTRACT_ROOT.glob("*.schema.json")) == sorted(
@@ -141,6 +154,132 @@ def test_source_package_has_exact_byte_identical_copies_of_all_seven_root_schema
         assert hashlib.sha256(normative).hexdigest() == LITERAL_ROOT_SHA256[name]
         assert packaged == normative
         assert schema_module.normative_schema_bytes(name) == normative
+
+
+def test_v2_schema_resources_are_byte_identical_and_leave_v1_digests_immutable():
+    assert sorted(path.name for path in V2_PACKAGED_CONTRACT_ROOT.glob("*.schema.json")) == sorted(
+        V2_SCHEMA_NAMES
+    )
+    for name in V2_SCHEMA_NAMES:
+        assert (V2_PACKAGED_CONTRACT_ROOT / name).read_bytes() == (
+            V2_CONTRACT_ROOT / name
+        ).read_bytes()
+    for name, expected_digest in LITERAL_ROOT_SHA256.items():
+        assert hashlib.sha256((CONTRACT_ROOT / name).read_bytes()).hexdigest() == expected_digest
+
+
+def test_v2_analysis_config_schema_requires_valid_seed_material_and_protocol():
+    validator = _v2_validator("analysis_config.schema.json")
+    actual = json.loads((ANALYSIS_ROOT / "analysis_config_v2.json").read_text(encoding="utf-8"))
+    golden = json.loads(
+        (V2_CONTRACT_ROOT / "golden-config/analysis_config.json").read_text(encoding="utf-8")
+    )
+    validator.validate(actual)
+    validator.validate(golden)
+    for key, value in (
+        ("seedMaterial", None),
+        ("seedMaterial", "sha256:not-a-digest"),
+        ("seedProtocol", None),
+        ("seedProtocol", "UNVERSIONED_RANDOM_SEED"),
+    ):
+        invalid = copy.deepcopy(actual)
+        if value is None:
+            del invalid["bootstrap"][key]
+        else:
+            invalid["bootstrap"][key] = value
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+    for key, forged_value in (
+        ("schemaVersion", "sfep-analysis-config/v1"),
+        ("analysisConfigVersion", "quality-analysis-v1"),
+    ):
+        invalid = copy.deepcopy(actual)
+        invalid[key] = forged_value
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+
+def test_v2_summary_dependency_grammar_accepts_only_bootstrap_seed_terminals():
+    validator = _v2_validator("analysis_summary.schema.json")
+    for dependency in ("config.bootstrap.seedMaterial", "config.bootstrap.seedProtocol"):
+        valid = _transitional_summary()
+        valid["schemaVersion"] = "sfep-analysis-summary/v2"
+        valid["lineage"]["fields"][0]["dependencies"] = [dependency]
+        validator.validate(valid)
+    invalid = _transitional_summary()
+    invalid["schemaVersion"] = "sfep-analysis-summary/v2"
+    invalid["lineage"]["fields"][0]["dependencies"] = ["config.bootstrap.seedGenerator"]
+    with pytest.raises(ValidationError):
+        validator.validate(invalid)
+
+
+def test_v2_summary_analysis_config_output_fields_allow_only_seed_pair():
+    validator = _v2_validator("analysis_summary.schema.json")
+    for output_field, dependency in (
+        ("bootstrap.seedMaterial", "config.bootstrap.seedMaterial"),
+        ("bootstrap.seedProtocol", "config.bootstrap.seedProtocol"),
+    ):
+        valid = _transitional_summary()
+        valid["schemaVersion"] = "sfep-analysis-summary/v2"
+        field = next(
+            field
+            for field in valid["lineage"]["fields"]
+            if field["artifactRole"] == "analysis_config"
+            and field["outputField"] == "bootstrap.replicates"
+        )
+        field["outputField"] = output_field
+        field["dependencies"] = [dependency]
+        validator.validate(valid)
+    for output_field in ("bootstrap.seed", "bootstrap.seedMaterialHash"):
+        invalid = _transitional_summary()
+        invalid["schemaVersion"] = "sfep-analysis-summary/v2"
+        field = next(
+            field
+            for field in invalid["lineage"]["fields"]
+            if field["artifactRole"] == "analysis_config"
+            and field["outputField"] == "bootstrap.replicates"
+        )
+        field["outputField"] = output_field
+        field["dependencies"] = ["config.bootstrap.seedMaterial"]
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+
+def test_v2_summary_schema_rejects_non_v2_schema_version():
+    validator = _v2_validator("analysis_summary.schema.json")
+    valid = _transitional_summary()
+    valid["schemaVersion"] = "sfep-analysis-summary/v2"
+    validator.validate(valid)
+    valid["schemaVersion"] = "sfep-analysis-summary/v1"
+    with pytest.raises(ValidationError):
+        validator.validate(valid)
+
+
+def test_v2_manifest_enforces_the_exact_artifact_version_matrix():
+    validator = _v2_validator("bundle_manifest.schema.json")
+    manifest = json.loads(
+        (CONTRACT_ROOT / "golden-bundle/bundle_manifest.json").read_text(encoding="utf-8")
+    )
+    manifest["schemaVersion"] = "sfep-equipment-bundle/v2"
+    manifest["artifacts"][0]["schemaVersion"] = "sfep-analysis-config/v2"
+    manifest["artifacts"][5]["schemaVersion"] = "sfep-analysis-summary/v2"
+    validator.validate(manifest)
+    invalid_top_level = copy.deepcopy(manifest)
+    invalid_top_level["schemaVersion"] = "sfep-equipment-bundle/v1"
+    with pytest.raises(ValidationError):
+        validator.validate(invalid_top_level)
+    for index, forged_version in (
+        (0, "sfep-analysis-config/v1"),
+        (1, "sfep-producer-runtime/v2"),
+        (2, "sfep-operating-ranges/v2"),
+        (3, "sfep-quality-rules/v2"),
+        (4, "sfep-replay-events/v2"),
+        (5, "sfep-analysis-summary/v1"),
+    ):
+        invalid = copy.deepcopy(manifest)
+        invalid["artifacts"][index]["schemaVersion"] = forged_version
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
 
 
 def test_production_digest_pins_are_exact_complete_and_immutable():
@@ -1248,19 +1387,28 @@ def test_wheel_contains_exactly_one_nested_copy_of_each_schema_and_no_legacy_cop
     built_wheel,
 ):
     expected = {
-        f"equipment_quality/contracts/v1/{name}" for name in SCHEMA_NAMES
+        **{
+            f"equipment_quality/contracts/v1/{name}": CONTRACT_ROOT / name
+            for name in SCHEMA_NAMES
+        },
+        **{
+            f"equipment_quality/contracts/v2/{name}": V2_CONTRACT_ROOT / name
+            for name in V2_SCHEMA_NAMES
+        },
     }
     with zipfile.ZipFile(built_wheel) as archive:
         names = archive.namelist()
         schema_members = {name for name in names if name.endswith(".schema.json")}
-        assert schema_members == expected
-        for member in expected:
+        assert schema_members == set(expected)
+        for member, normative_path in expected.items():
             assert names.count(member) == 1
-            name = Path(member).name
             archived = archive.read(member)
-            normative = (CONTRACT_ROOT / name).read_bytes()
+            normative = normative_path.read_bytes()
             assert archived == normative
-            assert hashlib.sha256(archived).hexdigest() == LITERAL_ROOT_SHA256[name]
+            if normative_path.parent == CONTRACT_ROOT:
+                assert hashlib.sha256(archived).hexdigest() == LITERAL_ROOT_SHA256[
+                    normative_path.name
+                ]
         assert "equipment_quality/analysis_config.schema.json" not in names
 
 

@@ -9,6 +9,8 @@ from dataclasses import FrozenInstanceError
 import pandas as pd
 import pytest
 
+import equipment_quality.statistics as statistics_module
+import oracles.v1_execution_trace as v1_oracle
 from equipment_quality.statistics import (
     StandardizedRates,
     Stratum,
@@ -481,6 +483,81 @@ def test_charge_bootstrap_is_reproducible_and_matches_block_golden_ci():
     assert first.reason_code == "NONE"
     assert type(first.lower) is float and math.isfinite(first.lower)
     assert type(first.upper) is float and math.isfinite(first.upper)
+
+
+def test_charge_bootstrap_explicit_seed_preserves_every_draw_and_final_ci(monkeypatch):
+    rows = bootstrap_fixture_with_two_coils_per_charge()
+    original_sampler = statistics_module.deterministic_sample_indices
+    sampled: list[tuple[int, tuple[int, ...]]] = []
+
+    def recording_sampler(seed, replicate, population_size):
+        result = original_sampler(seed, replicate, population_size)
+        sampled.append((replicate, result))
+        return result
+
+    monkeypatch.setattr(
+        statistics_module, "deterministic_sample_indices", recording_sampler
+    )
+    legacy = charge_bootstrap_rr_ci(rows, CRITERIA_ID, RULE_ID, replicates=2000)
+    legacy_sampled = tuple(sampled)
+    sampled.clear()
+
+    explicit = statistics_module.charge_bootstrap_rr_ci_with_seed(
+        rows,
+        CRITERIA_ID,
+        RULE_ID,
+        replicates=2000,
+    )
+
+    assert tuple(sampled) == legacy_sampled
+    assert tuple(replicate for replicate, _ in sampled) == tuple(range(2000))
+    assert explicit == legacy
+    assert (
+        explicit.lower,
+        explicit.upper,
+        explicit.valid_replicates,
+        explicit.reason_code,
+    ) == (
+        legacy.lower,
+        legacy.upper,
+        legacy.valid_replicates,
+        legacy.reason_code,
+    )
+
+
+def test_charge_bootstrap_matches_independent_oracle_for_every_draw_and_ci(monkeypatch):
+    rows = bootstrap_fixture_with_two_coils_per_charge()
+    original_sampler = statistics_module.deterministic_sample_indices
+    observed_samples: list[tuple[int, ...]] = []
+
+    def recording_sampler(seed, replicate, population_size):
+        sample = original_sampler(seed, replicate, population_size)
+        observed_samples.append(sample)
+        return sample
+
+    monkeypatch.setattr(
+        statistics_module, "deterministic_sample_indices", recording_sampler
+    )
+    result = statistics_module.charge_bootstrap_rr_ci_with_seed(
+        rows,
+        CRITERIA_ID,
+        RULE_ID,
+        replicates=2000,
+    )
+
+    independent_samples = v1_oracle.independent_rule_bootstrap_samples(
+        CRITERIA_ID,
+        RULE_ID,
+        population_size=8,
+        replicates=2000,
+    )
+    assert tuple(observed_samples) == independent_samples
+    assert (
+        result.lower,
+        result.upper,
+        result.valid_replicates,
+        result.reason_code,
+    ) == (0.4, 13.0 / 3.0, 2000, "NONE")
 
 
 def test_charge_bootstrap_result_record_is_frozen():

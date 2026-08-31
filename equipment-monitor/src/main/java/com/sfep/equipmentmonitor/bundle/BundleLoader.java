@@ -11,14 +11,7 @@ import java.util.List;
 import java.util.Map;
 
 public final class BundleLoader {
-    private final EmbeddedSchemas schemas;
-
     public BundleLoader() {
-        this(EmbeddedSchemas.load());
-    }
-
-    BundleLoader(EmbeddedSchemas schemas) {
-        this.schemas = schemas;
     }
 
     public LoadedBundle load(Path bundleRoot) {
@@ -29,54 +22,41 @@ public final class BundleLoader {
                 "MANIFEST_JSON_INVALID",
                 "bundle_manifest.json");
         UntrustedManifestClaims claims = UntrustedManifestClaims.extract(manifestNode);
-        verifySchemaDigests(claims);
-        verifyIds(claims);
-        EnumMap<ArtifactRole, ArtifactDescriptor> descriptors = descriptors(claims.artifacts());
+        BundleContract contract = BundleContracts.require(claims.schemaVersion());
+        verifySchemaDigests(contract, claims);
+        EnumMap<ArtifactRole, ArtifactDescriptor> descriptors = descriptors(contract, claims.artifacts());
+        verifyIds(contract, claims);
         verifyIdentityBindings(claims, descriptors);
         verifyArtifactAttestations(layout, descriptors);
 
-        schemas.validate(SchemaRole.BUNDLE_MANIFEST, manifestNode, "MANIFEST_SCHEMA_INVALID");
-        BundleManifest manifest = JsonSupport.bind(
-                manifestNode, BundleManifest.class, "MANIFEST_DTO_INVALID");
-
-        AnalysisConfigDto config = readJson(
-                layout,
-                ArtifactRole.ANALYSIS_CONFIG,
-                descriptors.get(ArtifactRole.ANALYSIS_CONFIG),
-                AnalysisConfigDto.class);
-        ProducerRuntimeDto runtime = readJson(
-                layout,
-                ArtifactRole.PRODUCER_RUNTIME,
-                descriptors.get(ArtifactRole.PRODUCER_RUNTIME),
-                ProducerRuntimeDto.class);
-        OperatingRangesDto ranges = readJson(
-                layout,
-                ArtifactRole.EQUIPMENT_OPERATING_RANGES,
-                descriptors.get(ArtifactRole.EQUIPMENT_OPERATING_RANGES),
-                OperatingRangesDto.class);
-        QualityRulesDto rules = readJson(
-                layout,
-                ArtifactRole.QUALITY_RISK_INTERVALS,
-                descriptors.get(ArtifactRole.QUALITY_RISK_INTERVALS),
-                QualityRulesDto.class);
-
-        verifyArtifactMetadata(manifest, config, runtime, ranges, rules);
+        contract.validate(SchemaRole.BUNDLE_MANIFEST, manifestNode, "MANIFEST_SCHEMA_INVALID");
+        EnumMap<ArtifactRole, JsonNode> jsonArtifacts = readAndValidateJsonArtifacts(
+                contract, layout, descriptors);
 
         SafeFile replayFile = layout.file(ArtifactRole.REPLAY_EVENTS.fileName());
         ArtifactDescriptor replayDescriptor = descriptors.get(ArtifactRole.REPLAY_EVENTS);
-        ReplayMetadata replayMetadata = new ReplayCsvValidator(schemas)
+        ReplayMetadata replayMetadata = new ReplayCsvValidator(EmbeddedSchemas.from(contract))
                 .validate(
                         replayFile,
-                        manifest.bundleId(),
-                        manifest.criteriaId(),
+                        claims.bundleId(),
+                        claims.criteriaId(),
                         replayDescriptor.sizeBytes(),
                         replayDescriptor.sha256());
 
-        AnalysisSummaryDto summary = readJson(
-                layout,
-                ArtifactRole.ANALYSIS_SUMMARY,
-                descriptors.get(ArtifactRole.ANALYSIS_SUMMARY),
-                AnalysisSummaryDto.class);
+        BundleManifest manifest = JsonSupport.bind(
+                manifestNode, BundleManifest.class, "MANIFEST_DTO_INVALID");
+        AnalysisConfigDto config = bind(
+                jsonArtifacts, ArtifactRole.ANALYSIS_CONFIG, AnalysisConfigDto.class);
+        ProducerRuntimeDto runtime = bind(
+                jsonArtifacts, ArtifactRole.PRODUCER_RUNTIME, ProducerRuntimeDto.class);
+        OperatingRangesDto ranges = bind(
+                jsonArtifacts, ArtifactRole.EQUIPMENT_OPERATING_RANGES, OperatingRangesDto.class);
+        QualityRulesDto rules = bind(
+                jsonArtifacts, ArtifactRole.QUALITY_RISK_INTERVALS, QualityRulesDto.class);
+        AnalysisSummaryDto summary = bind(
+                jsonArtifacts, ArtifactRole.ANALYSIS_SUMMARY, AnalysisSummaryDto.class);
+
+        verifyArtifactMetadata(contract, manifest, config, runtime, ranges, rules, summary);
         if (!manifest.bundleId().equals(summary.bundleId())
                 || !manifest.criteriaId().equals(summary.criteriaId())
                 || !manifest.asOf().equals(summary.asOf())) {
@@ -193,10 +173,12 @@ public final class BundleLoader {
         return value;
     }
 
-    private void verifySchemaDigests(UntrustedManifestClaims manifest) {
+    private static void verifySchemaDigests(
+            BundleContract contract,
+            UntrustedManifestClaims manifest) {
         for (SchemaRole role : SchemaRole.values()) {
             String claimed = manifest.identity().get(role.manifestIdentityKey());
-            String embedded = schemas.document(role).sha256();
+            String embedded = contract.schema(role).sha256();
             if (!embedded.equals(claimed)) {
                 throw new BundleLoadException(
                         "SCHEMA_DIGEST_MISMATCH",
@@ -209,33 +191,42 @@ public final class BundleLoader {
                 SchemaRole.EQUIPMENT_OPERATING_RANGES,
                 SchemaRole.QUALITY_RISK_INTERVALS)) {
             String criteriaClaim = manifest.criteriaIdentity().get(role.manifestIdentityKey());
-            if (!schemas.document(role).sha256().equals(criteriaClaim)) {
+            if (!contract.schema(role).sha256().equals(criteriaClaim)) {
                 throw new BundleLoadException("SCHEMA_DIGEST_MISMATCH", "criteria " + role.identityRole());
             }
         }
     }
 
-    private static void verifyIds(UntrustedManifestClaims manifest) {
-        String criteria = IdLines.compute("sfep-criteria-id/v1", manifest.criteriaIdentity()).id();
+    private static void verifyIds(BundleContract contract, UntrustedManifestClaims manifest) {
+        String criteria;
+        String bundle;
+        try {
+            criteria = IdLines.compute(
+                    contract.criteriaIdNamespace(), manifest.criteriaIdentity()).id();
+            bundle = IdLines.compute(contract.bundleIdNamespace(), manifest.identity()).id();
+        } catch (IllegalArgumentException error) {
+            throw new BundleLoadException("MANIFEST_CLAIMS_INVALID", "identity preimage", error);
+        }
         if (!criteria.equals(manifest.criteriaId())) {
             throw new BundleLoadException("CRITERIA_ID_MISMATCH", manifest.criteriaId());
         }
         if (!criteria.equals(manifest.identity().get("criteria_id"))) {
             throw new BundleLoadException("CRITERIA_ID_MISMATCH", "identity.criteria_id");
         }
-        String bundle = IdLines.compute("sfep-bundle-id/v1", manifest.identity()).id();
         if (!bundle.equals(manifest.bundleId())) {
             throw new BundleLoadException("BUNDLE_ID_MISMATCH", manifest.bundleId());
         }
     }
 
-    private static EnumMap<ArtifactRole, ArtifactDescriptor> descriptors(List<ArtifactDescriptor> artifacts) {
+    private static EnumMap<ArtifactRole, ArtifactDescriptor> descriptors(
+            BundleContract contract,
+            List<ArtifactDescriptor> artifacts) {
         EnumMap<ArtifactRole, ArtifactDescriptor> result = new EnumMap<>(ArtifactRole.class);
         for (int index = 0; index < ArtifactRole.values().length; index++) {
             ArtifactRole role = ArtifactRole.values()[index];
             ArtifactDescriptor descriptor = artifacts.get(index);
             if (!role.manifestRole().equals(descriptor.role())
-                    || !role.schemaVersion().equals(descriptor.schemaVersion())
+                    || !contract.artifactVersion(role).equals(descriptor.schemaVersion())
                     || result.put(role, descriptor) != null) {
                 throw new BundleLoadException("MANIFEST_ARTIFACT_INVALID", descriptor.role());
             }
@@ -279,29 +270,54 @@ public final class BundleLoader {
         }
     }
 
-    private <T> T readJson(
+    private static EnumMap<ArtifactRole, JsonNode> readAndValidateJsonArtifacts(
+            BundleContract contract,
             SafeBundleLayout layout,
+            Map<ArtifactRole, ArtifactDescriptor> descriptors) {
+        EnumMap<ArtifactRole, JsonNode> result = new EnumMap<>(ArtifactRole.class);
+        for (ArtifactRole role : ArtifactRole.values()) {
+            if (role == ArtifactRole.REPLAY_EVENTS) {
+                continue;
+            }
+            ArtifactDescriptor descriptor = descriptors.get(role);
+            byte[] consumed = layout.file(role.fileName()).readAllBytes("ARTIFACT_READ_FAILED");
+            ArtifactBytes.verify(role, descriptor, consumed);
+            JsonNode node = JsonSupport.parse(
+                    consumed,
+                    "ARTIFACT_JSON_INVALID",
+                    role.fileName());
+            contract.validate(role.schemaRole(), node, "JSON_SCHEMA_INVALID");
+            result.put(role, node);
+        }
+        return result;
+    }
+
+    private static <T> T bind(
+            Map<ArtifactRole, JsonNode> artifacts,
             ArtifactRole role,
-            ArtifactDescriptor descriptor,
             Class<T> type) {
-        byte[] consumed = layout.file(role.fileName()).readAllBytes("ARTIFACT_READ_FAILED");
-        ArtifactBytes.verify(role, descriptor, consumed);
-        JsonNode node = JsonSupport.parse(
-                consumed,
-                "ARTIFACT_JSON_INVALID",
-                role.fileName());
-        schemas.validate(role.schemaRole(), node, "JSON_SCHEMA_INVALID");
-        return JsonSupport.bind(node, type, "ARTIFACT_DTO_INVALID");
+        return JsonSupport.bind(artifacts.get(role), type, "ARTIFACT_DTO_INVALID");
     }
 
     private static void verifyArtifactMetadata(
+            BundleContract contract,
             BundleManifest manifest,
             AnalysisConfigDto config,
             ProducerRuntimeDto runtime,
             OperatingRangesDto ranges,
-            QualityRulesDto rules) {
-        if (!ArtifactRole.ANALYSIS_CONFIG.schemaVersion().equals(config.schemaVersion())
-                || !ArtifactRole.PRODUCER_RUNTIME.schemaVersion().equals(runtime.schemaVersion())) {
+            QualityRulesDto rules,
+            AnalysisSummaryDto summary) {
+        if (!contract.manifestVersion().equals(manifest.schemaVersion())
+                || !contract.artifactVersion(ArtifactRole.ANALYSIS_CONFIG)
+                        .equals(config.schemaVersion())
+                || !contract.artifactVersion(ArtifactRole.PRODUCER_RUNTIME)
+                        .equals(runtime.schemaVersion())
+                || !contract.artifactVersion(ArtifactRole.EQUIPMENT_OPERATING_RANGES)
+                        .equals(ranges.schemaVersion())
+                || !contract.artifactVersion(ArtifactRole.QUALITY_RISK_INTERVALS)
+                        .equals(rules.schemaVersion())
+                || !contract.artifactVersion(ArtifactRole.ANALYSIS_SUMMARY)
+                        .equals(summary.schemaVersion())) {
             throw new BundleLoadException("ARTIFACT_ID_MISMATCH", "schemaVersion");
         }
         if (!manifest.criteriaId().equals(ranges.criteriaId())

@@ -8,19 +8,21 @@ import com.sfep.equipmentmonitor.risk.RiskDefinitionCompiler;
 import com.sfep.equipmentmonitor.risk.RiskGrade;
 import com.sfep.equipmentmonitor.risk.RangeSelectionReason;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+@Tag("actual-bundle-v1")
 class ActualHistoricalReplayTest {
     private static final String CCR_DANGER_RULE =
             "sha256:a09f13dea430e6292665bd7c2bb5c4dfc5c411808f7adf015a2d33ab612c93bc";
 
     @Test
     void replaysTheEntireLocallySealedBundleAndProducesExplainableCcrAlerts() {
-        String configured = System.getenv("SFEP_ACTUAL_BUNDLE");
+        String configured = System.getProperty("sfep.actual-bundle", System.getenv("SFEP_ACTUAL_BUNDLE"));
         assumeTrue(configured != null && !configured.isBlank(), "local-only actual bundle not configured");
         LoadedBundle bundle = new BundleLoader().load(Path.of(configured));
         RiskDefinitionCompiler compiler = new RiskDefinitionCompiler();

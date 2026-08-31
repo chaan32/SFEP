@@ -21,6 +21,7 @@ from equipment_quality.models import (
     SourceFile,
     SummaryBuildRequest,
     TimeSplitResult,
+    resolve_bootstrap_seed,
 )
 from equipment_quality.operating_ranges import build_operating_ranges_result
 from equipment_quality.quality_intervals import build_quality_rules_result
@@ -337,6 +338,7 @@ def golden_summary_request(*, return_aliases: bool = False):
     )
     request = SummaryBuildRequest(
         analysis_config=config,
+        bootstrap_seed=resolve_bootstrap_seed(config, criteria_identity.value),
         analysis_config_bytes=config_bytes,
         producer_runtime_bytes=runtime_bytes,
         schema_digests=schema_digests,
@@ -510,6 +512,7 @@ def bundle_request(
     *,
     analysis_summary: Mapping[str, object] | None = None,
     quality_schema_version: str = "sfep-quality-rules/v1",
+    manifest_version: str = "sfep-equipment-bundle/v1",
 ) -> BundleWriteRequest:
     request, frozen_summary = _golden_bundle_payload()
     return BundleWriteRequest(
@@ -541,4 +544,5 @@ def bundle_request(
         as_of=request.split.as_of,
         timezone=request.analysis_config.timezone,
         label_maturity_days=request.analysis_config.label_maturity_days,
+        manifest_version=manifest_version,
     )

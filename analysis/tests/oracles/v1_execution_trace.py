@@ -716,6 +716,41 @@ def _sample_indices(seed: bytes, replicate: int, size: int) -> tuple[int, ...]:
     )
 
 
+def independent_rule_bootstrap_samples(
+    seed_material: str,
+    rule_id: str,
+    *,
+    population_size: int,
+    replicates: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Return a stdlib-only rule sample trace independent of production code."""
+    seed = hashlib.sha256(
+        (seed_material + "\0" + rule_id + "\0rule-ci-v1").encode("utf-8")
+    ).digest()
+    return tuple(
+        _sample_indices(seed, replicate, population_size)
+        for replicate in range(replicates)
+    )
+
+
+def independent_holdout_bootstrap_samples(
+    seed_material: str,
+    *,
+    population_size: int,
+    replicates: int,
+    profile_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Return the stdlib-only holdout trace in profile/replicate order."""
+    seed = hashlib.sha256(
+        (seed_material + "\0holdout-bootstrap-v1").encode("utf-8")
+    ).digest()
+    return tuple(
+        _sample_indices(seed, replicate, population_size)
+        for _profile in range(profile_count)
+        for replicate in range(replicates)
+    )
+
+
 def _mh_relative_risk(cells_by_stratum: dict[str, list[int]]) -> float | None:
     if not cells_by_stratum:
         return None

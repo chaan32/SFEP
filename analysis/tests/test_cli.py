@@ -15,8 +15,11 @@ from types import MappingProxyType, SimpleNamespace
 from typing import get_type_hints
 
 import pytest
+from jsonschema.exceptions import ValidationError
 
 from equipment_quality import cli
+import equipment_quality.schema as schema_module
+from equipment_quality.bundle_contract import V1_CONTRACT, V2_CONTRACT
 from equipment_quality.deterministic import canonical_json_bytes, sha256_uri
 from equipment_quality.runtime_verify import RuntimeIdentity
 from equipment_quality.schema import validate_normative_instance
@@ -36,6 +39,7 @@ SCHEMA_ROLE_NAMES = (
     ("analysis_summary", "analysis_summary.schema.json"),
     ("replay_events", "replay_event_row.schema.json"),
 )
+SCHEMA_ROLES = tuple(sorted((role for role, _ in SCHEMA_ROLE_NAMES), key=str.encode))
 CRITERIA_SCHEMA_ROLES = (
     "analysis_config",
     "equipment_operating_ranges",
@@ -78,6 +82,35 @@ def test_cli_public_signatures_are_exact() -> None:
         "argv": Sequence[str] | None,
         "return": int,
     }
+
+
+def test_v2_config_strictly_selects_one_closed_contract_and_profile() -> None:
+    config_bytes = (REPOSITORY_ROOT / "analysis/analysis_config_v2.json").read_bytes()
+
+    contract, config = schema_module.load_analysis_config_contract(config_bytes)
+
+    assert contract is V2_CONTRACT
+    assert config.schema_version == V2_CONTRACT.config_version
+
+    mixed = json.loads(config_bytes)
+    mixed["schemaVersion"] = V1_CONTRACT.config_version
+    with pytest.raises(ValidationError, match="quality-analysis-v1"):
+        schema_module.load_analysis_config_contract(canonical_json_bytes(mixed))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schemaVersion":"sfep-analysis-config/v3"}\n',
+        b'{"schemaVersion":7}\n',
+        b'{"schemaVersion":"sfep-analysis-config/v2","schemaVersion":"sfep-analysis-config/v1"}\n',
+    ),
+)
+def test_config_contract_selection_rejects_unknown_wrong_type_and_duplicate_versions(
+    payload: bytes,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        schema_module.load_analysis_config_contract(payload)
 
 
 def _valid_path_arguments(tmp_path: Path) -> dict[str, Path]:
@@ -517,7 +550,13 @@ def test_runtime_failure_prevents_config_csv_reads_and_output_creation(
     _assert_output_unpublished(paths["output"])
 
 
-def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None = None):
+def _install_stubbed_pipeline(
+    monkeypatch,
+    output: Path,
+    *,
+    fail_at: str | None = None,
+    contract=V1_CONTRACT,
+):
     calls: list[str] = []
     captured: dict[str, object] = {}
     config_bytes = b"exact config bytes\n"
@@ -537,6 +576,7 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
     configured_definitions = (object(), object(), object())
     projection = b"criteria projection\n"
     criteria_identity = SimpleNamespace(value="criteria-id")
+    bootstrap_seed = object()
     bundle_identity = SimpleNamespace(value="bundle-id")
     events = [object(), object()]
     summary_payload = {"summary": "wire"}
@@ -558,7 +598,10 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
         cli, "_read_config_bytes", step("config_bytes", config_bytes), raising=False
     )
     monkeypatch.setattr(
-        cli, "load_analysis_config", step("config_validation", config), raising=False
+        cli,
+        "load_analysis_config_contract",
+        step("config_validation", (contract, config)),
+        raising=False,
     )
     monkeypatch.setattr(cli, "read_inputs", step("read_inputs", inputs), raising=False)
     monkeypatch.setattr(
@@ -572,16 +615,17 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
         raising=False,
     )
 
-    def schema_bytes(name):
-        calls.append(f"schema:{name}")
-        return f"authenticated:{name}".encode("ascii")
+    def schema_bytes(selected_contract, role):
+        assert selected_contract is contract
+        calls.append(f"schema:{role}")
+        return f"authenticated:{role}".encode("ascii")
 
     def schema_digest(payload):
-        name = payload.decode("ascii").removeprefix("authenticated:")
-        calls.append(f"schema_digest:{name}")
-        return f"digest:{name}"
+        role = payload.decode("ascii").removeprefix("authenticated:")
+        calls.append(f"schema_digest:{role}")
+        return f"digest:{role}"
 
-    monkeypatch.setattr(cli, "normative_schema_bytes", schema_bytes, raising=False)
+    monkeypatch.setattr(cli, "contract_schema_bytes", schema_bytes, raising=False)
     monkeypatch.setattr(cli, "sha256_uri", schema_digest, raising=False)
     monkeypatch.setattr(
         cli,
@@ -593,6 +637,12 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
         cli,
         "compute_criteria_identity",
         step("criteria_identity", criteria_identity),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_bootstrap_seed",
+        step("bootstrap_seed", bootstrap_seed),
         raising=False,
     )
 
@@ -616,7 +666,7 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
     )
     monkeypatch.setattr(
         cli,
-        "build_quality_rules_result",
+        "build_quality_rules_result_with_seed",
         step("rules", rules),
         raising=False,
     )
@@ -665,6 +715,7 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
         config_bytes=config_bytes,
         runtime_bytes=runtime_bytes,
         config=config,
+        contract=contract,
         runtime=runtime,
         inputs=inputs,
         sources=sources,
@@ -673,6 +724,7 @@ def _install_stubbed_pipeline(monkeypatch, output: Path, *, fail_at: str | None 
         definitions=configured_definitions,
         projection=projection,
         criteria_identity=criteria_identity,
+        bootstrap_seed=bootstrap_seed,
         material_catalog=material_catalog,
         ranges=ranges,
         rules=rules,
@@ -700,8 +752,8 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
 
     schema_calls = [
         item
-        for role, name in SCHEMA_ROLE_NAMES
-        for item in (f"schema:{name}", f"schema_digest:{name}")
+        for role in SCHEMA_ROLES
+        for item in (f"schema:{role}", f"schema_digest:{role}")
     ]
     assert pipeline.calls == [
         "verify_runtime",
@@ -714,6 +766,7 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
         *schema_calls,
         "criteria_projection",
         "criteria_identity",
+        "bootstrap_seed",
         "ranges",
         "rules",
         "bundle_identity",
@@ -729,7 +782,7 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
 
     assert pipeline.captured["verify_runtime"] == (((paths["runtime"]),), {})
     assert pipeline.captured["config_bytes"] == (((paths["config"]),), {})
-    assert pipeline.captured["config_validation"] == (((paths["config"]),), {})
+    assert pipeline.captured["config_validation"] == (((pipeline.config_bytes),), {})
     assert pipeline.captured["read_inputs"] == (((paths["data"]),), {})
     assert pipeline.captured["genealogy"] == (((pipeline.inputs),), {})
     assert pipeline.captured["split"] == (
@@ -751,9 +804,7 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
     )
     assert tuple(criteria_kwargs["schema_digests"]) == CRITERIA_SCHEMA_ROLES
     assert criteria_kwargs["schema_digests"] == {
-        role: f"digest:{name}"
-        for role, name in SCHEMA_ROLE_NAMES
-        if role in CRITERIA_SCHEMA_ROLES
+        role: f"digest:{role}" for role in CRITERIA_SCHEMA_ROLES
     }
 
     flowing_catalog = pipeline.captured["ranges"][1]["material_catalog"]
@@ -767,7 +818,11 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
         )
         assert args[:3] == expected_prefix
         assert kwargs["material_catalog"] is flowing_catalog
-    assert pipeline.captured["rules"][0][3] == pipeline.criteria_identity.value
+    assert pipeline.captured["bootstrap_seed"] == (
+        (pipeline.config, pipeline.criteria_identity.value),
+        {},
+    )
+    assert pipeline.captured["rules"][0][3] is pipeline.bootstrap_seed
 
     bundle_args, bundle_kwargs = pipeline.captured["bundle_identity"]
     assert bundle_args == (
@@ -776,9 +831,7 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
         pipeline.runtime_bytes,
         pipeline.sources,
     )
-    assert tuple(bundle_kwargs["schema_digests"]) == tuple(
-        role for role, _ in SCHEMA_ROLE_NAMES
-    )
+    assert tuple(bundle_kwargs["schema_digests"]) == SCHEMA_ROLES
     assert pipeline.captured["events"] == (
         (
             pipeline.genealogy,
@@ -790,7 +843,9 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
     )
 
     _, summary_kwargs = pipeline.captured["summary_request"]
+    assert summary_kwargs["contract"] is pipeline.contract
     assert summary_kwargs["analysis_config"] is pipeline.config
+    assert summary_kwargs["bootstrap_seed"] is pipeline.bootstrap_seed
     assert summary_kwargs["analysis_config_bytes"] is pipeline.config_bytes
     assert summary_kwargs["producer_runtime_bytes"] is pipeline.runtime_bytes
     assert summary_kwargs["definitions"] is pipeline.definitions
@@ -799,6 +854,8 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
     assert pipeline.captured["summary"] == (((pipeline.summary_request),), {})
 
     _, bundle_kwargs = pipeline.captured["bundle_request"]
+    assert bundle_kwargs["contract"] is pipeline.contract
+    assert bundle_kwargs["manifest_version"] == pipeline.contract.manifest_version
     assert bundle_kwargs["output_root"] == paths["output"]
     assert bundle_kwargs["producer_runtime"] is pipeline.runtime_bytes
     assert bundle_kwargs["equipment_operating_ranges"] == {
@@ -814,6 +871,34 @@ def test_orchestration_uses_one_config_runtime_snapshot_and_exact_fixed_order(
         "rules": pipeline.rule_wire,
     }
     assert pipeline.captured["write"] == (((pipeline.bundle_request),), {})
+
+
+def test_v2_cli_flow_uses_selected_contract_for_every_output_version(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    paths = _valid_path_arguments(tmp_path)
+    pipeline = _install_stubbed_pipeline(
+        monkeypatch,
+        paths["output"],
+        contract=V2_CONTRACT,
+    )
+
+    cli.run_analysis(
+        paths["config"], paths["runtime"], paths["data"], paths["output"]
+    )
+
+    _, summary_kwargs = pipeline.captured["summary_request"]
+    _, bundle_kwargs = pipeline.captured["bundle_request"]
+    assert summary_kwargs["contract"] is V2_CONTRACT
+    assert bundle_kwargs["contract"] is V2_CONTRACT
+    assert bundle_kwargs["manifest_version"] == "sfep-equipment-bundle/v2"
+    assert bundle_kwargs["equipment_operating_ranges"]["schemaVersion"] == (
+        "sfep-operating-ranges/v1"
+    )
+    assert bundle_kwargs["quality_risk_intervals"]["schemaVersion"] == (
+        "sfep-quality-rules/v1"
+    )
 
 
 @pytest.mark.parametrize(

@@ -36,7 +36,7 @@ PACKAGE_SPECS = (
     ("tzdata", "2025.2", False),
 )
 PRODUCER_NAME = "sfep-equipment-quality"
-PRODUCER_VERSION = "1.0.0"
+PRODUCER_VERSION = "1.1.0"
 PIP_VERSION = "25.1.1"
 SOURCE_DATE_EPOCH = "1735689600"
 PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
@@ -370,7 +370,7 @@ def build_runtime_fixture(
         PRODUCER_NAME,
         PRODUCER_VERSION,
         payload_files={
-            "equipment_quality/__init__.py": b'__version__ = "1.0.0"\n',
+            "equipment_quality/__init__.py": b'__version__ = "1.1.0"\n',
             PROVENANCE_PATH: canonical_json_bytes(provenance),
         },
         direct_url_bytes=direct_url_bytes,
@@ -422,7 +422,7 @@ def build_runtime_fixture(
             "name": "equipment-quality",
             "version": PRODUCER_VERSION,
             "wheelFilename": (
-                "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+                "sfep_equipment_quality-1.1.0-py3-none-any.whl"
             ),
             "wheelSha256": _wheel_sha(PRODUCER_NAME),
             "installedCodeTreeSha256": independent_installed_code_tree(
@@ -662,7 +662,7 @@ def two_wheels(
     first_payload: bytes,
     second_payload: bytes | None = None,
 ) -> tuple[Path, Path]:
-    filename = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+    filename = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
     wheel_a = root / "wheel-a" / filename
     wheel_b = root / "wheel-b" / filename
     wheel_a.parent.mkdir(parents=True)

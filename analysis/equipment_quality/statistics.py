@@ -466,8 +466,44 @@ def charge_bootstrap_rr_ci(
     replicate_count = _uint64(replicates, "replicates")
     if replicate_count == 0:
         raise ValueError("replicates must be positive")
+    return _charge_bootstrap_rr_ci(
+        blocks,
+        criteria,
+        rule,
+        replicate_count,
+    )
+
+
+def charge_bootstrap_rr_ci_with_seed(
+    rows: pd.DataFrame,
+    seed_material: str,
+    rule_id: str,
+    *,
+    replicates: int,
+) -> BootstrapCi:
+    """Return the Charge-block CI from explicit authenticated seed material."""
+    blocks = _charge_blocks(rows)
+    material = _sha256_identifier(seed_material, "seed_material")
+    rule = _sha256_identifier(rule_id, "rule_id")
+    replicate_count = _uint64(replicates, "replicates")
+    if replicate_count == 0:
+        raise ValueError("replicates must be positive")
+    return _charge_bootstrap_rr_ci(blocks, material, rule, replicate_count)
+
+
+def _charge_bootstrap_rr_ci(
+    blocks: tuple[tuple[tuple[str, int, int, int, int], ...], ...],
+    seed_material: str,
+    rule_id: str,
+    replicate_count: int,
+) -> BootstrapCi:
     seed = hashlib.sha256(
-        criteria.encode("utf-8") + b"\0" + rule.encode("utf-8") + b"\0rule-ci-v1"
+        (
+            seed_material.encode("utf-8")
+            + b"\0"
+            + rule_id.encode("utf-8")
+            + b"\0rule-ci-v1"
+        )
     ).digest()
     population_size = len(blocks)
     if population_size == 0:

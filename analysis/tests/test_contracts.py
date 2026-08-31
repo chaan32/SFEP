@@ -28,6 +28,10 @@ from jsonschema.validators import validator_for
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ANALYSIS_ROOT = REPOSITORY_ROOT / "analysis"
 CONTRACT = REPOSITORY_ROOT / "contracts/equipment-monitor/v1"
+V2_CONTRACT = REPOSITORY_ROOT / "contracts/equipment-monitor/v2"
+ACTUAL_V2_SEED = "sha256:c0a9d1f3f0d655c24d2eeddc58f1905672d2f72d7ffd0d14e87bdecb118a2a26"
+GOLDEN_V2_SEED = "sha256:8c88d3109bd6945b76317ee415c7821524f515c9bd79d36b8072c285c6434af7"
+V1_ANALYSIS_CONFIG_SHA256 = "bb2610971dc1b3adcb4e93b9d26a50fdb4070292ffc4bf4a26ce7cdde0f5fb0b"
 SCHEMA_NAMES = [
     "bundle_manifest.schema.json",
     "analysis_config.schema.json",
@@ -2103,6 +2107,55 @@ def test_analysis_config_contains_the_exact_quality_analysis_v1_policy():
     ]
     assert set(config["fdrFamilies"]) == {"NUMERIC", "CATEGORICAL", "INTERACTION"}
     assert {entry["field"]: entry["firstAvailableStage"] for entry in config["fields"]}["judge"] == "AP_RECORDED_WITH_RESULT"
+
+
+def test_v2_configs_have_exact_versions_and_dedicated_bootstrap_seeds():
+    actual_v1_config = json.loads(
+        (ANALYSIS_ROOT / "analysis_config.json").read_text(encoding="utf-8")
+    )
+    golden_v1_config = json.loads(
+        (CONTRACT / "golden-bundle/analysis_config.json").read_text(encoding="utf-8")
+    )
+    actual_v2_config = json.loads(
+        (ANALYSIS_ROOT / "analysis_config_v2.json").read_text(encoding="utf-8")
+    )
+    golden_v2_config = json.loads(
+        (V2_CONTRACT / "golden-config/analysis_config.json").read_text(encoding="utf-8")
+    )
+    assert actual_v2_config["schemaVersion"] == "sfep-analysis-config/v2"
+    assert actual_v2_config["analysisConfigVersion"] == "quality-analysis-v2"
+    assert actual_v2_config["bootstrap"] == {
+        "minimumValidReplicates": 1900,
+        "replicates": 2000,
+        "seedMaterial": ACTUAL_V2_SEED,
+        "seedProtocol": "LEGACY_CRITERIA_ID_UTF8_V1",
+    }
+    assert golden_v2_config["schemaVersion"] == "sfep-analysis-config/v2"
+    assert golden_v2_config["analysisConfigVersion"] == "quality-analysis-v2"
+    assert golden_v2_config["bootstrap"] == {
+        "minimumValidReplicates": 1900,
+        "replicates": 2000,
+        "seedMaterial": GOLDEN_V2_SEED,
+        "seedProtocol": "LEGACY_CRITERIA_ID_UTF8_V1",
+    }
+    expected_actual_v2 = copy.deepcopy(actual_v1_config)
+    expected_actual_v2["schemaVersion"] = "sfep-analysis-config/v2"
+    expected_actual_v2["analysisConfigVersion"] = "quality-analysis-v2"
+    expected_actual_v2["bootstrap"].update(
+        seedMaterial=ACTUAL_V2_SEED,
+        seedProtocol="LEGACY_CRITERIA_ID_UTF8_V1",
+    )
+    assert actual_v2_config == expected_actual_v2
+    expected_golden_v2 = copy.deepcopy(golden_v1_config)
+    expected_golden_v2["schemaVersion"] = "sfep-analysis-config/v2"
+    expected_golden_v2["analysisConfigVersion"] = "quality-analysis-v2"
+    expected_golden_v2["bootstrap"].update(
+        seedMaterial=GOLDEN_V2_SEED,
+        seedProtocol="LEGACY_CRITERIA_ID_UTF8_V1",
+    )
+    assert golden_v2_config == expected_golden_v2
+    assert hashlib.sha256((ANALYSIS_ROOT / "analysis_config.json").read_bytes()).hexdigest() == V1_ANALYSIS_CONFIG_SHA256
+    assert hashlib.sha256((CONTRACT / "golden-bundle/analysis_config.json").read_bytes()).hexdigest() == V1_ANALYSIS_CONFIG_SHA256
 
 
 def test_slab_grind_config_is_categorical_product_state_evidence():

@@ -1,28 +1,22 @@
 package com.sfep.equipmentmonitor.bundle;
 
 public enum SchemaRole {
-    BUNDLE_MANIFEST("bundle_manifest", "bundle_manifest.schema.json"),
-    ANALYSIS_CONFIG("analysis_config", "analysis_config.schema.json"),
-    PRODUCER_RUNTIME("producer_runtime", "producer_runtime.schema.json"),
-    EQUIPMENT_OPERATING_RANGES("equipment_operating_ranges", "equipment_operating_ranges.schema.json"),
-    QUALITY_RISK_INTERVALS("quality_risk_intervals", "quality_risk_intervals.schema.json"),
-    REPLAY_EVENTS("replay_events", "replay_event_row.schema.json"),
-    ANALYSIS_SUMMARY("analysis_summary", "analysis_summary.schema.json");
+    BUNDLE_MANIFEST("bundle_manifest"),
+    ANALYSIS_CONFIG("analysis_config"),
+    PRODUCER_RUNTIME("producer_runtime"),
+    EQUIPMENT_OPERATING_RANGES("equipment_operating_ranges"),
+    QUALITY_RISK_INTERVALS("quality_risk_intervals"),
+    REPLAY_EVENTS("replay_events"),
+    ANALYSIS_SUMMARY("analysis_summary");
 
     private final String identityRole;
-    private final String fileName;
 
-    SchemaRole(String identityRole, String fileName) {
+    SchemaRole(String identityRole) {
         this.identityRole = identityRole;
-        this.fileName = fileName;
     }
 
     public String identityRole() {
         return identityRole;
-    }
-
-    public String fileName() {
-        return fileName;
     }
 
     public String manifestIdentityKey() {

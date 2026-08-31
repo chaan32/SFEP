@@ -5,6 +5,7 @@ import com.sfep.equipmentmonitor.bundle.LoadedBundle;
 import com.sfep.equipmentmonitor.replay.ReplaySpeed;
 import com.sfep.equipmentmonitor.replay.ReplayStatus;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 
 import javax.swing.JTable;
 import javax.swing.SwingUtilities;
@@ -18,10 +19,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+@Tag("actual-bundle-v1")
 class ActualDesktopMonitorUiTest {
     @Test
     void coalescesTheCompleteActualReplayWithoutLosingOverviewEvidenceOrAlerts() throws Exception {
-        String configured = System.getenv("SFEP_ACTUAL_BUNDLE");
+        String configured = System.getProperty("sfep.actual-bundle", System.getenv("SFEP_ACTUAL_BUNDLE"));
         assumeTrue(configured != null && !configured.isBlank(), "local-only actual bundle not configured");
         LoadedBundle bundle = new BundleLoader().load(Path.of(configured));
         AtomicReference<Runnable> pendingDrain = new AtomicReference<>();

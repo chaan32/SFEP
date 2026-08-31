@@ -466,13 +466,15 @@ def test_bootstrap_selection_uses_metric_applicability_once_per_rule_not_grade(
     for split, field, predicate_value, grade, adjustment_kind in cases:
         calls: list[str] = []
 
-        def successful_bootstrap(_rows, _criteria_id, rule_id, *, replicates):
+        def successful_bootstrap(_rows, _seed_material, rule_id, *, replicates):
             assert replicates == 2000
             calls.append(rule_id)
             return BootstrapCi(0.5, 2.5, 2000, "NONE")
 
         monkeypatch.setattr(
-            quality_intervals, "charge_bootstrap_rr_ci", successful_bootstrap
+            quality_intervals,
+            "charge_bootstrap_rr_ci_with_seed",
+            successful_bootstrap,
         )
         rules = build_quality_rules(split, definitions(config), config, CRITERIA_ID)
         if field == "slab_grind":
@@ -679,10 +681,50 @@ def test_submitted_replicates_fail_preflight_before_worker_start(
 
 def test_worker_input_rejects_replicates_outside_uint64_range():
     task = (*_tiny_bootstrap_task()[:-1], 2**64)
-    payload = pickle.dumps(("sfep-quality-bootstrap/v1", 0, (task,)))
+    payload = pickle.dumps(_bootstrap_worker_v2_request(0, (task,)))
 
     with pytest.raises(RuntimeError, match="replicates"):
         quality_intervals._decode_bootstrap_worker_input(payload)
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        "sfep-quality-bootstrap/v1",
+        "sfep-bootstrap-worker/v2",
+    ],
+)
+def test_worker_v2_rejects_legacy_and_ambiguous_tuple_request_shapes(protocol):
+    message = (protocol, 0, (_tiny_bootstrap_task(),))
+    with pytest.raises(RuntimeError, match="bootstrap worker input protocol"):
+        quality_intervals._decode_bootstrap_worker_input(pickle.dumps(message))
+
+
+def test_worker_v2_request_names_seed_material_explicitly():
+    task = _tiny_bootstrap_task()
+    payload = pickle.dumps(
+        {
+            "protocol": "sfep-bootstrap-worker/v2",
+            "workerOrdinal": 3,
+            "tasks": (
+                {
+                    "index": task[0],
+                    "rows": task[1],
+                    "seedMaterial": task[2],
+                    "ruleId": task[3],
+                    "replicates": task[4],
+                },
+            ),
+        }
+    )
+
+    ordinal, decoded = quality_intervals._decode_bootstrap_worker_input(payload)
+
+    assert ordinal == 3
+    assert len(decoded) == 1
+    assert decoded[0][0] == task[0]
+    pd.testing.assert_frame_equal(decoded[0][1], task[1])
+    assert decoded[0][2:] == task[2:]
 
 
 @pytest.mark.parametrize(
@@ -766,6 +808,23 @@ def _tiny_bootstrap_task(index=0, digit="1"):
         columns=("charge_id", "stratum", "candidate", "judge"),
     )
     return index, rows, CRITERIA_ID, _bootstrap_rule_id(digit), 2000
+
+
+def _bootstrap_worker_v2_request(worker_ordinal, tasks):
+    return {
+        "protocol": "sfep-bootstrap-worker/v2",
+        "workerOrdinal": worker_ordinal,
+        "tasks": tuple(
+            {
+                "index": task[0],
+                "rows": task[1],
+                "seedMaterial": task[2],
+                "ruleId": task[3],
+                "replicates": task[4],
+            }
+            for task in tasks
+        ),
+    }
 
 
 def _weighted_bootstrap_task(index: int, digit: str, unique_charges: int):
@@ -870,7 +929,7 @@ def test_partial_worker_payload_fails_closed_and_reaps(monkeypatch):
 def test_worker_ordinal_mismatch_fails_closed_before_results_are_returned(monkeypatch):
     payload = pickle.dumps(
         (
-            "sfep-quality-bootstrap/v1",
+            "sfep-bootstrap-worker/v2",
             1,
             ((0, _bootstrap_rule_id("1"), _bootstrap_ci()),),
         )
@@ -891,13 +950,7 @@ def test_worker_serialization_and_write_failures_return_nonzero_not_outer_contro
 ):
     input_path = tmp_path / "worker-input.pickle"
     input_path.write_bytes(
-        pickle.dumps(
-            (
-                "sfep-quality-bootstrap/v1",
-                0,
-                (_tiny_bootstrap_task(),),
-            )
-        )
+        pickle.dumps(_bootstrap_worker_v2_request(0, (_tiny_bootstrap_task(),)))
     )
     original_dumps = pickle.dumps
 
@@ -923,16 +976,18 @@ def test_worker_calls_task5_exactly_once_per_submitted_identity(monkeypatch, tmp
     )
     input_path = tmp_path / "worker-input.pickle"
     input_path.write_bytes(
-        pickle.dumps(("sfep-quality-bootstrap/v1", 7, tasks))
+        pickle.dumps(_bootstrap_worker_v2_request(7, tasks))
     )
     calls = []
     outputs = []
 
-    def observed(rows, criteria_id, rule_id, *, replicates):
-        calls.append((rows.copy(deep=True), criteria_id, rule_id, replicates))
+    def observed(rows, seed_material, rule_id, *, replicates):
+        calls.append((rows.copy(deep=True), seed_material, rule_id, replicates))
         return _bootstrap_ci()
 
-    monkeypatch.setattr(quality_intervals, "charge_bootstrap_rr_ci", observed)
+    monkeypatch.setattr(
+        quality_intervals, "charge_bootstrap_rr_ci_with_seed", observed
+    )
     monkeypatch.setattr(
         quality_intervals,
         "_write_all",
@@ -1578,7 +1633,7 @@ def test_actual_process_response_cannot_exceed_submitted_replicates(
     object.__setattr__(interval, "valid_replicates", 2001)
     response_payload = pickle.dumps(
         (
-            "sfep-quality-bootstrap/v1",
+            "sfep-bootstrap-worker/v2",
             0,
             ((0, _bootstrap_rule_id("1"), interval),),
         )

@@ -22,6 +22,11 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from referencing.exceptions import Unresolvable
 
 from equipment_quality.deterministic import sha256_uri
+from equipment_quality.bundle_contract import (
+    BundleContract,
+    SchemaResource,
+    contract_for_config_version,
+)
 from equipment_quality.models import AnalysisConfig, InputTables, SourceFile
 
 
@@ -111,6 +116,8 @@ _NORMATIVE_SCHEMA_SHA256 = MappingProxyType(
 _NORMATIVE_SCHEMA_BYTES_CACHE: dict[str, bytes] = {}
 _NORMATIVE_VALIDATOR_CACHE: dict[str, Draft202012Validator] = {}
 _NORMATIVE_SCHEMA_CACHE_LOCK = RLock()
+_CONTRACT_SCHEMA_BYTES_CACHE: dict[SchemaResource, bytes] = {}
+_CONTRACT_VALIDATOR_CACHE: dict[SchemaResource, Draft202012Validator] = {}
 
 _LINEAGE_ARTIFACT_ORDER = {
     role: index
@@ -539,6 +546,71 @@ def _normative_validator(name: str) -> Draft202012Validator:
 def normative_schema_bytes(name: str) -> bytes:
     """Return digest-authenticated immutable bytes for one normative schema."""
     return _normative_schema_bytes(name)
+
+
+def _contract_schema_resource(
+    contract: BundleContract, role: object
+) -> SchemaResource:
+    if type(contract) is not BundleContract:
+        raise TypeError("contract must be an exact BundleContract")
+    if type(role) is not str:
+        raise TypeError("contract schema role must be a built-in string")
+    try:
+        return contract.schema_resources[role]
+    except KeyError as error:
+        raise ValueError(f"unknown contract schema role: {role!r}") from error
+
+
+def contract_schema_bytes(contract: BundleContract, role: str) -> bytes:
+    """Return authenticated bytes for one role in an explicit contract profile."""
+    resource = _contract_schema_resource(contract, role)
+    with _NORMATIVE_SCHEMA_CACHE_LOCK:
+        cached = _CONTRACT_SCHEMA_BYTES_CACHE.get(resource)
+        if cached is None:
+            try:
+                target = importlib.resources.files(resource.package)
+                for component in resource.resource_path.split("/"):
+                    target = target.joinpath(component)
+                cached = bytes(target.read_bytes())
+            except OSError as error:
+                raise RuntimeError(
+                    f"contract schema resource unavailable: {resource.resource_path}"
+                ) from error
+            if hashlib.sha256(cached).hexdigest() != resource.sha256:
+                raise RuntimeError(
+                    f"contract schema resource digest mismatch: {resource.resource_path}"
+                )
+            _CONTRACT_SCHEMA_BYTES_CACHE[resource] = cached
+        return cached
+
+
+def _contract_validator(
+    contract: BundleContract, role: str
+) -> Draft202012Validator:
+    resource = _contract_schema_resource(contract, role)
+    with _NORMATIVE_SCHEMA_CACHE_LOCK:
+        cached = _CONTRACT_VALIDATOR_CACHE.get(resource)
+        if cached is None:
+            cached = _compile_normative_validator(
+                resource.resource_path, contract_schema_bytes(contract, role)
+            )
+            _CONTRACT_VALIDATOR_CACHE[resource] = cached
+        return cached
+
+
+def validate_contract_instance(
+    contract: BundleContract, role: str, instance: object
+) -> None:
+    """Validate an instance against one role in an explicit contract profile."""
+    try:
+        _contract_validator(contract, role).validate(instance)
+        if role == "analysis_summary":
+            assert isinstance(instance, Mapping)
+            _validate_analysis_summary_application_contract(instance)
+    except Unresolvable as error:
+        raise RuntimeError(
+            f"contract schema reference resolution failed: {role}"
+        ) from error
 
 
 def _summary_validation_error(message: str) -> None:
@@ -1240,15 +1312,7 @@ def _hierarchies(
     }
 
 
-def load_analysis_config(path: Path) -> AnalysisConfig:
-    """Load the complete normative config without unknowns, defaults, or mutation."""
-    path = Path(path)
-    try:
-        payload = _load_strict_json(path.read_text(encoding="utf-8"))
-    except UnicodeDecodeError as error:
-        raise ValueError("analysis config must be UTF-8") from error
-    validate_normative_instance("analysis_config.schema.json", payload)
-
+def _analysis_config_from_payload(payload: Mapping[str, object]) -> AnalysisConfig:
     field_names = [field["field"] for field in payload["fields"]]
     if len(set(field_names)) != len(field_names):
         raise ValueError("analysis config field names must be unique")
@@ -1288,3 +1352,28 @@ def load_analysis_config(path: Path) -> AnalysisConfig:
         fdr_families=tuple(payload["fdrFamilies"]),
         evidence_families=tuple(payload["evidenceFamilies"]),
     )
+
+
+def load_analysis_config_contract(
+    config_bytes: bytes,
+) -> tuple[BundleContract, AnalysisConfig]:
+    """Strictly select and validate one contract from an exact config snapshot."""
+    if type(config_bytes) is not bytes:
+        raise TypeError("analysis config snapshot must be built-in bytes")
+    try:
+        payload = _load_strict_json(config_bytes.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError("analysis config must be UTF-8") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("analysis config must be a JSON object")
+    if "schemaVersion" not in payload:
+        raise ValueError("analysis config must declare schemaVersion")
+    contract = contract_for_config_version(payload["schemaVersion"])
+    validate_contract_instance(contract, "analysis_config", payload)
+    return contract, _analysis_config_from_payload(payload)
+
+
+def load_analysis_config(path: Path) -> AnalysisConfig:
+    """Load a config by strict config-derived contract selection."""
+    _, config = load_analysis_config_contract(Path(path).read_bytes())
+    return config

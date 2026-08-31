@@ -3,26 +3,42 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import hashlib
 import io
+import inspect
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 
 import pytest
 
+import equipment_quality.artifacts as artifact_module
+from equipment_quality import cli
+from equipment_quality import models as equipment_models
+from equipment_quality.schema import load_analysis_config
 import oracles.v1_execution_trace as v1_oracle
 from oracles.v1_execution_trace import (
     project_v1_execution_trace,
     verify_v1_bundle,
 )
+from oracles.bundle_semantic_comparator import (
+    LINEAGE_CORRECTIONS,
+    assert_semantic_parity,
+    normalized_event,
+)
+from test_artifacts import _v2_bundle_request
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 V1_CONTRACT_ROOT = REPOSITORY_ROOT / "contracts" / "equipment-monitor" / "v1"
 GOLDEN_V1_BUNDLE = V1_CONTRACT_ROOT / "golden-bundle"
+GOLDEN_V2_BUNDLE = (
+    REPOSITORY_ROOT / "contracts/equipment-monitor/v2/golden-bundle"
+)
 GOLDEN_V1_SEED = "sha256:8c88d3109bd6945b76317ee415c7821524f515c9bd79d36b8072c285c6434af7"
 ACTUAL_V1_SEED = "sha256:c0a9d1f3f0d655c24d2eeddc58f1905672d2f72d7ffd0d14e87bdecb118a2a26"
 GOLDEN_V1_BUNDLE_ID = "sha256:4f40427690116f0defcbe609d9e5e1ef4025bb4193cdf099386659a26dd9f8bc"
@@ -42,6 +58,74 @@ ACTUAL_SOURCES = {
     "fur_hr": ("sts_2fur_hr_2.csv", "sha256:c2bb0b503ec30b0e01e00d2bd88fde536479de59aebf1eae84131380d58f3bcf", "3578800"),
     "sm_cc": ("sts_1sm_cc_1.csv", "sha256:0cd3e91428c005dae1785b9af01d30e3d08230e2058c68693c9aa7ffee043075", "1883100"),
 }
+
+
+def test_bootstrap_seed_resolution_uses_only_the_versioned_authenticated_source() -> None:
+    v1 = load_analysis_config(REPOSITORY_ROOT / "analysis/analysis_config.json")
+    v2 = replace(
+        v1,
+        schema_version="sfep-analysis-config/v2",
+        analysis_config_version="quality-analysis-v2",
+        bootstrap={
+            **dict(v1.bootstrap),
+            "seedMaterial": ACTUAL_V1_SEED,
+            "seedProtocol": "LEGACY_CRITERIA_ID_UTF8_V1",
+        },
+    )
+    unrelated_v2_criteria_id = "sha256:" + "9" * 64
+
+    assert equipment_models.resolve_bootstrap_seed(v1, ACTUAL_V1_SEED) == (
+        equipment_models.BootstrapSeed(
+            protocol="LEGACY_CRITERIA_ID_UTF8_V1",
+            material=ACTUAL_V1_SEED,
+            lineage_dependencies=("identity.criteria_id",),
+        )
+    )
+    assert equipment_models.resolve_bootstrap_seed(v2, unrelated_v2_criteria_id) == (
+        equipment_models.BootstrapSeed(
+            protocol="LEGACY_CRITERIA_ID_UTF8_V1",
+            material=ACTUAL_V1_SEED,
+            lineage_dependencies=(
+                "config.bootstrap.seedMaterial",
+                "config.bootstrap.seedProtocol",
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("irrelevant_criteria_id", (None, 7, "not-a-criteria-id"))
+def test_v2_bootstrap_seed_resolution_never_touches_irrelevant_criteria_id(
+    irrelevant_criteria_id,
+) -> None:
+    v1 = load_analysis_config(REPOSITORY_ROOT / "analysis/analysis_config.json")
+    v2 = replace(
+        v1,
+        schema_version="sfep-analysis-config/v2",
+        analysis_config_version="quality-analysis-v2",
+        bootstrap={
+            **dict(v1.bootstrap),
+            "seedMaterial": ACTUAL_V1_SEED,
+            "seedProtocol": "LEGACY_CRITERIA_ID_UTF8_V1",
+        },
+    )
+
+    resolved = equipment_models.resolve_bootstrap_seed(v2, irrelevant_criteria_id)
+
+    assert resolved.material == ACTUAL_V1_SEED
+    assert resolved.lineage_dependencies == (
+        "config.bootstrap.seedMaterial",
+        "config.bootstrap.seedProtocol",
+    )
+
+
+@pytest.mark.parametrize("criteria_id", (None, 7, "not-a-criteria-id"))
+def test_v1_bootstrap_seed_resolution_still_validates_criteria_id_exactly(
+    criteria_id,
+) -> None:
+    config = load_analysis_config(REPOSITORY_ROOT / "analysis/analysis_config.json")
+
+    with pytest.raises((TypeError, ValueError), match="criteria_id"):
+        equipment_models.resolve_bootstrap_seed(config, criteria_id)
 
 # Hand-frozen from the verified v1 tree.  The oracle never derives this table.
 V1_BYTE_FREEZE = {
@@ -84,6 +168,143 @@ def _sha256_uri(payload: bytes) -> str:
 
 def _sequence_digest(values: tuple[str, ...]) -> str:
     return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
+
+
+V2_INDEPENDENT_PROJECTION = {
+    "eventCount": 95,
+    "eventIdsSha256": "efbc5963a584dd79b84e2455044645d7d51b1f4c5d6721b0b2b38f9ccf2142ab",
+    "holdoutMetricsSha256": "f1b0136d3467b49e17ca72a465dd26430dab9cc023f2dc3acf9d9d0b36e66fd8",
+    "rangeCount": 0,
+    "rangeIdsSha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "ruleCount": 165,
+    "ruleIdsSha256": "32873af746cdaf4e300f3efd136074cf98f6ed601f0d2d6c7c856d98144deee2",
+    "splitCounts": {
+        "confirmation": {"dateFrom": "2025-01-04", "dateTo": "2025-01-04", "defects": 0, "nonDefects": 2, "total": 2, "unknownOrCensored": 0},
+        "discovery": {"dateFrom": "2025-01-01", "dateTo": "2025-01-03", "defects": 1, "nonDefects": 4, "total": 5, "unknownOrCensored": 0},
+        "holdout": {"dateFrom": "2025-02-21", "dateTo": "2025-02-21", "defects": 1, "nonDefects": 1, "total": 2, "unknownOrCensored": 0},
+        "reference": {"dateFrom": "2025-01-01", "dateTo": "2025-02-20", "defects": 1, "nonDefects": 6, "total": 10, "unknownOrCensored": 3},
+    },
+    "versions": (
+        "sfep-equipment-bundle/v2",
+        "sfep-analysis-config/v2",
+        "sfep-producer-runtime/v1",
+        "sfep-operating-ranges/v1",
+        "sfep-quality-rules/v1",
+        "sfep-replay-events/v1",
+        "sfep-analysis-summary/v2",
+    ),
+}
+
+
+def _independent_v2_projection(bundle_root: Path) -> dict[str, object]:
+    manifest = json.loads((bundle_root / "bundle_manifest.json").read_bytes())
+    summary = json.loads((bundle_root / "analysis_summary.json").read_bytes())
+    rules = json.loads((bundle_root / "quality_risk_intervals.json").read_bytes())[
+        "rules"
+    ]
+    ranges = json.loads((bundle_root / "equipment_operating_ranges.json").read_bytes())[
+        "ranges"
+    ]
+    events = tuple(
+        csv.DictReader(
+            io.StringIO((bundle_root / "replay_events.csv").read_text(encoding="utf-8"))
+        )
+    )
+
+    def digest(values) -> str:
+        return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
+
+    holdout_bytes = json.dumps(
+        summary["holdoutMetrics"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return {
+        "eventCount": len(events),
+        "eventIdsSha256": digest(row["event_id"] for row in events),
+        "holdoutMetricsSha256": hashlib.sha256(holdout_bytes).hexdigest(),
+        "rangeCount": len(ranges),
+        "rangeIdsSha256": digest(item["ruleId"] for item in ranges),
+        "ruleCount": len(rules),
+        "ruleIdsSha256": digest(item["ruleId"] for item in rules),
+        "splitCounts": summary["splitCounts"],
+        "versions": (
+            manifest["schemaVersion"],
+            *(item["schemaVersion"] for item in manifest["artifacts"]),
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ("success", "semantic_mismatch", "projector_exception", "byte_mutation", "structural_mutation"),
+)
+def test_v2_reference_preflight_uses_an_independent_literal_before_rename(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    request = _v2_bundle_request(tmp_path / scenario)
+    final = request.output_root / request.bundle_identity.value
+    callbacks: list[Path] = []
+
+    def projector(bundle_root: Path):
+        callbacks.append(bundle_root)
+        assert not final.exists()
+        if scenario == "projector_exception":
+            raise RuntimeError("independent projector failed")
+        projection = _independent_v2_projection(bundle_root)
+        if scenario == "byte_mutation":
+            summary = bundle_root / "analysis_summary.json"
+            summary.write_bytes(summary.read_bytes() + b" ")
+        elif scenario == "structural_mutation":
+            (bundle_root / "unexpected").mkdir()
+        return projection
+
+    reference = (
+        {**V2_INDEPENDENT_PROJECTION, "ruleCount": 164}
+        if scenario == "semantic_mismatch"
+        else V2_INDEPENDENT_PROJECTION
+    )
+    if scenario == "success":
+        assert artifact_module._write_bundle_with_reference_preflight(
+            request,
+            reference_projection=reference,
+            project_bundle=projector,
+        ) == final
+        assert final.is_dir()
+    else:
+        with pytest.raises((OSError, RuntimeError, ValueError)):
+            artifact_module._write_bundle_with_reference_preflight(
+                request,
+                reference_projection=reference,
+                project_bundle=projector,
+            )
+        assert not final.exists()
+        assert not tuple(request.output_root.glob(".sfep-bundle-tmp-*"))
+    assert len(callbacks) == 1
+
+
+def test_v2_migration_preflight_does_not_expand_the_public_cli_surface() -> None:
+    assert tuple(inspect.signature(cli.run_analysis).parameters) == (
+        "config_path",
+        "runtime_path",
+        "data_dir",
+        "output_dir",
+    )
+    option_strings = {
+        option
+        for action in cli._parser()._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    assert option_strings == {
+        "--help",
+        "--config",
+        "--runtime-manifest",
+        "--data-dir",
+        "--output-dir",
+    }
 
 
 def _identity(version: str, fields: dict[str, str]) -> str:
@@ -497,3 +718,342 @@ def test_trace_projects_all_migration_semantics_deterministically(
         if path.is_file()
     }
     assert after == before
+
+
+def _rebind_v2_artifact(bundle: Path, role: str, payload: bytes) -> None:
+    filenames = {
+        "producer_runtime": "producer_runtime.json",
+        "equipment_operating_ranges": "equipment_operating_ranges.json",
+        "quality_risk_intervals": "quality_risk_intervals.json",
+        "replay_events": "replay_events.csv",
+        "analysis_summary": "analysis_summary.json",
+    }
+    target = bundle / filenames[role]
+    target.write_bytes(payload)
+    manifest_path = bundle / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    artifact = next(item for item in manifest["artifacts"] if item["role"] == role)
+    artifact["sizeBytes"] = len(payload)
+    artifact["sha256"] = _sha256_uri(payload)
+    manifest_path.write_bytes(_canonical_json(manifest))
+
+
+def _identity_uri(namespace: str, fields: dict[str, str]) -> str:
+    preimage = "\n".join(
+        [namespace, *(f"{key}={fields[key]}" for key in sorted(fields, key=str.encode))]
+    ) + "\n"
+    return _sha256_uri(preimage.encode("utf-8"))
+
+
+def _coherently_rebind_v2_identity(
+    bundle: Path,
+    *,
+    criteria_change: tuple[str, str] | None = None,
+    identity_change: tuple[str, str] | None = None,
+) -> None:
+    manifest_path = bundle / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    if criteria_change is not None:
+        key, value = criteria_change
+        manifest["criteriaIdentity"][key] = value
+        if key == "as_of":
+            manifest["asOf"] = value
+        criteria_id = _identity_uri(
+            "sfep-criteria-id/v1", manifest["criteriaIdentity"]
+        )
+        manifest["criteriaId"] = criteria_id
+        manifest["identity"]["criteria_id"] = criteria_id
+        for role, filename in (
+            ("equipment_operating_ranges", "equipment_operating_ranges.json"),
+            ("quality_risk_intervals", "quality_risk_intervals.json"),
+        ):
+            value_object = json.loads((bundle / filename).read_bytes())
+            value_object["criteriaId"] = criteria_id
+            if key == "as_of":
+                value_object["asOf"] = value
+            _rebind_v2_artifact(bundle, role, _canonical_json(value_object))
+        summary = json.loads((bundle / "analysis_summary.json").read_bytes())
+        summary["criteriaId"] = criteria_id
+        if key == "as_of":
+            summary["asOf"] = value
+        _rebind_v2_artifact(bundle, "analysis_summary", _canonical_json(summary))
+    if identity_change is not None:
+        key, value = identity_change
+        manifest["identity"][key] = value
+    bundle_id = _identity_uri("sfep-bundle-id/v1", manifest["identity"])
+    manifest["bundleId"] = bundle_id
+
+    summary = json.loads((bundle / "analysis_summary.json").read_bytes())
+    summary["bundleId"] = bundle_id
+    _rebind_v2_artifact(bundle, "analysis_summary", _canonical_json(summary))
+    replay_path = bundle / "replay_events.csv"
+    rows = list(csv.reader(io.StringIO(replay_path.read_text(encoding="utf-8"), newline="")))
+    bundle_index = rows[0].index("bundle_id")
+    criteria_index = rows[0].index("criteria_id")
+    for row in rows[1:]:
+        row[bundle_index] = bundle_id
+        row[criteria_index] = manifest["criteriaId"]
+    output = io.StringIO(newline="")
+    csv.writer(output, lineterminator="\n").writerows(rows)
+    _rebind_v2_artifact(bundle, "replay_events", output.getvalue().encode())
+
+    rebound = json.loads(manifest_path.read_bytes())
+    rebound.update({
+        "asOf": manifest["asOf"],
+        "bundleId": manifest["bundleId"],
+        "criteriaId": manifest["criteriaId"],
+        "criteriaIdentity": manifest["criteriaIdentity"],
+        "identity": manifest["identity"],
+    })
+    manifest_path.write_bytes(_canonical_json(rebound))
+
+
+def _coherently_rebind_v2_runtime(
+    bundle: Path,
+    field_path: str,
+    replacement: str,
+) -> None:
+    runtime_path = bundle / "producer_runtime.json"
+    runtime = json.loads(runtime_path.read_bytes())
+    parent = runtime
+    parts = field_path.split(".")
+    for part in parts[:-1]:
+        child = parent[part]
+        assert isinstance(child, dict)
+        parent = child
+    parent[parts[-1]] = replacement
+    runtime_payload = _canonical_json(runtime)
+    _rebind_v2_artifact(bundle, "producer_runtime", runtime_payload)
+    manifest_path = bundle / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    previous_criteria_id = manifest["criteriaId"]
+    previous_bundle_id = manifest["bundleId"]
+    digest = _sha256_uri(runtime_payload)
+    manifest["criteriaIdentity"]["producer_runtime_sha256"] = digest
+    criteria_id = _identity_uri(
+        "sfep-criteria-id/v1", manifest["criteriaIdentity"]
+    )
+    manifest["criteriaId"] = criteria_id
+    manifest["identity"]["producer_runtime_sha256"] = digest
+    manifest["identity"]["criteria_id"] = criteria_id
+    bundle_id = _identity_uri("sfep-bundle-id/v1", manifest["identity"])
+    manifest["bundleId"] = bundle_id
+    filename_by_role = {
+        "equipment_operating_ranges": "equipment_operating_ranges.json",
+        "quality_risk_intervals": "quality_risk_intervals.json",
+        "replay_events": "replay_events.csv",
+        "analysis_summary": "analysis_summary.json",
+    }
+    for role, filename in filename_by_role.items():
+        artifact_payload = (bundle / filename).read_bytes()
+        artifact_payload = artifact_payload.replace(
+            previous_criteria_id.encode(), criteria_id.encode()
+        ).replace(previous_bundle_id.encode(), bundle_id.encode())
+        _rebind_v2_artifact(bundle, role, artifact_payload)
+    rebound = json.loads(manifest_path.read_bytes())
+    rebound.update({
+        "bundleId": manifest["bundleId"],
+        "criteriaId": manifest["criteriaId"],
+        "criteriaIdentity": manifest["criteriaIdentity"],
+        "identity": manifest["identity"],
+    })
+    manifest_path.write_bytes(_canonical_json(rebound))
+
+
+def test_strict_v1_v2_comparator_accepts_only_the_sealed_migration_delta() -> None:
+    assert_semantic_parity(GOLDEN_V1_BUNDLE, GOLDEN_V2_BUNDLE)
+    assert LINEAGE_CORRECTIONS == frozenset({
+        ("analysis_summary", f"holdoutMetrics[].{metric}.{leaf}")
+        for metric in ("precision", "lift")
+        for leaf in ("lower", "upper", "validReplicates", "reasonCode")
+    })
+
+    with (GOLDEN_V2_BUNDLE / "replay_events.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as stream:
+        first = next(csv.DictReader(stream))
+    expected = dict(first)
+    expected["bundle_id"] = "<bundle>"
+    expected["criteria_id"] = "<criteria>"
+    assert normalized_event(first) == tuple(expected.items())
+
+
+@pytest.mark.parametrize(
+    ("surface", "field"),
+    (
+        ("equipment_operating_ranges", "criteriaId"),
+        ("quality_risk_intervals", "criteriaId"),
+        ("replay_events", "criteria_id"),
+        ("replay_events", "bundle_id"),
+        ("analysis_summary", "criteriaId"),
+        ("analysis_summary", "bundleId"),
+    ),
+)
+def test_strict_comparator_rejects_every_unbound_v2_identity_surface(
+    tmp_path: Path,
+    surface: str,
+    field: str,
+) -> None:
+    bundle = _copy_bundle(GOLDEN_V2_BUNDLE, tmp_path / (surface + "-" + field))
+    forged = "sha256:" + "9" * 64
+    if surface == "replay_events":
+        path = bundle / "replay_events.csv"
+        rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8"), newline="")))
+        rows[1][rows[0].index(field)] = forged
+        output = io.StringIO(newline="")
+        csv.writer(output, lineterminator="\n").writerows(rows)
+        _rebind_v2_artifact(bundle, surface, output.getvalue().encode())
+    else:
+        filename = {
+            "equipment_operating_ranges": "equipment_operating_ranges.json",
+            "quality_risk_intervals": "quality_risk_intervals.json",
+            "analysis_summary": "analysis_summary.json",
+        }[surface]
+        value = json.loads((bundle / filename).read_bytes())
+        value[field] = forged
+        _rebind_v2_artifact(bundle, surface, _canonical_json(value))
+
+    with pytest.raises(AssertionError):
+        assert_semantic_parity(GOLDEN_V1_BUNDLE, bundle)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    (
+        ("criteria", "criteria_projection_sha256"),
+        ("criteria", "as_of"),
+        ("identity", "source.ap.sha256"),
+    ),
+)
+def test_strict_comparator_rejects_coherent_identity_forgery(
+    tmp_path: Path,
+    kind: str,
+    field: str,
+) -> None:
+    bundle = _copy_bundle(GOLDEN_V2_BUNDLE, tmp_path / field.replace(".", "-"))
+    value = "2025-02-19" if field == "as_of" else "sha256:" + "9" * 64
+    _coherently_rebind_v2_identity(
+        bundle,
+        criteria_change=(field, value) if kind == "criteria" else None,
+        identity_change=(field, value) if kind == "identity" else None,
+    )
+
+    with pytest.raises(AssertionError):
+        assert_semantic_parity(GOLDEN_V1_BUNDLE, bundle)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    (
+        ("locks.producer", "sha256:" + "9" * 64),
+        ("locks.pyproject", "sha256:" + "8" * 64),
+        ("producer.installedCodeTreeSha256", "sha256:" + "7" * 64),
+        ("producer.sourceSha256", "sha256:" + "6" * 64),
+        ("producer.version", "9.9.9"),
+        (
+            "producer.wheelFilename",
+            "sfep_equipment_quality-9.9.9-py3-none-any.whl",
+        ),
+        ("producer.wheelSha256", "sha256:" + "5" * 64),
+        ("python.executableSha256", "sha256:" + "4" * 64),
+    ),
+)
+def test_strict_comparator_rejects_every_coherently_rebound_runtime_provenance_field(
+    tmp_path: Path,
+    field_path: str,
+    replacement: str,
+) -> None:
+    bundle = _copy_bundle(
+        GOLDEN_V2_BUNDLE,
+        tmp_path / field_path.replace(".", "-"),
+    )
+    _coherently_rebind_v2_runtime(bundle, field_path, replacement)
+
+    with pytest.raises(
+        AssertionError,
+        match=rf"runtime provenance field {re.escape(field_path)}",
+    ):
+        assert_semantic_parity(GOLDEN_V1_BUNDLE, bundle)
+
+
+def test_strict_comparator_rejects_schema_only_invalid_coherent_summary(
+    tmp_path: Path,
+) -> None:
+    bundle = _copy_bundle(GOLDEN_V2_BUNDLE, tmp_path / "schema-only-invalid")
+    summary = json.loads((bundle / "analysis_summary.json").read_bytes())
+    assert summary["splitCounts"]["discovery"]["defects"] == 1
+    summary["splitCounts"]["discovery"]["defects"] = True
+    _rebind_v2_artifact(
+        bundle,
+        "analysis_summary",
+        v1_oracle._canonical_bytes(summary),
+    )
+
+    with pytest.raises(AssertionError, match="v2 schema validation failed"):
+        assert_semantic_parity(GOLDEN_V1_BUNDLE, bundle)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "event-order",
+        "event-id",
+        "event-semantic-column",
+        "values-json",
+        "rule-metric",
+        "holdout-metric",
+        "lineage-dependency",
+    ),
+)
+def test_strict_v1_v2_comparator_rejects_every_nonallowlisted_semantic_tamper(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    bundle = _copy_bundle(GOLDEN_V2_BUNDLE, tmp_path / tamper)
+    if tamper.startswith("event-") or tamper == "values-json":
+        replay_path = bundle / "replay_events.csv"
+        rows = list(
+            csv.reader(io.StringIO(replay_path.read_text(encoding="utf-8"), newline=""))
+        )
+        if tamper == "event-order":
+            rows[1], rows[2] = rows[2], rows[1]
+        else:
+            column = {
+                "event-id": "event_id",
+                "event-semantic-column": "equipment_id",
+                "values-json": "values_json",
+            }[tamper]
+            replacement = {
+                "event-id": "sha256:" + "0" * 64,
+                "event-semantic-column": "FORGED",
+                "values-json": '{"forged":true}',
+            }[tamper]
+            rows[1][rows[0].index(column)] = replacement
+        output = io.StringIO(newline="")
+        csv.writer(output, lineterminator="\n").writerows(rows)
+        _rebind_v2_artifact(bundle, "replay_events", output.getvalue().encode())
+    elif tamper == "rule-metric":
+        path = bundle / "quality_risk_intervals.json"
+        rules = json.loads(path.read_bytes())
+        rules["rules"][0]["discovery"]["support"] += 1
+        _rebind_v2_artifact(
+            bundle, "quality_risk_intervals", _canonical_json(rules)
+        )
+    else:
+        path = bundle / "analysis_summary.json"
+        summary = json.loads(path.read_bytes())
+        if tamper == "holdout-metric":
+            summary["holdoutMetrics"][0]["truePositive"] += 1
+        else:
+            record = next(
+                item
+                for item in summary["lineage"]["fields"]
+                if item["artifactRole"] == "analysis_summary"
+                and item["outputField"] == "holdoutMetrics[].precision.lower"
+            )
+            record["dependencies"].append("identity.criteria_id")
+            record["dependencies"].sort(key=str.encode)
+        _rebind_v2_artifact(bundle, "analysis_summary", _canonical_json(summary))
+
+    with pytest.raises(AssertionError):
+        assert_semantic_parity(GOLDEN_V1_BUNDLE, bundle)

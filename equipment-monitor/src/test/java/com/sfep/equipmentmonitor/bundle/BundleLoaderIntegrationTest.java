@@ -171,6 +171,18 @@ class BundleLoaderIntegrationTest {
     }
 
     @Test
+    void artifactHashMismatchWinsBeforeMalformedArtifactJson() throws Exception {
+        Path bundle = GoldenBundleFixture.copyTo(temporary.toRealPath().resolve("hash-before-json"));
+        Path summaryPath = bundle.resolve("analysis_summary.json");
+        byte[] malformedSameSize = Files.readAllBytes(summaryPath);
+        java.util.Arrays.fill(malformedSameSize, (byte) ' ');
+        malformedSameSize[0] = '{';
+        Files.write(summaryPath, malformedSameSize);
+
+        assertCode("ARTIFACT_HASH_MISMATCH", () -> new BundleLoader().load(bundle));
+    }
+
+    @Test
     void rejectsSchemaInvalidJsonAfterAValidUpdatedArtifactAttestation() throws Exception {
         Path bundle = GoldenBundleFixture.copyTo(temporary.toRealPath().resolve("json-schema"));
         ObjectNode summary = (ObjectNode) BundleTestJson.mapper()

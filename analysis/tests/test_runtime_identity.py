@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import subprocess
 import sys
 from types import MappingProxyType
 from types import ModuleType
@@ -27,6 +28,7 @@ from factories.runtime import (
     FakeDistribution,
     RuntimeFixture,
     build_runtime_fixture,
+    independent_source_digest,
     independent_installed_code_tree,
     independent_tree_preimage,
     record_hash,
@@ -1419,7 +1421,7 @@ def test_schema_valid_wheel_attestations_are_seal_owned_and_bytes_are_retained(
     package["wheelSha256"] = "sha256:" + "a" * 64
     producer = runtime_fixture.manifest["producer"]
     assert isinstance(producer, dict)
-    producer["wheelFilename"] = "sfep_equipment_quality-1.0.0-cp312-none-any.whl"
+    producer["wheelFilename"] = "sfep_equipment_quality-1.1.0-cp312-none-any.whl"
     producer["wheelSha256"] = "sha256:" + "b" * 64
     changed_bytes = runtime_fixture.write_manifest()
 
@@ -1469,3 +1471,109 @@ def test_all_verification_failures_use_the_single_public_exception(
     with pytest.raises(RuntimeIdentityError) as error:
         _verify(runtime_fixture)
     assert type(error.value) is RuntimeIdentityError
+
+
+def _current_runtime_paths() -> tuple[Path, Path, Path]:
+    repository = Path(__file__).resolve().parents[2]
+    return (
+        repository / "analysis/producer_runtime.json",
+        repository / "analysis/producer.lock",
+        repository / "contracts/equipment-monitor/v1/golden-bundle/producer_runtime.json",
+    )
+
+
+def _assert_current_runtime_provenance(manifest_path: Path) -> None:
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    assert canonical_json_bytes(manifest) == manifest_bytes
+    producer = manifest["producer"]
+    runtime_path, producer_lock, _v1_runtime = _current_runtime_paths()
+    match = __import__("re").fullmatch(
+        rb"sfep-equipment-quality==1\.1\.0 --hash=sha256:([0-9a-f]{64})\n",
+        producer_lock.read_bytes(),
+    )
+    assert match is not None
+    assert producer == {
+        **producer,
+        "name": "equipment-quality",
+        "version": "1.1.0",
+        "wheelFilename": "sfep_equipment_quality-1.1.0-py3-none-any.whl",
+        "wheelSha256": "sha256:" + match.group(1).decode("ascii"),
+        "sourceSha256": independent_source_digest(runtime_path.parent),
+    }
+
+
+def test_checked_in_current_runtime_is_honest_1_1_and_not_the_v1_golden_copy() -> None:
+    runtime, _producer_lock, v1_runtime = _current_runtime_paths()
+
+    _assert_current_runtime_provenance(runtime)
+    assert runtime.read_bytes() != v1_runtime.read_bytes()
+
+
+@pytest.mark.parametrize("field", ("sourceSha256", "wheelSha256"))
+def test_current_runtime_provenance_check_rejects_source_and_wheel_digest_tamper(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    runtime, _producer_lock, _v1_runtime = _current_runtime_paths()
+    value = json.loads(runtime.read_bytes())
+    value["producer"][field] = "sha256:" + "0" * 64
+    tampered = tmp_path / "producer_runtime.json"
+    tampered.write_bytes(canonical_json_bytes(value))
+
+    with pytest.raises(AssertionError):
+        _assert_current_runtime_provenance(tampered)
+
+
+def test_compatibility_runtime_authenticates_current_manifest_and_rejects_v1_copy(
+    tmp_path: Path,
+) -> None:
+    runtime_root = os.environ.get("SFEP_COMPAT_RUNTIME")
+    if runtime_root is None:
+        pytest.skip("SFEP_COMPAT_RUNTIME is required for installed-runtime acceptance")
+    python = Path(runtime_root) / "bin/python"
+    if not python.is_file():
+        pytest.skip("compatibility runtime Python is unavailable")
+    runtime, _producer_lock, v1_runtime = _current_runtime_paths()
+    script = (
+        "from pathlib import Path; import sys; "
+        "from equipment_quality.runtime_verify import verify_runtime; "
+        "identity=verify_runtime(Path(sys.argv[1])); "
+        "assert identity.manifest['producer']['version']=='1.1.0'"
+    )
+    environment = {
+        **os.environ,
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "Asia/Seoul",
+    }
+
+    accepted = subprocess.run(
+        [str(python), "-P", "-s", "-B", "-c", script, str(runtime)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    copied = subprocess.run(
+        [str(python), "-P", "-s", "-B", "-c", script, str(v1_runtime)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    tree_tamper = json.loads(runtime.read_bytes())
+    tree_tamper["producer"]["installedCodeTreeSha256"] = "sha256:" + "0" * 64
+    tampered = tmp_path / "producer_runtime.json"
+    tampered.write_bytes(canonical_json_bytes(tree_tamper))
+    rejected_tree = subprocess.run(
+        [str(python), "-P", "-s", "-B", "-c", script, str(tampered)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert copied.returncode != 0
+    assert rejected_tree.returncode != 0

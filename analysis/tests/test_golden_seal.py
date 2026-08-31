@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 from typing import Callable
 import warnings
 import zipfile
@@ -41,12 +42,12 @@ from factories.runtime import (
 ANALYSIS_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = ANALYSIS_ROOT / "tools"
 WHEELHOUSE = ANALYSIS_ROOT / ".wheelhouse"
-PRODUCER_FILENAME = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
 EXPECTED_SOURCE_DIGEST = (
-    "sha256:3e7fbecbec0d5312aa89de7429b1893f3f791582e9366997ed640984e7305d9c"
+    "sha256:26eefd1d37546b1aeb1a56158bad06765cb40f21f975a1c2efe569410d5d9a05"
 )
 EXPECTED_PROVENANCE_DIGEST = (
-    "sha256:60bb3912aac62515d9ac8895f63cbc0f6623b86fd8b2f9250c21b3c8adbfc4ae"
+    "sha256:93ba035df919f9dfbc2a69b510955e223023bf7ddd81689df6af7e31b393c58f"
 )
 
 THIRD_PARTY_WHEELS = (
@@ -246,9 +247,9 @@ def _rewrite_wheel(
 def _mutated_wheel(wheel: Path, case: str) -> bytes:
     if case.startswith(("local-", "eocd-", "central-")) or case == "unclaimed-gap":
         return _mutated_raw_zip(wheel, case)
-    metadata_path = "sfep_equipment_quality-1.0.0.dist-info/METADATA"
-    wheel_path = "sfep_equipment_quality-1.0.0.dist-info/WHEEL"
-    record_path = "sfep_equipment_quality-1.0.0.dist-info/RECORD"
+    metadata_path = "sfep_equipment_quality-1.1.0.dist-info/METADATA"
+    wheel_path = "sfep_equipment_quality-1.1.0.dist-info/WHEEL"
+    record_path = "sfep_equipment_quality-1.1.0.dist-info/RECORD"
     additions: tuple[tuple[zipfile.ZipInfo, bytes], ...] = ()
     archive_comment = b""
     mutate_info: Callable[[zipfile.ZipInfo], None] | None = None
@@ -262,7 +263,7 @@ def _mutated_wheel(wheel: Path, case: str) -> bytes:
                 b"Name: sfep-equipment-quality", b"Name: other-producer"
             )
         if case == "metadata-version" and name == metadata_path:
-            return name, payload.replace(b"Version: 1.0.0", b"Version: 9.0.0")
+            return name, payload.replace(b"Version: 1.1.0", b"Version: 9.0.0")
         if case == "wheel-tag" and name == wheel_path:
             return name, payload.replace(b"Tag: py3-none-any", b"Tag: cp312-none-any")
         if case.startswith("provenance-") and name == PROVENANCE_PATH:
@@ -532,7 +533,7 @@ def test_frozen_third_party_locks_match_independent_literal_oracle() -> None:
             (WHEELHOUSE / PRODUCER_FILENAME).read_bytes()
         ).hexdigest()
         assert (ANALYSIS_ROOT / "producer.lock").read_bytes() == (
-            "sfep-equipment-quality==1.0.0 "
+            "sfep-equipment-quality==1.1.0 "
             f"--hash=sha256:{producer_digest}\n"
         ).encode("ascii")
 
@@ -541,7 +542,7 @@ def test_source_preimage_and_provenance_match_independent_literals() -> None:
     preimage = independent_source_preimage(ANALYSIS_ROOT)
     provenance = independently_expected_provenance(ANALYSIS_ROOT)
 
-    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 25
+    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 29
     assert preimage.startswith(b"sfep-source-lines/v1\n")
     assert independent_source_digest(ANALYSIS_ROOT) == EXPECTED_SOURCE_DIGEST
     assert _sha256_uri(provenance) == EXPECTED_PROVENANCE_DIGEST
@@ -2578,7 +2579,7 @@ def producer_wheel_pair(
 
 def _expected_producer_lock(wheel: Path) -> bytes:
     return (
-        "sfep-equipment-quality==1.0.0 "
+        "sfep-equipment-quality==1.1.0 "
         f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
     ).encode("ascii")
 
@@ -3803,7 +3804,7 @@ def test_runtime_seal_is_canonical_path_independent_and_schema_valid(
     ]
     assert manifest["pipVersion"] == "25.1.1"
     assert manifest["producer"]["name"] == "equipment-quality"
-    assert manifest["producer"]["version"] == "1.0.0"
+    assert manifest["producer"]["version"] == "1.1.0"
     forbidden = {
         str(ANALYSIS_ROOT).encode(),
         str(WHEELHOUSE).encode(),
@@ -4769,7 +4770,7 @@ def _golden_id(version: str, fields: dict[str, str]) -> str:
 def _golden_independent_oracle(
     contract_root: Path = _GOLDEN_CONTRACT_ROOT,
     analysis_config: Path = ANALYSIS_ROOT / "analysis_config.json",
-    runtime_manifest: Path = ANALYSIS_ROOT / "producer_runtime.json",
+    runtime_manifest: Path = _GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json",
 ) -> tuple[str, str, dict[str, str], dict[str, str], dict[str, bytes]]:
     expectation = contract_root / "golden-expectation"
     source = contract_root / "golden-source"
@@ -4946,7 +4947,10 @@ def _copy_golden_seal_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     config = tmp_path / "analysis_config.json"
     runtime = tmp_path / "producer_runtime.json"
     shutil.copy2(ANALYSIS_ROOT / "analysis_config.json", config)
-    shutil.copy2(ANALYSIS_ROOT / "producer_runtime.json", runtime)
+    shutil.copy2(
+        _GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json",
+        runtime,
+    )
     return root, config, runtime, tmp_path / "golden-bundle"
 
 
@@ -4998,8 +5002,10 @@ def test_golden_bundle_independent_oracle_freezes_ids_outputs_and_inputs() -> No
         hashlib.sha256((ANALYSIS_ROOT / "analysis_config.json").read_bytes()).hexdigest(),
     ) == _GOLDEN_ANALYSIS_CONFIG_LITERAL
     assert (
-        len((ANALYSIS_ROOT / "producer_runtime.json").read_bytes()),
-        hashlib.sha256((ANALYSIS_ROOT / "producer_runtime.json").read_bytes()).hexdigest(),
+        len((_GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json").read_bytes()),
+        hashlib.sha256(
+            (_GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json").read_bytes()
+        ).hexdigest(),
     ) == _GOLDEN_RUNTIME_LITERAL
 
 
@@ -5605,3 +5611,1931 @@ def test_golden_bundle_final_capture_jointly_rechecks_an_already_read_input(
     assert mutated
     assert capture_calls == 2
     assert not output.exists()
+
+
+# Task 6: seal the authenticated v1 semantics under the v2 seed contract.
+_GOLDEN_V2_SEAL_TOOL = TOOLS_ROOT / "seal_golden_bundle_v2.py"
+_GOLDEN_V2_CONFIG = (
+    ANALYSIS_ROOT.parent
+    / "contracts/equipment-monitor/v2/golden-config/analysis_config.json"
+)
+_GOLDEN_V2_BUNDLE = (
+    ANALYSIS_ROOT.parent / "contracts/equipment-monitor/v2/golden-bundle"
+)
+_GOLDEN_V2_OUTPUT_NAMES = (
+    "analysis_config.json",
+    "producer_runtime.json",
+    "equipment_operating_ranges.json",
+    "quality_risk_intervals.json",
+    "replay_events.csv",
+    "analysis_summary.json",
+    "bundle_manifest.json",
+)
+
+
+def _compat_runtime_python() -> Path:
+    runtime = os.environ.get("SFEP_COMPAT_RUNTIME")
+    if runtime is None:
+        pytest.skip("SFEP_COMPAT_RUNTIME is required for compatibility reseal tests")
+    python = Path(runtime) / "bin/python"
+    if not python.is_file():
+        pytest.skip("SFEP_COMPAT_RUNTIME/bin/python is unavailable")
+    return python
+
+
+def _run_golden_v2_seal(
+    contract_root: Path,
+    analysis_config: Path,
+    runtime_manifest: Path,
+    output: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(_compat_runtime_python()),
+            "-S",
+            str(_GOLDEN_V2_SEAL_TOOL),
+            "--contract-root",
+            str(contract_root),
+            "--analysis-config",
+            str(analysis_config),
+            "--runtime-manifest",
+            str(runtime_manifest),
+            "--output-dir",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PYTHONHASHSEED": "0",
+            "TZ": "Asia/Seoul",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+
+
+def test_golden_v2_cli_rejects_startup_without_no_site_mode() -> None:
+    result = subprocess.run(
+        [str(_compat_runtime_python()), str(_GOLDEN_V2_SEAL_TOOL), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TZ": "Asia/Seoul",
+        },
+    )
+    assert result.returncode == 2
+    assert "requires Python -S" in result.stderr
+
+
+def test_golden_v2_no_site_startup_never_executes_runtime_pth(
+    tmp_path: Path,
+) -> None:
+    runtime_python = _compat_runtime_python()
+    purelib = runtime_python.parents[1] / "lib/python3.12/site-packages"
+    attack_pth = purelib / "zz_sfep_startup_attack.pth"
+    marker = tmp_path / "pth-executed"
+    attack_pth.write_text(
+        "import pathlib; "
+        f"pathlib.Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "Asia/Seoul",
+    }
+    try:
+        old_startup = subprocess.run(
+            [str(runtime_python), "-c", "pass"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert old_startup.returncode == 0, old_startup.stderr
+        assert marker.read_text(encoding="utf-8") == "executed"
+        marker.unlink()
+        result = _run_golden_v2_seal(
+            _GOLDEN_CONTRACT_ROOT,
+            _GOLDEN_V2_CONFIG,
+            _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+            tmp_path / "output",
+        )
+    finally:
+        attack_pth.unlink(missing_ok=True)
+
+    assert result.returncode == 2
+    assert "unclaimed" in result.stderr or "inventory" in result.stderr
+    assert not marker.exists()
+    assert not (tmp_path / "output").exists()
+
+
+def _tree_file_hashes(root: Path) -> dict[str, tuple[int, str]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            len(path.read_bytes()),
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix().encode())
+        if path.is_file()
+    }
+
+
+def test_golden_v2_seal_cli_is_exact_and_imports_only_the_standard_library() -> None:
+    source = _GOLDEN_V2_SEAL_TOOL.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = {
+        alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert imports <= set(sys.stdlib_module_names) | {"__future__"}
+
+    result = subprocess.run(
+        [sys.executable, "-S", str(_GOLDEN_V2_SEAL_TOOL), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--contract-root" in result.stdout
+    assert "--analysis-config" in result.stdout
+    assert "--runtime-manifest" in result.stdout
+    assert "--output-dir" in result.stdout
+    assert "--output " not in result.stdout
+
+
+def test_golden_v2_seal_is_byte_deterministic_and_v1_read_only(
+    tmp_path: Path,
+) -> None:
+    before = _tree_file_hashes(_GOLDEN_CONTRACT_ROOT)
+    runtime = _GOLDEN_V2_BUNDLE / "producer_runtime.json"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    first_result = _run_golden_v2_seal(
+        _GOLDEN_CONTRACT_ROOT, _GOLDEN_V2_CONFIG, runtime, first
+    )
+    second_result = _run_golden_v2_seal(
+        _GOLDEN_CONTRACT_ROOT, _GOLDEN_V2_CONFIG, runtime, second
+    )
+
+    assert first_result.returncode == 0, first_result.stderr
+    assert second_result.returncode == 0, second_result.stderr
+    assert {path.name for path in first.iterdir()} == set(_GOLDEN_V2_OUTPUT_NAMES)
+    assert {
+        name: (first / name).read_bytes() for name in _GOLDEN_V2_OUTPUT_NAMES
+    } == {
+        name: (second / name).read_bytes() for name in _GOLDEN_V2_OUTPUT_NAMES
+    } == {
+        name: (_GOLDEN_V2_BUNDLE / name).read_bytes()
+        for name in _GOLDEN_V2_OUTPUT_NAMES
+    }
+    assert _tree_file_hashes(_GOLDEN_CONTRACT_ROOT) == before
+
+
+@pytest.mark.parametrize("tamper", ("v1-manifest", "v1-artifact", "v2-seed"))
+def test_golden_v2_seal_rejects_unauthenticated_v1_or_wrong_seed_before_output(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    contract = tmp_path / "contract-v1"
+    shutil.copytree(_GOLDEN_CONTRACT_ROOT, contract)
+    config = tmp_path / "analysis_config.json"
+    shutil.copy2(_GOLDEN_V2_CONFIG, config)
+    if tamper == "v1-manifest":
+        path = contract / "golden-bundle/bundle_manifest.json"
+        path.write_bytes(path.read_bytes() + b" ")
+    elif tamper == "v1-artifact":
+        path = contract / "golden-bundle/replay_events.csv"
+        path.write_bytes(path.read_bytes() + b" ")
+    else:
+        value = json.loads(config.read_bytes())
+        value["bootstrap"]["seedMaterial"] = "sha256:" + "0" * 64
+        config.write_bytes(_canonical_json_bytes(value))
+    output = tmp_path / "output"
+
+    result = _run_golden_v2_seal(
+        contract,
+        config,
+        _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+        output,
+    )
+
+    assert result.returncode == 2
+    assert not output.exists()
+
+
+def test_golden_v2_seal_is_strict_no_clobber(tmp_path: Path) -> None:
+    output = tmp_path / "occupied"
+    output.mkdir()
+    sentinel = output / "external.txt"
+    sentinel.write_bytes(b"external\n")
+
+    result = _run_golden_v2_seal(
+        _GOLDEN_CONTRACT_ROOT,
+        _GOLDEN_V2_CONFIG,
+        _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+        output,
+    )
+
+    assert result.returncode == 2
+    assert sentinel.read_bytes() == b"external\n"
+    assert {path.name for path in output.iterdir()} == {"external.txt"}
+
+
+def test_golden_v2_publication_fault_never_exposes_partial_target(
+    tmp_path: Path,
+) -> None:
+    namespace = runpy.run_path(str(_GOLDEN_V2_SEAL_TOOL), run_name="v2_seal_test")
+    module_globals = namespace["_publish_bundle"].__globals__
+    original = module_globals["_write_file"]
+    calls = 0
+
+    def fail_second(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise namespace["GoldenV2SealError"]("injected publication fault")
+        original(path, payload, *args, **kwargs)
+
+    module_globals["_write_file"] = fail_second
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    with pytest.raises(namespace["GoldenV2SealError"], match="injected"):
+        module_globals["_publish_bundle"](output, payloads, lambda: None)
+
+    assert not output.exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def _golden_v2_seal_namespace() -> dict[str, object]:
+    return runpy.run_path(str(_GOLDEN_V2_SEAL_TOOL), run_name="v2_seal_test")
+
+
+def _golden_v2_inputs(namespace: dict[str, object]) -> dict[str, bytes]:
+    return namespace["_capture_inputs"](
+        _GOLDEN_CONTRACT_ROOT,
+        _GOLDEN_V2_CONFIG,
+        _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+    )[0]
+
+
+def _v2_identity_uri(namespace: dict[str, object], name: str, fields: dict[str, str]) -> str:
+    expected = set(fields)
+    return namespace["_identity"](name, fields, expected)
+
+
+def _coherently_forge_generated_v2(
+    namespace: dict[str, object],
+    destination: Path,
+    *,
+    criteria_change: tuple[str, str] | None = None,
+    identity_change: tuple[str, str] | None = None,
+) -> Path:
+    shutil.copytree(_GOLDEN_V2_BUNDLE, destination)
+    manifest_path = destination / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    if criteria_change is not None:
+        key, value = criteria_change
+        manifest["criteriaIdentity"][key] = value
+        if key == "as_of":
+            manifest["asOf"] = value
+        criteria_id = _v2_identity_uri(
+            namespace, "sfep-criteria-id/v1", manifest["criteriaIdentity"]
+        )
+        manifest["criteriaId"] = criteria_id
+        manifest["identity"]["criteria_id"] = criteria_id
+        for filename in ("equipment_operating_ranges.json", "quality_risk_intervals.json"):
+            value_object = json.loads((destination / filename).read_bytes())
+            value_object["criteriaId"] = criteria_id
+            if key == "as_of":
+                value_object["asOf"] = value
+            (destination / filename).write_bytes(_canonical_json_bytes(value_object))
+        summary = json.loads((destination / "analysis_summary.json").read_bytes())
+        summary["criteriaId"] = criteria_id
+        if key == "as_of":
+            summary["asOf"] = value
+        (destination / "analysis_summary.json").write_bytes(_canonical_json_bytes(summary))
+    if identity_change is not None:
+        key, value = identity_change
+        manifest["identity"][key] = value
+    bundle_id = _v2_identity_uri(
+        namespace, "sfep-bundle-id/v1", manifest["identity"]
+    )
+    manifest["bundleId"] = bundle_id
+    summary_path = destination / "analysis_summary.json"
+    summary = json.loads(summary_path.read_bytes())
+    summary["bundleId"] = bundle_id
+    summary_path.write_bytes(_canonical_json_bytes(summary))
+    replay_path = destination / "replay_events.csv"
+    rows = list(csv.reader(io.StringIO(replay_path.read_text(encoding="utf-8"), newline="")))
+    for row in rows[1:]:
+        row[rows[0].index("bundle_id")] = bundle_id
+        row[rows[0].index("criteria_id")] = manifest["criteriaId"]
+    output = io.StringIO(newline="")
+    csv.writer(output, lineterminator="\n").writerows(rows)
+    replay_path.write_bytes(output.getvalue().encode())
+    filename_by_role = {
+        role: filename for role, filename, _version in namespace["_ARTIFACTS"]
+    }
+    for entry in manifest["artifacts"]:
+        payload = (destination / filename_by_role[entry["role"]]).read_bytes()
+        entry["sizeBytes"] = len(payload)
+        entry["sha256"] = _sha256_uri(payload)
+    manifest_path.write_bytes(_canonical_json_bytes(manifest))
+    rebound = destination.with_name(bundle_id)
+    destination.rename(rebound)
+    return rebound
+
+
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    (
+        ("criteria", "criteria_projection_sha256"),
+        ("criteria", "as_of"),
+        ("identity", "source.ap.sha256"),
+    ),
+)
+def test_golden_v2_verifier_rejects_coherent_identity_forgery(
+    tmp_path: Path,
+    kind: str,
+    field: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    value = "2025-02-19" if field == "as_of" else "sha256:" + "9" * 64
+    forged = _coherently_forge_generated_v2(
+        namespace,
+        tmp_path / "working",
+        criteria_change=(field, value) if kind == "criteria" else None,
+        identity_change=(field, value) if kind == "identity" else None,
+    )
+
+    with pytest.raises(namespace["GoldenV2SealError"]):
+        namespace["_verify_generated"](forged, _golden_v2_inputs(namespace))
+
+
+def test_golden_v2_verifier_rejects_schema_invalid_rebound_manifest(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    bundle_id = json.loads(
+        (_GOLDEN_V2_BUNDLE / "bundle_manifest.json").read_bytes()
+    )["bundleId"]
+    bundle = tmp_path / bundle_id
+    shutil.copytree(_GOLDEN_V2_BUNDLE, bundle)
+    manifest_path = bundle / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["forgedAdditionalMember"] = True
+    manifest_path.write_bytes(_canonical_json_bytes(manifest))
+
+    with pytest.raises(namespace["GoldenV2SealError"], match="schema|manifest"):
+        namespace["_verify_generated"](bundle, _golden_v2_inputs(namespace))
+
+
+def test_golden_v2_schema_verifier_rejects_bool_substituted_for_integer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_verify_generated"].__globals__
+    manifest = json.loads(
+        (_GOLDEN_V2_BUNDLE / "bundle_manifest.json").read_bytes()
+    )
+    bundle = tmp_path / manifest["bundleId"]
+    shutil.copytree(_GOLDEN_V2_BUNDLE, bundle)
+    summary_path = bundle / "analysis_summary.json"
+    summary = json.loads(summary_path.read_bytes())
+    assert summary["splitCounts"]["discovery"]["defects"] == 1
+    summary["splitCounts"]["discovery"]["defects"] = True
+    summary_payload = namespace["_canonical_bytes"](summary)
+    summary_path.write_bytes(summary_payload)
+    summary_entry = next(
+        entry
+        for entry in manifest["artifacts"]
+        if entry["role"] == "analysis_summary"
+    )
+    summary_entry["sha256"] = _sha256_uri(summary_payload)
+    summary_entry["sizeBytes"] = len(summary_payload)
+    (bundle / "bundle_manifest.json").write_bytes(_canonical_json_bytes(manifest))
+    original = globals_["_validate_output_schemas"]
+    calls = 0
+
+    def recording_schema_validation(outputs: object) -> None:
+        nonlocal calls
+        calls += 1
+        original(outputs)
+
+    globals_["_validate_output_schemas"] = recording_schema_validation
+    monkeypatch.setattr(globals_["sys"], "executable", str(_compat_runtime_python()))
+    with pytest.raises(
+        namespace["GoldenV2SealError"],
+        match="generated v2 schema validation failed",
+    ) as captured:
+        namespace["_verify_generated"](bundle, _golden_v2_inputs(namespace))
+    assert calls == 1
+    assert "True is not of type 'integer'" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("surface", "field"),
+    (
+        ("equipment_operating_ranges.json", "criteriaId"),
+        ("quality_risk_intervals.json", "criteriaId"),
+        ("replay_events.csv", "criteria_id"),
+        ("replay_events.csv", "bundle_id"),
+        ("analysis_summary.json", "criteriaId"),
+        ("analysis_summary.json", "bundleId"),
+    ),
+)
+def test_golden_v2_verifier_rejects_every_unbound_generated_identity_surface(
+    tmp_path: Path,
+    surface: str,
+    field: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    manifest = json.loads(
+        (_GOLDEN_V2_BUNDLE / "bundle_manifest.json").read_bytes()
+    )
+    bundle = tmp_path / manifest["bundleId"]
+    shutil.copytree(_GOLDEN_V2_BUNDLE, bundle)
+    if surface.endswith(".csv"):
+        path = bundle / surface
+        rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8"), newline="")))
+        rows[1][rows[0].index(field)] = "sha256:" + "9" * 64
+        output = io.StringIO(newline="")
+        csv.writer(output, lineterminator="\n").writerows(rows)
+        payload = output.getvalue().encode()
+    else:
+        path = bundle / surface
+        value = json.loads(path.read_bytes())
+        value[field] = "sha256:" + "9" * 64
+        payload = namespace["_canonical_bytes"](value)
+    path.write_bytes(payload)
+    role = next(
+        role
+        for role, filename, _version in namespace["_ARTIFACTS"]
+        if filename == surface
+    )
+    entry = next(item for item in manifest["artifacts"] if item["role"] == role)
+    entry["sizeBytes"] = len(payload)
+    entry["sha256"] = _sha256_uri(payload)
+    (bundle / "bundle_manifest.json").write_bytes(namespace["_canonical_bytes"](manifest))
+
+    with pytest.raises(namespace["GoldenV2SealError"], match="binding|parity"):
+        namespace["_verify_generated"](bundle, _golden_v2_inputs(namespace))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"value":0.005}\n',
+        b'{"b":1,"a":2}\n',
+        b'{"a": 1}\n',
+    ),
+)
+def test_golden_v2_json_parser_rejects_noncanonical_json(payload: bytes) -> None:
+    namespace = _golden_v2_seal_namespace()
+    with pytest.raises(namespace["GoldenV2SealError"], match="canonical"):
+        namespace["_json"](payload, "attack JSON")
+
+
+def test_golden_v2_json_parser_rejects_duplicate_members() -> None:
+    namespace = _golden_v2_seal_namespace()
+    with pytest.raises(namespace["GoldenV2SealError"], match="duplicate"):
+        namespace["_json"](b'{"a":1,"a":1}\n', "attack JSON")
+
+
+def test_golden_v2_canonical_numbers_match_every_normative_vector() -> None:
+    namespace = _golden_v2_seal_namespace()
+    vectors = json.loads(
+        (
+            ANALYSIS_ROOT.parent
+            / "contracts/equipment-monitor/v1/canonical-number-test-vectors.json"
+        ).read_bytes()
+    )
+    assert tuple(
+        namespace["_canonical_float"](float.fromhex(vector["hex"]))
+        for vector in vectors
+    ) == tuple(vector["expected"] for vector in vectors)
+
+
+@pytest.mark.parametrize("tamper", ("crlf", "values-json"))
+def test_golden_v2_event_parser_rejects_noncanonical_csv(
+    tamper: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    payload = (_GOLDEN_V2_BUNDLE / "replay_events.csv").read_bytes()
+    if tamper == "crlf":
+        payload = payload.replace(b"\n", b"\r\n")
+    else:
+        payload = payload.replace(b"5e-3", b"0.005", 1)
+    with pytest.raises(namespace["GoldenV2SealError"], match="canonical"):
+        namespace["_events"](payload)
+
+
+def test_golden_v2_reader_and_inventory_reject_hardlinks(tmp_path: Path) -> None:
+    namespace = _golden_v2_seal_namespace()
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    alias = tmp_path / "alias"
+    os.link(source, alias)
+    with pytest.raises(namespace["GoldenV2SealError"], match="hardlink|link"):
+        namespace["_read_file"](source, "hardlinked input")
+    with pytest.raises(namespace["GoldenV2SealError"], match="hardlink|link"):
+        namespace["_inventory"](tmp_path, {"source", "alias"}, "hardlinked inventory")
+
+
+def test_golden_v2_reader_rejects_in_place_mode_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_read_file"].__globals__
+    target = tmp_path / "target"
+    target.write_bytes(b"payload")
+    original = globals_["os"].read
+    changed = False
+
+    def chmod_during_read(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        payload = original(descriptor, size)
+        if payload and not changed:
+            os.fchmod(descriptor, 0o400)
+            changed = True
+        return payload
+
+    monkeypatch.setattr(globals_["os"], "read", chmod_during_read)
+    with pytest.raises(namespace["GoldenV2SealError"], match="changed"):
+        namespace["_read_file"](target, "raced input")
+    assert changed
+
+
+def test_golden_v2_publication_rejects_hardlinked_scratch_and_cleans_it(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    original = globals_["_write_file"]
+    outside = tmp_path / "outside-hardlink"
+    linked = False
+
+    def hardlink_first(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal linked
+        original(path, payload, *args, **kwargs)
+        if not linked:
+            os.link(path, outside)
+            linked = True
+
+    globals_["_write_file"] = hardlink_first
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="hardlink|link"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert outside.is_file()
+    assert not output.exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_rejects_parent_swap_and_cleans_owned_scratch(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    output = parent / "output"
+    displaced = tmp_path / "displaced-parent"
+    original = globals_["_write_file"]
+    swapped = False
+
+    def swap_parent(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        original(path, payload, *args, **kwargs)
+        if not swapped:
+            parent.rename(displaced)
+            parent.mkdir()
+            swapped = True
+
+    globals_["_write_file"] = swap_parent
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="parent|identity|changed"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert swapped
+    assert not output.exists()
+    assert list(parent.glob(".sfep-golden-v2-*")) == []
+    assert list(displaced.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_rejects_ancestor_swap_and_cleans_owned_scratch(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    ancestor = tmp_path / "ancestor"
+    parent = ancestor / "parent"
+    parent.mkdir(parents=True)
+    output = parent / "output"
+    displaced = tmp_path / "displaced-ancestor"
+    original = globals_["_write_file"]
+    swapped = False
+
+    def swap_ancestor(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        original(path, payload, *args, **kwargs)
+        if not swapped:
+            ancestor.rename(displaced)
+            parent.mkdir(parents=True)
+            swapped = True
+
+    globals_["_write_file"] = swap_ancestor
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="parent|identity|changed"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert swapped
+    assert not output.exists()
+    assert list(parent.glob(".sfep-golden-v2-*")) == []
+    assert list((displaced / "parent").glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_rejects_symlink_replacement_and_cleans_owned_scratch(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    original = globals_["_write_file"]
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"external")
+    replaced = False
+
+    def replace_first(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        original(path, payload, *args, **kwargs)
+        if not replaced:
+            path.unlink()
+            path.symlink_to(outside)
+            replaced = True
+
+    globals_["_write_file"] = replace_first
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="regular|replaced|identity"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert outside.read_bytes() == b"external"
+    assert not output.exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_cleans_only_identity_pinned_replaced_scratch(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    original = globals_["_write_file"]
+    external = tmp_path / "external"
+    external.mkdir()
+    external_inode = external.stat().st_ino
+    displaced = tmp_path / "owned-displaced"
+    replacement: Path | None = None
+
+    def replace_scratch(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal replacement
+        if replacement is None:
+            path.parent.rename(displaced)
+            external.rename(path.parent)
+            replacement = path.parent
+        original(path, payload, *args, **kwargs)
+
+    globals_["_write_file"] = replace_scratch
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="scratch|identity"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert replacement is not None
+    assert replacement.is_dir() and replacement.stat().st_ino == external_inode
+    assert not displaced.exists()
+    assert not output.exists()
+
+
+def test_golden_v2_publication_rejects_unowned_lock_without_removing_it(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    lock = tmp_path / ".sfep-golden-v2.lock"
+    lock.write_bytes(b"unowned")
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="lock"):
+        namespace["_publish_bundle"](output, payloads, lambda: None)
+    assert lock.read_bytes() == b"unowned"
+    assert not output.exists()
+
+
+def test_golden_v2_publication_rejects_lock_replacement_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    original = globals_["_write_file"]
+    replacement = b"unowned replacement"
+    replaced = False
+
+    def replace_lock(path: Path, payload: bytes, *args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        original(path, payload, *args, **kwargs)
+        if not replaced:
+            lock = path.parent.parent / globals_["_PUBLICATION_LOCK"]
+            lock.unlink()
+            lock.write_bytes(replacement)
+            replaced = True
+
+    globals_["_write_file"] = replace_lock
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="lock"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert replaced
+    assert (tmp_path / globals_["_PUBLICATION_LOCK"]).read_bytes() == replacement
+    assert not output.exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_cleans_lock_if_initial_fchmod_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_fchmod = os.fchmod
+    failed = False
+
+    def failing_first_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected lock fchmod failure")
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(globals_["os"], "fchmod", failing_first_fchmod)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="injected lock fchmod failure"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert failed
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_publication_cleans_lock_if_initial_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_open = os.open
+    real_fstat = os.fstat
+    lock_descriptor: int | None = None
+    failed = False
+
+    def recording_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal lock_descriptor
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == globals_["_PUBLICATION_LOCK"]:
+            lock_descriptor = descriptor
+        return descriptor
+
+    def failing_first_lock_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if descriptor == lock_descriptor and not failed:
+            failed = True
+            raise OSError("injected initial lock fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(globals_["os"], "open", recording_open)
+    monkeypatch.setattr(globals_["os"], "fstat", failing_first_lock_fstat)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="injected initial lock fstat failure"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert failed and lock_descriptor is not None
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+@pytest.mark.parametrize("fault", ("scratch-fstat",))
+def test_golden_v2_publication_cleans_early_owned_scratch_on_descriptor_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_open = os.open
+    real_fstat = os.fstat
+    opened: list[int] = []
+    scratch_descriptor: int | None = None
+    failed = False
+
+    def faulting_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal failed, scratch_descriptor
+        if (
+            fault == "scratch-open"
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+            and not failed
+        ):
+            failed = True
+            raise OSError("injected scratch open failure")
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        if isinstance(path, str) and path.startswith(globals_["_SCRATCH_PREFIX"]):
+            scratch_descriptor = descriptor
+        return descriptor
+
+    def faulting_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if fault == "scratch-fstat" and descriptor == scratch_descriptor and not failed:
+            failed = True
+            raise OSError("injected scratch fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(globals_["os"], "open", faulting_open)
+    monkeypatch.setattr(globals_["os"], "fstat", faulting_fstat)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="injected scratch"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert failed
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+    for descriptor in set(opened):
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+@pytest.mark.parametrize("fault", ("identity-stat", "scratch-open"))
+def test_golden_v2_publication_retries_one_shot_scratch_acquisition_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_open = os.open
+    real_stat = os.stat
+    real_fstat = os.fstat
+    opened: list[int] = []
+    failed = False
+
+    def faulting_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal failed
+        if (
+            fault == "scratch-open"
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+            and not failed
+        ):
+            failed = True
+            raise OSError("injected one-shot scratch open failure")
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def faulting_stat(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal failed
+        if (
+            fault == "identity-stat"
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+            and dir_fd is not None
+            and not follow_symlinks
+            and not failed
+        ):
+            failed = True
+            raise OSError("injected one-shot scratch identity stat failure")
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(globals_["os"], "open", faulting_open)
+    monkeypatch.setattr(globals_["os"], "stat", faulting_stat)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    status = globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert failed and status == "created"
+    assert {path.name for path in output.iterdir()} == set(_GOLDEN_V2_OUTPUT_NAMES)
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+    for descriptor in set(opened):
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+def test_golden_v2_publication_preserves_ambiguous_mkdir_identity_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_stat = os.stat
+    displaced = tmp_path / "ambiguous-owned-scratch"
+    replacement: Path | None = None
+
+    def replace_before_first_identity(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal replacement
+        if (
+            replacement is None
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+            and dir_fd is not None
+            and not follow_symlinks
+        ):
+            owned = tmp_path / path
+            owned.rename(displaced)
+            owned.mkdir()
+            replacement = owned
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(globals_["os"], "stat", replace_before_first_identity)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    with pytest.raises(namespace["GoldenV2SealError"], match="ambiguous|inventory"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert replacement is not None and replacement.is_dir()
+    assert displaced.is_dir()
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert [path for path in tmp_path.glob(".sfep-golden-v2-*")] == [replacement]
+
+
+def test_golden_v2_publication_rejects_moved_out_scratch_before_first_path_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    publication_parent = tmp_path / "publication-parent"
+    outside_parent = tmp_path / "outside-parent"
+    publication_parent.mkdir()
+    outside_parent.mkdir()
+    displaced = outside_parent / "owned-scratch"
+    replacement: Path | None = None
+    real_stat = os.stat
+
+    def move_outside_before_first_identity(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal replacement
+        if (
+            replacement is None
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+            and dir_fd is not None
+            and not follow_symlinks
+        ):
+            owned = publication_parent / path
+            owned.rename(displaced)
+            owned.mkdir(mode=0o700)
+            replacement = owned
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(globals_["os"], "stat", move_outside_before_first_identity)
+    output = publication_parent / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    with pytest.raises(namespace["GoldenV2SealError"], match="ambiguous|epoch"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert replacement is not None and replacement.is_dir()
+    assert displaced.is_dir()
+    assert not output.exists()
+    assert not (publication_parent / globals_["_PUBLICATION_LOCK"]).exists()
+    assert [
+        path for path in publication_parent.glob(".sfep-golden-v2-*")
+    ] == [replacement]
+
+
+def test_golden_v2_first_open_replacement_is_ambiguous_and_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_open = os.open
+    displaced = tmp_path / "owned-early-scratch"
+    replacement: Path | None = None
+
+    def replace_before_scratch_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replacement
+        if (
+            replacement is None
+            and isinstance(path, str)
+            and path.startswith(globals_["_SCRATCH_PREFIX"])
+        ):
+            owned = tmp_path / path
+            owned.rename(displaced)
+            owned.mkdir()
+            replacement = owned
+            raise OSError("injected scratch replacement open failure")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(globals_["os"], "open", replace_before_scratch_open)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(namespace["GoldenV2SealError"], match="ambiguous|epoch"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert replacement is not None and replacement.is_dir()
+    assert displaced.is_dir()
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert [path for path in tmp_path.glob(".sfep-golden-v2-*")] == [replacement]
+
+
+def test_golden_v2_publication_rolls_back_if_lock_unlink_initially_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_unlink = os.unlink
+    failed = False
+
+    def failing_first_lock_unlink(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal failed
+        if path == globals_["_PUBLICATION_LOCK"] and not failed:
+            failed = True
+            raise OSError("injected lock unlink failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(globals_["os"], "unlink", failing_first_lock_unlink)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="injected lock unlink failure"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert failed
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_rollback_cleans_owned_alternate_scratch_by_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_install = globals_["_atomic_install_exclusive"]
+    real_unlink = os.unlink
+    occupied_name: str | None = None
+    failed = False
+
+    def commit_and_occupy_original(
+        parent_fd: int,
+        source_name: str,
+        target_name: str,
+    ) -> None:
+        nonlocal occupied_name
+        real_install(parent_fd, source_name, target_name)
+        if target_name == "output" and occupied_name is None:
+            os.mkdir(source_name, 0o700, dir_fd=parent_fd)
+            occupied_name = source_name
+
+    def failing_first_lock_unlink(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal failed
+        if path == globals_["_PUBLICATION_LOCK"] and not failed:
+            failed = True
+            raise OSError("injected finalization failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    globals_["_atomic_install_exclusive"] = commit_and_occupy_original
+    monkeypatch.setattr(globals_["os"], "unlink", failing_first_lock_unlink)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="injected finalization failure"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert occupied_name is not None
+    assert (tmp_path / occupied_name).is_dir()
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert [path.name for path in tmp_path.glob(".sfep-golden-v2-*")] == [
+        occupied_name
+    ]
+
+
+def test_golden_v2_publication_rolls_back_and_closes_parent_if_lock_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_open_directory = globals_["_open_directory"]
+    real_unlink = os.unlink
+    real_fsync = os.fsync
+    real_close = os.close
+    parent_descriptors: list[int] = []
+    closed: list[int] = []
+    lock_unlinked = False
+    failed = False
+
+    def recording_open_directory(path: Path, label: str) -> int:
+        descriptor = real_open_directory(path, label)
+        parent_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_unlink(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal lock_unlinked
+        real_unlink(path, dir_fd=dir_fd)
+        if path == globals_["_PUBLICATION_LOCK"]:
+            lock_unlinked = True
+
+    def failing_lock_parent_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if lock_unlinked and descriptor in parent_descriptors and not failed:
+            failed = True
+            raise OSError("injected post-lock-unlink parent fsync failure")
+        real_fsync(descriptor)
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    globals_["_open_directory"] = recording_open_directory
+    monkeypatch.setattr(globals_["os"], "unlink", recording_unlink)
+    monkeypatch.setattr(globals_["os"], "fsync", failing_lock_parent_fsync)
+    monkeypatch.setattr(globals_["os"], "close", recording_close)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+    with pytest.raises(OSError, match="post-lock-unlink parent fsync failure"):
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+    assert failed and lock_unlinked
+    assert parent_descriptors and all(fd in closed for fd in parent_descriptors)
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_durable_publication_ignores_descriptor_close_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_unlink_lock = globals_["_unlink_owned_lock"]
+    real_fsync = os.fsync
+    real_close = os.close
+    lock_unlinked = False
+    durable = False
+    close_faults = 0
+
+    def recording_unlink_lock(*args: object, **kwargs: object) -> None:
+        nonlocal lock_unlinked
+        real_unlink_lock(*args, **kwargs)
+        lock_unlinked = True
+
+    def recording_fsync(descriptor: int) -> None:
+        nonlocal durable
+        real_fsync(descriptor)
+        if lock_unlinked:
+            durable = True
+
+    def close_then_report_diagnostic(descriptor: int) -> None:
+        nonlocal close_faults
+        real_close(descriptor)
+        if durable:
+            close_faults += 1
+            raise OSError("injected durable close diagnostic")
+
+    globals_["_unlink_owned_lock"] = recording_unlink_lock
+    monkeypatch.setattr(globals_["os"], "fsync", recording_fsync)
+    monkeypatch.setattr(globals_["os"], "close", close_then_report_diagnostic)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    status = globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert status == "created"
+    assert durable and close_faults == 3
+    assert {path.name for path in output.iterdir()} == set(_GOLDEN_V2_OUTPUT_NAMES)
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+def test_golden_v2_predurable_cleanup_diagnostic_preserves_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_publish_bundle"].__globals__
+    real_write = globals_["_write_file"]
+    real_open = os.open
+    real_close = os.close
+    scratch_descriptor: int | None = None
+    write_failed = False
+    close_failed = False
+
+    def recording_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal scratch_descriptor
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if isinstance(path, str) and path.startswith(globals_["_SCRATCH_PREFIX"]):
+            scratch_descriptor = descriptor
+        return descriptor
+
+    def fail_first_write(*args: object, **kwargs: object) -> None:
+        nonlocal write_failed
+        if not write_failed:
+            write_failed = True
+            raise namespace["GoldenV2SealError"]("primary publication failure")
+        real_write(*args, **kwargs)
+
+    def close_then_fail_once(descriptor: int) -> None:
+        nonlocal close_failed
+        real_close(descriptor)
+        if descriptor == scratch_descriptor and not close_failed:
+            close_failed = True
+            raise OSError("secondary cleanup close diagnostic")
+
+    globals_["_write_file"] = fail_first_write
+    monkeypatch.setattr(globals_["os"], "open", recording_open)
+    monkeypatch.setattr(globals_["os"], "close", close_then_fail_once)
+    output = tmp_path / "output"
+    payloads = {name: (name + "\n").encode() for name in _GOLDEN_V2_OUTPUT_NAMES}
+
+    with pytest.raises(
+        namespace["GoldenV2SealError"], match="primary publication failure"
+    ) as captured:
+        globals_["_publish_bundle"](output, payloads, lambda: None)
+
+    assert write_failed and close_failed
+    assert any(
+        "secondary cleanup close diagnostic" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert not output.exists()
+    assert not (tmp_path / globals_["_PUBLICATION_LOCK"]).exists()
+    assert list(tmp_path.glob(".sfep-golden-v2-*")) == []
+
+
+@pytest.mark.parametrize("fault", ("write", "fsync"))
+def test_golden_v2_write_file_preserves_primary_io_error_when_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_write_file"].__globals__
+    real_open = os.open
+    real_write = os.write
+    real_fsync = os.fsync
+    real_close = os.close
+    real_fstat = os.fstat
+    target_descriptor: int | None = None
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        nonlocal target_descriptor
+        target_descriptor = real_open(*args, **kwargs)
+        return target_descriptor
+
+    def faulting_write(descriptor: int, payload: object) -> int:
+        if fault == "write" and descriptor == target_descriptor:
+            raise OSError("primary write failure")
+        return real_write(descriptor, payload)
+
+    def faulting_fsync(descriptor: int) -> None:
+        if fault == "fsync" and descriptor == target_descriptor:
+            raise OSError("primary fsync failure")
+        real_fsync(descriptor)
+
+    def close_then_fail(descriptor: int) -> None:
+        real_close(descriptor)
+        if descriptor == target_descriptor:
+            raise OSError("secondary write-file close diagnostic")
+
+    monkeypatch.setattr(globals_["os"], "open", recording_open)
+    monkeypatch.setattr(globals_["os"], "write", faulting_write)
+    monkeypatch.setattr(globals_["os"], "fsync", faulting_fsync)
+    monkeypatch.setattr(globals_["os"], "close", close_then_fail)
+
+    with pytest.raises(OSError, match=f"primary {fault} failure") as captured:
+        globals_["_write_file"](tmp_path / "payload", b"payload")
+
+    assert any(
+        "secondary write-file close diagnostic" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert target_descriptor is not None
+    with pytest.raises(OSError):
+        real_fstat(target_descriptor)
+
+
+@pytest.mark.parametrize("fault", ("read", "fstat"))
+def test_golden_v2_read_file_at_preserves_primary_io_error_when_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_read_file_at"].__globals__
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    real_open = os.open
+    real_read = os.read
+    real_fstat = os.fstat
+    real_close = os.close
+    directory_descriptor = real_open(
+        tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    target_descriptor: int | None = None
+    target_fstats = 0
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        nonlocal target_descriptor
+        target_descriptor = real_open(*args, **kwargs)
+        return target_descriptor
+
+    def faulting_read(descriptor: int, size: int) -> bytes:
+        if fault == "read" and descriptor == target_descriptor:
+            raise OSError("primary read failure")
+        return real_read(descriptor, size)
+
+    def faulting_fstat(descriptor: int) -> os.stat_result:
+        nonlocal target_fstats
+        if descriptor == target_descriptor:
+            target_fstats += 1
+            if fault == "fstat" and target_fstats == 2:
+                raise OSError("primary fstat failure")
+        return real_fstat(descriptor)
+
+    def close_then_fail(descriptor: int) -> None:
+        real_close(descriptor)
+        if descriptor == target_descriptor:
+            raise OSError("secondary read-file close diagnostic")
+
+    monkeypatch.setattr(globals_["os"], "open", recording_open)
+    monkeypatch.setattr(globals_["os"], "read", faulting_read)
+    monkeypatch.setattr(globals_["os"], "fstat", faulting_fstat)
+    monkeypatch.setattr(globals_["os"], "close", close_then_fail)
+    try:
+        with pytest.raises(OSError, match=f"primary {fault} failure") as captured:
+            globals_["_read_file_at"](
+                directory_descriptor, "payload", "fault-injected payload"
+            )
+    finally:
+        real_close(directory_descriptor)
+
+    assert any(
+        "secondary read-file close diagnostic" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert target_descriptor is not None
+    with pytest.raises(OSError):
+        real_fstat(target_descriptor)
+
+
+def test_golden_v2_outer_parent_close_diagnostic_cannot_reverse_durable_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _golden_v2_seal_namespace()
+    globals_ = namespace["_run"].__globals__
+    real_open_directory = globals_["_open_directory"]
+    real_close = os.close
+    outer_parent_fd: int | None = None
+    close_failed = False
+    published = False
+
+    def recording_open_directory(path: Path, label: str) -> int:
+        nonlocal outer_parent_fd
+        descriptor = real_open_directory(path, label)
+        outer_parent_fd = descriptor
+        return descriptor
+
+    def durable_publish(*args: object, **kwargs: object) -> str:
+        nonlocal published
+        published = True
+        return "created"
+
+    def close_then_report_diagnostic(descriptor: int) -> None:
+        nonlocal close_failed
+        real_close(descriptor)
+        if descriptor == outer_parent_fd and not close_failed:
+            close_failed = True
+            raise OSError("outer pinned-parent close diagnostic")
+
+    globals_["_open_directory"] = recording_open_directory
+    globals_["_validate_topology"] = lambda *args: None
+    globals_["_capture_inputs"] = lambda *args: ({"v2/runtime": b"runtime"}, {})
+    globals_["_verify_runtime_install"] = lambda *args: None
+    globals_["_run_producer"] = lambda *args: tmp_path / "generated"
+    globals_["_verify_generated"] = lambda *args: (
+        "sha256:" + "a" * 64,
+        {name: b"payload" for name in _GOLDEN_V2_OUTPUT_NAMES},
+    )
+    globals_["_publish_bundle"] = durable_publish
+    monkeypatch.setattr(globals_["os"], "close", close_then_report_diagnostic)
+
+    result = globals_["_run"](
+        _GOLDEN_CONTRACT_ROOT,
+        _GOLDEN_V2_CONFIG,
+        _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+        tmp_path / "output",
+    )
+
+    assert result == ("created", "sha256:" + "a" * 64)
+    assert published and close_failed
+
+
+def test_golden_v2_producer_ignores_pythonpath_shadow_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shadow = tmp_path / "shadow"
+    package = shadow / "equipment_quality"
+    package.mkdir(parents=True)
+    marker = tmp_path / "shadow-imported"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('shadow', encoding='utf-8')\n"
+        "raise SystemExit(91)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    result = _run_golden_v2_seal(
+        _GOLDEN_CONTRACT_ROOT,
+        _GOLDEN_V2_CONFIG,
+        _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+        tmp_path / "output",
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_golden_v2_parent_authenticates_dependency_before_it_can_import(
+    tmp_path: Path,
+) -> None:
+    runtime_python = _compat_runtime_python()
+    dependency = (
+        runtime_python.parents[1]
+        / "lib/python3.12/site-packages/jsonschema/__init__.py"
+    )
+    original = dependency.read_bytes()
+    original_digest = hashlib.sha256(original).hexdigest()
+    marker = tmp_path / "dependency-imported"
+    attack = (
+        "from pathlib import Path as _AttackPath\n"
+        f"_AttackPath({str(marker)!r}).write_text('imported', encoding='utf-8')\n"
+    ).encode("utf-8") + original
+    try:
+        dependency.write_bytes(attack)
+        result = _run_golden_v2_seal(
+            _GOLDEN_CONTRACT_ROOT,
+            _GOLDEN_V2_CONFIG,
+            _GOLDEN_V2_BUNDLE / "producer_runtime.json",
+            tmp_path / "output",
+        )
+    finally:
+        dependency.write_bytes(original)
+
+    assert hashlib.sha256(dependency.read_bytes()).hexdigest() == original_digest
+    assert result.returncode == 2
+    assert "jsonschema" in result.stderr
+    assert "RECORD" in result.stderr or "authenticate" in result.stderr
+    assert not marker.exists()
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("child", ("producer", "schema"))
+def test_golden_v2_child_reauthenticates_dependency_before_application_import(
+    tmp_path: Path,
+    child: str,
+) -> None:
+    runtime_python = _compat_runtime_python()
+    marker = tmp_path / f"{child}-dependency-imported"
+    child_output = tmp_path / "child-output"
+    child_output.mkdir()
+    harness = textwrap.dedent(
+        r'''
+        import hashlib, pathlib, runpy, subprocess, sys
+
+        tool, runtime_path, fixture, config, contract, output, marker, child = sys.argv[1:]
+        namespace = runpy.run_path(tool, run_name="child_race_harness")
+        dependency = pathlib.Path(sys.executable).parent.parent / "lib/python3.12/site-packages/jsonschema/__init__.py"
+        original = dependency.read_bytes()
+        original_digest = hashlib.sha256(original).hexdigest()
+        attack = (
+            "from pathlib import Path as _AttackPath\n"
+            + f"_AttackPath({marker!r}).write_text('imported', encoding='utf-8')\n"
+        ).encode("utf-8") + original
+        real_run = subprocess.run
+        observed_error = None
+
+        def mutate_between_parent_and_child(*args, **kwargs):
+            dependency.write_bytes(attack)
+            try:
+                return real_run(*args, **kwargs)
+            finally:
+                dependency.write_bytes(original)
+
+        namespace["_run_producer"].__globals__["subprocess"].run = mutate_between_parent_and_child
+        try:
+            if child == "producer":
+                namespace["_run_producer"](
+                    pathlib.Path(contract),
+                    pathlib.Path(config),
+                    pathlib.Path(runtime_path),
+                    pathlib.Path(output),
+                )
+            else:
+                names = namespace["_OUTPUT_NAMES"]
+                payloads = {
+                    name: (pathlib.Path(fixture) / name).read_bytes()
+                    for name in names
+                }
+                namespace["_validate_output_schemas"](payloads)
+        except namespace["GoldenV2SealError"] as error:
+            observed_error = str(error)
+        finally:
+            dependency.write_bytes(original)
+        if hashlib.sha256(dependency.read_bytes()).hexdigest() != original_digest:
+            raise SystemExit(90)
+        if pathlib.Path(marker).exists():
+            print("MARKER_EXECUTED", file=sys.stderr)
+            raise SystemExit(91)
+        if observed_error is None:
+            print("CHILD_DID_NOT_REJECT_TAMPER", file=sys.stderr)
+            raise SystemExit(92)
+        print(observed_error)
+        '''
+    )
+    result = subprocess.run(
+        [
+            str(runtime_python),
+            "-S",
+            "-P",
+            "-s",
+            "-B",
+            "-c",
+            harness,
+            str(_GOLDEN_V2_SEAL_TOOL),
+            str(_GOLDEN_V2_BUNDLE / "producer_runtime.json"),
+            str(_GOLDEN_V2_BUNDLE),
+            str(_GOLDEN_V2_CONFIG),
+            str(_GOLDEN_CONTRACT_ROOT),
+            str(child_output),
+            str(marker),
+            child,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TZ": "Asia/Seoul",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RECORD" in result.stdout or "authenticate" in result.stdout
+    assert not marker.exists()
+
+
+def test_golden_v2_child_never_self_authenticates_replaced_sealer_source(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "replacement-sealer-executed"
+    child_output = tmp_path / "child-output"
+    child_output.mkdir()
+    harness = textwrap.dedent(
+        r'''
+        import pathlib, runpy, sys
+
+        tool, runtime_path, config, contract, output, marker = sys.argv[1:]
+        tool_path = pathlib.Path(tool)
+        namespace = runpy.run_path(tool, run_name="source_race_harness")
+        original = tool_path.read_bytes()
+        attack = (
+            "from pathlib import Path\n"
+            "def _authenticated_child_main(envelope):\n"
+            + f"    Path({marker!r}).write_text('executed', encoding='utf-8')\n"
+        ).encode("utf-8")
+        try:
+            tool_path.write_bytes(attack)
+            generated = namespace["_run_producer"](
+                pathlib.Path(contract),
+                pathlib.Path(config),
+                pathlib.Path(runtime_path),
+                pathlib.Path(output),
+            )
+        finally:
+            tool_path.write_bytes(original)
+        if pathlib.Path(marker).exists():
+            print("REPLACEMENT_SEALER_EXECUTED", file=sys.stderr)
+            raise SystemExit(91)
+        if not generated.is_dir():
+            print("RESIDENT_VERIFIER_DID_NOT_RUN", file=sys.stderr)
+            raise SystemExit(92)
+        print(generated.name)
+        '''
+    )
+    result = subprocess.run(
+        [
+            str(_compat_runtime_python()),
+            "-S",
+            "-P",
+            "-s",
+            "-B",
+            "-c",
+            harness,
+            str(_GOLDEN_V2_SEAL_TOOL),
+            str(_GOLDEN_V2_BUNDLE / "producer_runtime.json"),
+            str(_GOLDEN_V2_CONFIG),
+            str(_GOLDEN_CONTRACT_ROOT),
+            str(child_output),
+            str(marker),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TZ": "Asia/Seoul",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_golden_v2_child_uses_resident_verifier_when_source_replaced_before_capture(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "pre-capture-replacement-executed"
+    child_output = tmp_path / "child-output"
+    child_output.mkdir()
+    harness = textwrap.dedent(
+        r'''
+        import pathlib, sys
+
+        tool, runtime_path, config, contract, output, marker = sys.argv[1:]
+        tool_path = pathlib.Path(tool)
+        original = tool_path.read_bytes()
+        compiled = compile(original, tool, "exec")
+        attack = (
+            "from pathlib import Path\n"
+            "def _authenticated_child_main(envelope):\n"
+            + f"    Path({marker!r}).write_text('executed', encoding='utf-8')\n"
+        ).encode("utf-8")
+        namespace = {"__file__": tool, "__name__": "pre_capture_race_harness"}
+        try:
+            tool_path.write_bytes(attack)
+            exec(compiled, namespace)
+            generated = namespace["_run_producer"](
+                pathlib.Path(contract),
+                pathlib.Path(config),
+                pathlib.Path(runtime_path),
+                pathlib.Path(output),
+            )
+        except namespace.get("GoldenV2SealError", RuntimeError) as error:
+            print(error)
+            generated = None
+        finally:
+            tool_path.write_bytes(original)
+        if pathlib.Path(marker).exists():
+            print("PRE_CAPTURE_REPLACEMENT_EXECUTED", file=sys.stderr)
+            raise SystemExit(91)
+        if generated is None or not generated.is_dir():
+            print("RESIDENT_VERIFIER_DID_NOT_RUN", file=sys.stderr)
+            raise SystemExit(92)
+        print(generated.name)
+        '''
+    )
+    result = subprocess.run(
+        [
+            str(_compat_runtime_python()),
+            "-S",
+            "-P",
+            "-s",
+            "-B",
+            "-c",
+            harness,
+            str(_GOLDEN_V2_SEAL_TOOL),
+            str(_GOLDEN_V2_BUNDLE / "producer_runtime.json"),
+            str(_GOLDEN_V2_CONFIG),
+            str(_GOLDEN_CONTRACT_ROOT),
+            str(child_output),
+            str(marker),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TZ": "Asia/Seoul",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_golden_v2_parent_reauthenticates_immediately_after_schema_child(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "post-schema-dependency-imported"
+    harness = textwrap.dedent(
+        r'''
+        import hashlib, json, pathlib, runpy, subprocess, sys
+
+        tool, runtime_path, config, contract, output, marker = sys.argv[1:]
+        namespace = runpy.run_path(tool, run_name="post_schema_race_harness")
+        globals_ = namespace["_run"].__globals__
+        dependency = pathlib.Path(sys.executable).parent.parent / "lib/python3.12/site-packages/jsonschema/__init__.py"
+        original = dependency.read_bytes()
+        original_digest = hashlib.sha256(original).hexdigest()
+        attack = (
+            "from pathlib import Path as _AttackPath\n"
+            + f"_AttackPath({marker!r}).write_text('imported', encoding='utf-8')\n"
+        ).encode("utf-8") + original
+        real_run = subprocess.run
+        state = {"schema_mutated": False, "publish_called": False}
+        observed_error = None
+
+        def mutate_after_schema(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            envelope = json.loads(kwargs["input"])
+            if envelope.get("mode") == "schema":
+                dependency.write_bytes(attack)
+                state["schema_mutated"] = True
+            return result
+
+        def forbidden_publication(*args, **kwargs):
+            state["publish_called"] = True
+            raise namespace["GoldenV2SealError"]("publication reached after schema race")
+
+        globals_["subprocess"].run = mutate_after_schema
+        globals_["_publish_bundle"] = forbidden_publication
+        try:
+            namespace["_run"](
+                pathlib.Path(contract),
+                pathlib.Path(config),
+                pathlib.Path(runtime_path),
+                pathlib.Path(output),
+            )
+        except namespace["GoldenV2SealError"] as error:
+            observed_error = str(error)
+        finally:
+            dependency.write_bytes(original)
+        if hashlib.sha256(dependency.read_bytes()).hexdigest() != original_digest:
+            raise SystemExit(90)
+        if not state["schema_mutated"]:
+            print("SCHEMA_CHILD_NOT_REACHED", file=sys.stderr)
+            raise SystemExit(91)
+        if state["publish_called"]:
+            print("PUBLICATION_REACHED", file=sys.stderr)
+            raise SystemExit(92)
+        if pathlib.Path(marker).exists():
+            print("MUTATED_DEPENDENCY_IMPORTED", file=sys.stderr)
+            raise SystemExit(93)
+        if observed_error is None:
+            print("POST_SCHEMA_TAMPER_NOT_REJECTED", file=sys.stderr)
+            raise SystemExit(94)
+        print(observed_error)
+        '''
+    )
+    result = subprocess.run(
+        [
+            str(_compat_runtime_python()),
+            "-S",
+            "-P",
+            "-s",
+            "-B",
+            "-c",
+            harness,
+            str(_GOLDEN_V2_SEAL_TOOL),
+            str(_GOLDEN_V2_BUNDLE / "producer_runtime.json"),
+            str(_GOLDEN_V2_CONFIG),
+            str(_GOLDEN_CONTRACT_ROOT),
+            str(tmp_path / "output"),
+            str(marker),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TZ": "Asia/Seoul",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "jsonschema" in result.stdout
+    assert "RECORD" in result.stdout or "authenticate" in result.stdout
+    assert not marker.exists()
+    assert not (tmp_path / "output").exists()
+
+
+def test_golden_oracles_ignore_valid_but_different_current_runtime_manifest(
+    tmp_path: Path,
+) -> None:
+    current = ANALYSIS_ROOT / "producer_runtime.json"
+    current_bytes = current.read_bytes()
+    v1_runtime = _GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json"
+    v2_runtime = _GOLDEN_V2_BUNDLE / "producer_runtime.json"
+    assert current_bytes == v2_runtime.read_bytes()
+    assert current_bytes != v1_runtime.read_bytes()
+    try:
+        current.write_bytes(v1_runtime.read_bytes())
+        v1_output = tmp_path / "v1"
+        v1_result = _run_golden_seal(
+            _GOLDEN_CONTRACT_ROOT,
+            ANALYSIS_ROOT / "analysis_config.json",
+            v1_runtime,
+            v1_output,
+        )
+        v2_output = tmp_path / "v2"
+        v2_result = _run_golden_v2_seal(
+            _GOLDEN_CONTRACT_ROOT,
+            _GOLDEN_V2_CONFIG,
+            v2_runtime,
+            v2_output,
+        )
+    finally:
+        current.write_bytes(current_bytes)
+
+    assert v1_result.returncode == 0, v1_result.stderr
+    assert v2_result.returncode == 0, v2_result.stderr
+    assert (v1_output / "producer_runtime.json").read_bytes() == v1_runtime.read_bytes()
+    assert (v2_output / "producer_runtime.json").read_bytes() == v2_runtime.read_bytes()
+    assert current.read_bytes() == current_bytes

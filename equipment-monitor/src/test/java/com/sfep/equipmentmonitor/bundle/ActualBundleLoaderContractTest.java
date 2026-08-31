@@ -1,6 +1,7 @@
 package com.sfep.equipmentmonitor.bundle;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 
 import java.nio.file.Path;
 import java.util.Map;
@@ -8,10 +9,11 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+@Tag("actual-bundle-v1")
 class ActualBundleLoaderContractTest {
     @Test
     void projectsTheSealedActualBundleManagementEvidenceWhenConfigured() throws Exception {
-        String configured = System.getenv("SFEP_ACTUAL_BUNDLE");
+        String configured = System.getProperty("sfep.actual-bundle", System.getenv("SFEP_ACTUAL_BUNDLE"));
         assumeTrue(configured != null && !configured.isBlank(), "local-only actual bundle not configured");
 
         LoadedBundle loaded = new BundleLoader().load(Path.of(configured).toRealPath());

@@ -5,13 +5,17 @@ from dataclasses import replace
 from datetime import date
 import hashlib
 import json
+from pathlib import Path
 import stat
 
+import pandas as pd
 import pytest
 
 import equipment_quality.artifacts as artifact_module
 import equipment_quality.event_builder as event_builder_module
+import equipment_quality.models as equipment_models
 import equipment_quality.summary as summary_module
+import oracles.v1_execution_trace as v1_oracle
 from equipment_quality.artifacts import (
     FIXED_ARTIFACT_FILENAMES,
     FIXED_ARTIFACT_ROLES,
@@ -24,11 +28,21 @@ from equipment_quality.artifacts import (
     verify_complete_bundle,
     write_bundle,
 )
+from equipment_quality.bundle_contract import V1_CONTRACT, V2_CONTRACT
 from equipment_quality.criteria_projection import build_criteria_projection
+from equipment_quality.event_builder import build_replay_events
 from equipment_quality.feature_roles import definitions
 from equipment_quality.models import AggregateLineage, Identity, SourceFile
-from equipment_quality.quality_intervals import build_quality_rules_result
-from equipment_quality.schema import validate_normative_instance
+from equipment_quality.operating_ranges import build_operating_ranges_result
+from equipment_quality.quality_intervals import (
+    build_quality_rules_result,
+    build_quality_rules_result_with_seed,
+)
+from equipment_quality.schema import (
+    contract_schema_bytes,
+    load_analysis_config,
+    validate_normative_instance,
+)
 from equipment_quality.summary import build_summary, holdout_metrics
 from equipment_quality.deterministic import canonical_json_bytes, id_lines, sha256_uri
 from factories.artifacts import (
@@ -74,6 +88,242 @@ def test_literal_bundle_identity_has_exact_nineteen_fields_and_id() -> None:
     assert dict(identity.fields) == LITERAL_NINETEEN_BUNDLE_FIELDS
     assert identity.version == "sfep-bundle-id/v1"
     assert identity.value == LITERAL_BUNDLE_ID
+
+
+def _v2_summary_request():
+    base = golden_summary_request()
+    config_path = Path(__file__).resolve().parents[1] / "analysis_config_v2.json"
+    config_bytes = config_path.read_bytes()
+    config = load_analysis_config(config_path)
+    items = definitions(config)
+    schemas = {
+        role: sha256_uri(contract_schema_bytes(V2_CONTRACT, role))
+        for role in V2_CONTRACT.schema_resources
+    }
+    criteria = compute_criteria_identity(
+        base.split.as_of,
+        build_criteria_projection(base.split, items),
+        config_bytes,
+        base.producer_runtime_bytes,
+        {role: schemas[role] for role in LITERAL_CRITERIA_SCHEMA_DIGESTS},
+    )
+    seed = equipment_models.resolve_bootstrap_seed(config, criteria.value)
+    ranges = build_operating_ranges_result(
+        base.split,
+        items,
+        config,
+        material_catalog=base.material_catalog,
+    )
+    rules = build_quality_rules_result_with_seed(
+        base.split,
+        items,
+        config,
+        seed,
+        material_catalog=base.material_catalog,
+    )
+    bundle = compute_bundle_identity(
+        criteria.value,
+        config_bytes,
+        base.producer_runtime_bytes,
+        base.inputs.sources,
+        schemas,
+    )
+    events = tuple(
+        build_replay_events(
+            base.genealogy,
+            bundle.value,
+            criteria.value,
+            config,
+        )
+    )
+    return replace(
+        base,
+        contract=V2_CONTRACT,
+        analysis_config=config,
+        bootstrap_seed=seed,
+        analysis_config_bytes=config_bytes,
+        schema_digests=schemas,
+        definitions=items,
+        criteria_identity=criteria,
+        bundle_identity=bundle,
+        operating_ranges=ranges,
+        quality_rules=rules,
+        events=events,
+    )
+
+
+def _v2_bundle_request(output_root: Path):
+    request = _v2_summary_request()
+    summary = build_summary(request)
+    return equipment_models.BundleWriteRequest(
+        output_root=output_root,
+        analysis_config=request.analysis_config_bytes,
+        producer_runtime=request.producer_runtime_bytes,
+        equipment_operating_ranges={
+            "asOf": request.split.as_of.isoformat(),
+            "criteriaId": request.criteria_identity.value,
+            "ranges": request.operating_ranges.to_wire(),
+            "schemaVersion": V2_CONTRACT.artifact_versions["equipment_operating_ranges"],
+        },
+        quality_risk_intervals={
+            "asOf": request.split.as_of.isoformat(),
+            "criteriaId": request.criteria_identity.value,
+            "rules": request.quality_rules.to_wire(),
+            "schemaVersion": V2_CONTRACT.artifact_versions["quality_risk_intervals"],
+        },
+        replay_events=request.events,
+        analysis_summary=summary,
+        criteria_identity=request.criteria_identity,
+        bundle_identity=request.bundle_identity,
+        sources=request.inputs.sources,
+        schema_digests=request.schema_digests,
+        as_of=request.split.as_of,
+        timezone=request.analysis_config.timezone,
+        label_maturity_days=request.analysis_config.label_maturity_days,
+        contract=V2_CONTRACT,
+        manifest_version=V2_CONTRACT.manifest_version,
+    )
+
+
+def test_v2_summary_lineage_diff_is_exactly_the_seed_migration_allowlist() -> None:
+    v1 = build_summary(golden_summary_request())
+    v2 = build_summary(_v2_summary_request())
+    assert v1["schemaVersion"] == V1_CONTRACT.summary_version
+    assert v2["schemaVersion"] == V2_CONTRACT.summary_version
+
+    def keyed(summary):
+        return {
+            (item["artifactRole"], item["outputField"]): item
+            for item in summary["lineage"]["fields"]
+        }
+
+    v1_fields = keyed(v1)
+    v2_fields = keyed(v2)
+    added = {
+        ("analysis_config", "bootstrap.seedMaterial"),
+        ("analysis_config", "bootstrap.seedProtocol"),
+    }
+    assert set(v2_fields) - set(v1_fields) == added
+    assert set(v1_fields) - set(v2_fields) == set()
+    for key in added:
+        field = key[1]
+        assert v2_fields[key] == {
+            "artifactRole": "analysis_config",
+            "conversion": "COPY_CANONICAL_CONFIG",
+            "dependencies": ["config." + field],
+            "firstAvailableStage": None,
+            "outputField": field,
+            "sourceColumn": None,
+            "sourceRole": None,
+        }
+
+    changed = set()
+    v2_holdout_corrections = {
+        ("analysis_summary", f"holdoutMetrics[].{metric}.{leaf}")
+        for metric in ("precision", "lift")
+        for leaf in ("lower", "upper", "validReplicates", "reasonCode")
+    }
+    for key, before in v1_fields.items():
+        expected = dict(before)
+        dependencies = list(before["dependencies"])
+        if (
+            before["conversion"] in {"COMPUTE_QUALITY_METRIC", "COMPUTE_HOLDOUT_METRIC"}
+            and "identity.criteria_id" in dependencies
+        ):
+            dependencies.remove("identity.criteria_id")
+            dependencies.extend(
+                ("config.bootstrap.seedMaterial", "config.bootstrap.seedProtocol")
+            )
+            expected["dependencies"] = sorted(dependencies, key=str.encode)
+            changed.add(key)
+        if key in v2_holdout_corrections:
+            assert {
+                name: value
+                for name, value in v2_fields[key].items()
+                if name != "dependencies"
+            } == {
+                name: value for name, value in before.items() if name != "dependencies"
+            }
+            assert v2_fields[key]["dependencies"] != before["dependencies"]
+        else:
+            assert v2_fields[key] == expected
+    assert changed
+    for collection in ("aggregates", "materials", "populations"):
+        assert v2["lineage"][collection] == v1["lineage"][collection]
+
+
+def test_v2_manifest_and_artifact_versions_follow_one_exact_contract(tmp_path) -> None:
+    request = _v2_bundle_request(tmp_path / "v2-output")
+    assert request.criteria_identity.version == "sfep-criteria-id/v1"
+    assert request.bundle_identity.version == "sfep-bundle-id/v1"
+    assert len(request.criteria_identity.fields) == 8
+    assert len(request.bundle_identity.fields) == 19
+
+    final = write_bundle(request)
+    manifest = json.loads((final / "bundle_manifest.json").read_bytes())
+    assert manifest["schemaVersion"] == "sfep-equipment-bundle/v2"
+    assert {
+        item["role"]: item["schemaVersion"] for item in manifest["artifacts"]
+    } == dict(V2_CONTRACT.artifact_versions)
+    assert json.loads((final / "analysis_config.json").read_bytes())["schemaVersion"] == "sfep-analysis-config/v2"
+    assert json.loads((final / "analysis_summary.json").read_bytes())["schemaVersion"] == "sfep-analysis-summary/v2"
+    assert len(manifest["criteriaIdentity"]) == 8
+    assert len(manifest["identity"]) == 19
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "add_file",
+        "add_directory",
+        "add_symlink",
+        "remove_entry",
+        "replace_entry",
+        "artifact_mode",
+        "directory_mode",
+        "byte_content",
+    ),
+)
+def test_post_projector_verification_rejects_every_layout_and_byte_mutation(
+    tmp_path,
+    mutation,
+) -> None:
+    request = bundle_request(tmp_path / mutation)
+
+    def mutate_after_projection(bundle_root: Path):
+        summary = bundle_root / "analysis_summary.json"
+        if mutation == "add_file":
+            (bundle_root / "unexpected.txt").write_bytes(b"unexpected")
+        elif mutation == "add_directory":
+            (bundle_root / "unexpected").mkdir()
+        elif mutation == "add_symlink":
+            (bundle_root / "unexpected-link").symlink_to(summary.name)
+        elif mutation == "remove_entry":
+            summary.unlink()
+        elif mutation == "replace_entry":
+            payload = summary.read_bytes()
+            summary.unlink()
+            summary.write_bytes(payload)
+            summary.chmod(0o600)
+        elif mutation == "artifact_mode":
+            summary.chmod(0o644)
+        elif mutation == "directory_mode":
+            bundle_root.chmod(0o755)
+        elif mutation == "byte_content":
+            summary.write_bytes(summary.read_bytes() + b" ")
+        else:
+            raise AssertionError("unknown mutation")
+        return ("independent-reference",)
+
+    with pytest.raises((OSError, ValueError)):
+        artifact_module._write_bundle_with_reference_preflight(
+            request,
+            reference_projection=("independent-reference",),
+            project_bundle=mutate_after_projection,
+        )
+
+    assert not (request.output_root / request.bundle_identity.value).exists()
+    assert not tuple(request.output_root.glob(".sfep-bundle-tmp-*"))
 
 
 def test_identity_rejects_a_digest_that_does_not_authenticate_its_fields() -> None:
@@ -596,6 +846,138 @@ def test_too_few_bootstraps_lineage_records_only_the_executed_failure_path() -> 
     )
 
 
+def test_v2_rule_bootstrap_lineage_uses_only_the_config_seed_pair() -> None:
+    config = golden_summary_request().analysis_config
+    split, catalog = identified_split_and_catalog(strong_repeated_fixture())
+    seed = equipment_models.BootstrapSeed(
+        protocol="LEGACY_CRITERIA_ID_UTF8_V1",
+        material=LITERAL_CRITERIA_ID,
+        lineage_dependencies=(
+            "config.bootstrap.seedMaterial",
+            "config.bootstrap.seedProtocol",
+        ),
+    )
+    result = build_quality_rules_result_with_seed(
+        split,
+        definitions(config),
+        config,
+        seed,
+        material_catalog=catalog,
+    )
+
+    traces = summary_module._concrete_quality_lineage(result, config, seed)
+    seed_terminals = {
+        "identity.criteria_id",
+        "config.bootstrap.seedMaterial",
+        "config.bootstrap.seedProtocol",
+    }
+    bootstrap_paths = {
+        path
+        for trace in traces.values()
+        for path, dependencies in trace.items()
+        if set(dependencies) & seed_terminals
+    }
+
+    assert bootstrap_paths
+    for trace in traces.values():
+        for dependencies in trace.values():
+            observed_seed_terminals = set(dependencies) & seed_terminals
+            if observed_seed_terminals:
+                assert observed_seed_terminals == {
+                    "config.bootstrap.seedMaterial",
+                    "config.bootstrap.seedProtocol",
+                }
+
+
+def test_holdout_lineage_exhaustively_tracks_v1_and_v2_seed_dependencies() -> None:
+    v1_request = golden_summary_request()
+    v1 = build_summary(v1_request)
+    v2 = build_summary(_v2_summary_request())
+    assert canonical_json_bytes(v1) == expected_golden_summary_bytes(v1_request)
+    metrics = (
+        "alertRate",
+        "precision",
+        "recall",
+        "baseDefectRate",
+        "lift",
+        "falseAlertsPer100",
+    )
+    v1_bootstrap_metrics = {
+        "alertRate",
+        "recall",
+        "baseDefectRate",
+        "falseAlertsPer100",
+    }
+    leaves = ("pointEstimate", "lower", "upper", "validReplicates", "reasonCode")
+    all_seed_terminals = {
+        "identity.criteria_id",
+        "config.bootstrap.seedMaterial",
+        "config.bootstrap.seedProtocol",
+    }
+
+    def holdout_dependencies(summary):
+        return {
+            item["outputField"]: set(item["dependencies"])
+            for item in summary["lineage"]["fields"]
+            if item["artifactRole"] == "analysis_summary"
+            and item["outputField"].startswith("holdoutMetrics[].")
+        }
+
+    for version, by_path in (
+        ("v1", holdout_dependencies(v1)),
+        ("v2", holdout_dependencies(v2)),
+    ):
+        confusion_dependencies = by_path["holdoutMetrics[].truePositive"]
+        for metric in metrics:
+            point = by_path[f"holdoutMetrics[].{metric}.pointEstimate"]
+            assert point.isdisjoint(
+                all_seed_terminals
+                | {
+                    "config.bootstrap.replicates",
+                    "config.bootstrap.minimumValidReplicates",
+                    "replay_events.charge_id",
+                }
+            )
+            for leaf in leaves[1:]:
+                dependencies = by_path[f"holdoutMetrics[].{metric}.{leaf}"]
+                bootstrapped = version == "v2" or metric in v1_bootstrap_metrics
+                if bootstrapped:
+                    expected_seed = (
+                        {
+                            "config.bootstrap.seedMaterial",
+                            "config.bootstrap.seedProtocol",
+                        }
+                        if version == "v2"
+                        else {"identity.criteria_id"}
+                    )
+                    bootstrap_dependencies = {
+                        *expected_seed,
+                        "config.bootstrap.replicates",
+                        "replay_events.charge_id",
+                    }
+                    if leaf != "validReplicates":
+                        bootstrap_dependencies.add(
+                            "config.bootstrap.minimumValidReplicates"
+                        )
+                    matching_dependencies = (
+                        point
+                        if metric == "baseDefectRate"
+                        else confusion_dependencies
+                    )
+                    assert dependencies == (
+                        point | matching_dependencies | bootstrap_dependencies
+                    )
+                else:
+                    assert dependencies.isdisjoint(
+                        all_seed_terminals
+                        | {
+                            "config.bootstrap.replicates",
+                            "config.bootstrap.minimumValidReplicates",
+                            "replay_events.charge_id",
+                        }
+                    )
+
+
 def test_summary_lineage_graph_is_closed_sorted_unique_and_acyclic() -> None:
     fields = build_summary(golden_summary_request())["lineage"]["fields"]
     identities = [f'{item["artifactRole"]}.{item["outputField"]}' for item in fields]
@@ -731,6 +1113,172 @@ def test_holdout_metrics_requires_pre_ap_eligible_grade_and_charge_bootstraps() 
     assert ignored["truePositive"] == 0
     assert ignored["falseNegative"] == 1
     assert ignored["precision"]["reasonCode"] == "ZERO_DENOMINATOR"
+
+
+def test_holdout_explicit_seed_preserves_every_draw_and_every_final_ci(monkeypatch) -> None:
+    split, _ = golden_split_and_definitions()
+    rules = [holdout_rule()]
+    original_sampler = summary_module._sample_charge_indices
+    sampled: list[tuple[int, tuple[int, ...]]] = []
+
+    def recording_sampler(seed, replicate, population_size):
+        result = original_sampler(seed, replicate, population_size)
+        sampled.append((replicate, result))
+        return result
+
+    monkeypatch.setattr(summary_module, "_sample_charge_indices", recording_sampler)
+    legacy = holdout_metrics(split, rules, LITERAL_CRITERIA_ID)
+    legacy_sampled = tuple(sampled)
+    sampled.clear()
+
+    explicit = summary_module.holdout_metrics_with_seed(
+        split,
+        rules,
+        equipment_models.BootstrapSeed(
+            protocol="LEGACY_CRITERIA_ID_UTF8_V1",
+            material=LITERAL_CRITERIA_ID,
+            lineage_dependencies=("identity.criteria_id",),
+        ),
+    )
+
+    assert tuple(sampled) == legacy_sampled
+    assert tuple(replicate for replicate, _ in sampled) == tuple(range(2000)) * 2
+    assert explicit == legacy
+    assert [
+        (profile["alertGrade"], profile["truePositive"], profile["falsePositive"],
+         profile["trueNegative"], profile["falseNegative"],
+         tuple((name, tuple(interval.items())) for name, interval in profile.items()
+               if isinstance(interval, dict)))
+        for profile in explicit
+    ] == [
+        (profile["alertGrade"], profile["truePositive"], profile["falsePositive"],
+         profile["trueNegative"], profile["falseNegative"],
+         tuple((name, tuple(interval.items())) for name, interval in profile.items()
+               if isinstance(interval, dict)))
+        for profile in legacy
+    ]
+
+
+def test_holdout_matches_independent_oracle_for_every_draw_and_final_ci(monkeypatch) -> None:
+    split, _ = golden_split_and_definitions()
+    template_rows = split.holdout_rows.to_dict(orient="records")
+    blocks = (
+        (1120.0, ("불량", "양품")),
+        (1120.0, ("불량", "불량")),
+        (1120.0, ("양품", "양품")),
+        (1000.0, ("불량", "양품")),
+        (1000.0, ("불량", "불량")),
+        (1000.0, ("양품", "양품")),
+    )
+    holdout_rows = []
+    for charge_ordinal, (temperature, judges) in enumerate(blocks):
+        for coil_ordinal, judge in enumerate(judges):
+            row = dict(template_rows[coil_ordinal])
+            row.update(
+                charge_id=f"ORACLE-C{charge_ordinal}",
+                slab_no=f"S{charge_ordinal}-{coil_ordinal}",
+                hr_coil_id=f"H{charge_ordinal}-{coil_ordinal}",
+                f_pre_temp=temperature,
+                judge=judge,
+                label_status="AVAILABLE",
+            )
+            holdout_rows.append(row)
+    oracle_split = replace(
+        split,
+        holdout_rows=pd.DataFrame(holdout_rows, columns=split.holdout_rows.columns),
+    )
+    seed = equipment_models.BootstrapSeed(
+        "LEGACY_CRITERIA_ID_UTF8_V1",
+        LITERAL_CRITERIA_ID,
+        ("identity.criteria_id",),
+    )
+    original_sampler = summary_module._sample_charge_indices
+    observed_samples: list[tuple[int, ...]] = []
+
+    def recording_sampler(seed_bytes, replicate, population_size):
+        sample = original_sampler(seed_bytes, replicate, population_size)
+        observed_samples.append(sample)
+        return sample
+
+    monkeypatch.setattr(summary_module, "_sample_charge_indices", recording_sampler)
+    profiles = summary_module.holdout_metrics_with_seed(
+        oracle_split,
+        [holdout_rule()],
+        seed,
+    )
+
+    independent_samples = v1_oracle.independent_holdout_bootstrap_samples(
+        LITERAL_CRITERIA_ID,
+        population_size=6,
+        replicates=2000,
+        profile_count=2,
+    )
+    assert tuple(observed_samples) == independent_samples
+    expected_intervals = {
+        "alertRate": (0.5, 1.0 / 6.0, 5.0 / 6.0, 2000),
+        "precision": (0.5, 0.0, 1.0, 1967),
+        "recall": (0.5, 0.0, 1.0, 1998),
+        "baseDefectRate": (0.5, 1.0 / 6.0, 5.0 / 6.0, 2000),
+        "lift": (1.0, 0.0, 2.0, 1965),
+        "falseAlertsPer100": (25.0, 0.0, 175.0 / 3.0, 2000),
+    }
+    assert tuple(
+        (
+            profile["alertGrade"],
+            (
+                profile["truePositive"],
+                profile["falsePositive"],
+                profile["trueNegative"],
+                profile["falseNegative"],
+            ),
+            tuple(
+                (
+                    metric,
+                    profile[metric]["pointEstimate"],
+                    profile[metric]["lower"],
+                    profile[metric]["upper"],
+                    profile[metric]["validReplicates"],
+                    profile[metric]["reasonCode"],
+                )
+                for metric in expected_intervals
+            ),
+        )
+        for profile in profiles
+    ) == tuple(
+        (
+            grade,
+            (3, 3, 3, 3),
+            tuple(
+                (metric, *expected, "NONE")
+                for metric, expected in expected_intervals.items()
+            ),
+        )
+        for grade in ("DANGER", "CAUTION_OR_DANGER")
+    )
+
+
+def test_summary_holdout_receives_the_exact_resolved_bootstrap_seed(monkeypatch) -> None:
+    seed = equipment_models.BootstrapSeed(
+        protocol="LEGACY_CRITERIA_ID_UTF8_V1",
+        material=LITERAL_CRITERIA_ID,
+        lineage_dependencies=("identity.criteria_id",),
+    )
+    request = replace(golden_summary_request(), bootstrap_seed=seed)
+    observed = []
+    original = summary_module.holdout_metrics_with_seed
+
+    def recording_holdout(split, rules, bootstrap_seed):
+        observed.append(bootstrap_seed)
+        return original(split, rules, bootstrap_seed)
+
+    monkeypatch.setattr(
+        summary_module, "holdout_metrics_with_seed", recording_holdout
+    )
+
+    build_summary(request)
+
+    assert observed == [seed]
+    assert observed[0] is seed
 
 
 def _visible_bundles(output_root) -> list:

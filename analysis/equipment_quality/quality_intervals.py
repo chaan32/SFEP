@@ -23,6 +23,7 @@ from equipment_quality.deterministic import canonical_json_bytes, sha256_uri, ty
 from equipment_quality.feature_roles import STAGE_RANK, FeatureDefinition, definitions as configured_definitions
 from equipment_quality.models import (
     AnalysisConfig,
+    BootstrapSeed,
     MaterialLineage,
     QualityRuleSidecar,
     QualityRulesResult,
@@ -34,7 +35,7 @@ from equipment_quality.statistics import (
     BootstrapCi,
     Stratum,
     benjamini_hochberg,
-    charge_bootstrap_rr_ci,
+    charge_bootstrap_rr_ci_with_seed,
     cmh_p_value,
     mantel_haenszel_rr,
     standardized_rates,
@@ -52,7 +53,7 @@ _EQUIPMENT_IDENTIFIER_ROLE = "EQUIPMENT_IDENTIFIER"
 _MISSING = object()
 _PARALLEL_BOOTSTRAP_MINIMUM = 16
 _MAX_BOOTSTRAP_WORKERS = 10
-_BOOTSTRAP_PROTOCOL = "sfep-quality-bootstrap/v1"
+_BOOTSTRAP_PROTOCOL = "sfep-bootstrap-worker/v2"
 _BOOTSTRAP_WORKER_ARGUMENT = "--bootstrap-worker"
 _MAX_BOOTSTRAP_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MAX_BOOTSTRAP_RESPONSE_BYTES = 1024 * 1024
@@ -1223,13 +1224,13 @@ class _BootstrapResponse:
 def _bootstrap_task(
     task: tuple[int, pd.DataFrame, str, str, int],
 ) -> _BootstrapResponse:
-    index, rows, criteria_id, rule_id, replicates = task
+    index, rows, seed_material, rule_id, replicates = task
     return _BootstrapResponse(
         index,
         rule_id,
-        charge_bootstrap_rr_ci(
+        charge_bootstrap_rr_ci_with_seed(
             rows,
-            criteria_id,
+            seed_material,
             rule_id,
             replicates=replicates,
         ),
@@ -1256,9 +1257,15 @@ def _decode_bootstrap_worker_input(
         message = pickle.Unpickler(stream).load()
         if stream.tell() != len(payload):
             raise ValueError("trailing input bytes")
-        if type(message) is not tuple or len(message) != 3:
-            raise ValueError("input envelope must contain protocol, ordinal, and tasks")
-        protocol, worker_ordinal, raw_tasks = message
+        if type(message) is not dict or set(message) != {
+            "protocol",
+            "workerOrdinal",
+            "tasks",
+        }:
+            raise ValueError("input envelope shape is invalid")
+        protocol = message["protocol"]
+        worker_ordinal = message["workerOrdinal"]
+        raw_tasks = message["tasks"]
         if (
             protocol != _BOOTSTRAP_PROTOCOL
             or type(worker_ordinal) is not int
@@ -1268,21 +1275,31 @@ def _decode_bootstrap_worker_input(
             raise ValueError("input protocol or task collection is invalid")
         tasks: list[tuple[int, pd.DataFrame, str, str, int]] = []
         for raw_task in raw_tasks:
-            if type(raw_task) is not tuple or len(raw_task) != 5:
-                raise ValueError("input task must contain exactly five fields")
-            index, rows, criteria_id, rule_id, replicates = raw_task
+            if type(raw_task) is not dict or set(raw_task) != {
+                "index",
+                "rows",
+                "seedMaterial",
+                "ruleId",
+                "replicates",
+            }:
+                raise ValueError("input task shape is invalid")
+            index = raw_task["index"]
+            rows = raw_task["rows"]
+            seed_material = raw_task["seedMaterial"]
+            rule_id = raw_task["ruleId"]
+            replicates = raw_task["replicates"]
             if type(index) is not int or index < 0:
                 raise ValueError("input task index must be a non-negative integer")
             if type(rows) is not pd.DataFrame:
                 raise TypeError("input task rows must be a pandas DataFrame")
-            if type(criteria_id) is not str or type(rule_id) is not str:
+            if type(seed_material) is not str or type(rule_id) is not str:
                 raise TypeError("input task identifiers must be built-in strings")
             if (
                 type(replicates) is not int
                 or not 1 <= replicates <= _UINT64_MAX
             ):
                 raise ValueError("input task replicates must be a positive integer")
-            tasks.append((index, rows, criteria_id, rule_id, replicates))
+            tasks.append((index, rows, seed_material, rule_id, replicates))
         return worker_ordinal, tuple(tasks)
     except Exception as error:
         raise RuntimeError(f"bootstrap worker input protocol invalid: {error}") from error
@@ -1684,7 +1701,20 @@ def _write_bootstrap_worker_inputs(
     for index, partition in enumerate(partitions):
         try:
             payload = pickle.dumps(
-                (_BOOTSTRAP_PROTOCOL, index, tuple(partition)),
+                {
+                    "protocol": _BOOTSTRAP_PROTOCOL,
+                    "workerOrdinal": index,
+                    "tasks": tuple(
+                        {
+                            "index": task[0],
+                            "rows": task[1],
+                            "seedMaterial": task[2],
+                            "ruleId": task[3],
+                            "replicates": task[4],
+                        }
+                        for task in partition
+                    ),
+                },
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
         except Exception as error:
@@ -1870,7 +1900,7 @@ def _bootstrap_discovery_metrics(
     rows: _Rows,
     candidates: tuple[Candidate, ...],
     discovery: list[_MetricComputation],
-    criteria_id: str,
+    bootstrap_seed: BootstrapSeed,
     config: AnalysisConfig,
 ) -> list[_MetricComputation]:
     replicates = int(config.bootstrap["replicates"])
@@ -1878,7 +1908,7 @@ def _bootstrap_discovery_metrics(
         (
             index,
             _bootstrap_rows(rows, discovery[index]),
-            criteria_id,
+            bootstrap_seed.material,
             candidate.rule_id,
             replicates,
         )
@@ -2034,13 +2064,14 @@ class _QualityCoreItem:
     confirmation: _MetricComputation
 
 
-def _build_quality_rules_core(
+def _build_quality_rules_core_with_seed(
     split: TimeSplitResult,
     definitions: Sequence[FeatureDefinition],
     config: AnalysisConfig,
-    criteria_id: str,
+    bootstrap_seed: BootstrapSeed,
 ) -> tuple[_QualityCoreItem, ...]:
-    _validate_criteria_id(criteria_id)
+    if type(bootstrap_seed) is not BootstrapSeed:
+        raise TypeError("bootstrap_seed must be an exact BootstrapSeed")
     wanted = _definition_surface(definitions, config)
     discovery_rows = _snapshot_rows(split.discovery_rows)
     confirmation_rows = _snapshot_rows(split.confirmation_rows)
@@ -2077,7 +2108,7 @@ def _build_quality_rules_core(
         discovery_rows,
         candidates,
         discovery,
-        criteria_id,
+        bootstrap_seed,
         config,
     )
 
@@ -2108,6 +2139,25 @@ def _build_quality_rules_core(
     return tuple(
         _QualityCoreItem(rule, discovery[index], confirmation_computations[index])
         for index, rule in enumerate(rules)
+    )
+
+
+def _build_quality_rules_core(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+) -> tuple[_QualityCoreItem, ...]:
+    criteria = _validate_criteria_id(criteria_id)
+    return _build_quality_rules_core_with_seed(
+        split,
+        definitions,
+        config,
+        BootstrapSeed(
+            "LEGACY_CRITERIA_ID_UTF8_V1",
+            criteria,
+            ("identity.criteria_id",),
+        ),
     )
 
 
@@ -2171,6 +2221,47 @@ def build_quality_rules_result(
     if set(discovery_material_keys) & set(confirmation_material_keys):
         raise ValueError("quality discovery/confirmation material identity overlap")
     items = _build_quality_rules_core(split, definitions, config, criteria_id)
+    records = tuple(item.rule.to_wire() for item in items)
+    sidecars = tuple(
+        QualityRuleSidecar(
+            item.rule.candidate.rule_id,
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.discovery,
+                discovery_material_keys,
+            ),
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.confirmation,
+                confirmation_material_keys,
+            ),
+        )
+        for item in items
+    )
+    return QualityRulesResult(records, sidecars)
+
+
+def build_quality_rules_result_with_seed(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    bootstrap_seed: BootstrapSeed,
+    *,
+    material_catalog: Sequence[MaterialLineage],
+) -> QualityRulesResult:
+    """Build rich quality results from one resolved bootstrap seed."""
+    catalog = _MaterialCatalogIndex(material_catalog)
+    discovery_material_keys = catalog.resolve_rows(
+        split.discovery_rows, "quality discovery"
+    )
+    confirmation_material_keys = catalog.resolve_rows(
+        split.confirmation_rows, "quality confirmation"
+    )
+    if set(discovery_material_keys) & set(confirmation_material_keys):
+        raise ValueError("quality discovery/confirmation material identity overlap")
+    items = _build_quality_rules_core_with_seed(
+        split, definitions, config, bootstrap_seed
+    )
     records = tuple(item.rule.to_wire() for item in items)
     sidecars = tuple(
         QualityRuleSidecar(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
@@ -16,10 +16,14 @@ import stat
 import tempfile
 from types import MappingProxyType
 
+from equipment_quality.bundle_contract import BundleContract
 from equipment_quality.deterministic import canonical_json_bytes, id_lines, sha256_uri
 from equipment_quality.event_builder import serialize_replay_events
 from equipment_quality.models import BundleWriteRequest, Identity, SourceFile
-from equipment_quality.schema import normative_schema_bytes, validate_normative_instance
+from equipment_quality.schema import (
+    contract_schema_bytes,
+    validate_contract_instance,
+)
 
 
 _CRITERIA_SCHEMA_ROLES = (
@@ -62,23 +66,6 @@ FIXED_ARTIFACT_FILENAMES = MappingProxyType(
         "analysis_summary": "analysis_summary.json",
     }
 )
-_ARTIFACT_SCHEMA_NAMES = {
-    "analysis_config": "analysis_config.schema.json",
-    "producer_runtime": "producer_runtime.schema.json",
-    "equipment_operating_ranges": "equipment_operating_ranges.schema.json",
-    "quality_risk_intervals": "quality_risk_intervals.schema.json",
-    "replay_events": "replay_event_row.schema.json",
-    "analysis_summary": "analysis_summary.schema.json",
-    "bundle_manifest": "bundle_manifest.schema.json",
-}
-_ARTIFACT_SCHEMA_VERSIONS = {
-    "analysis_config": "sfep-analysis-config/v1",
-    "producer_runtime": "sfep-producer-runtime/v1",
-    "equipment_operating_ranges": "sfep-operating-ranges/v1",
-    "quality_risk_intervals": "sfep-quality-rules/v1",
-    "replay_events": "sfep-replay-events/v1",
-    "analysis_summary": "sfep-analysis-summary/v1",
-}
 _LOCK_NAME = ".sfep-equipment-quality.lock"
 _TEMP_PREFIX = ".sfep-bundle-tmp-"
 _DIRECTORY_MODE = 0o700
@@ -95,6 +82,10 @@ class NonDeterministicBundleError(RuntimeError):
 
 class PublishDurabilityError(RuntimeError):
     """The final directory is visible but parent-directory durability is unknown."""
+
+
+class SemanticPreflightError(ValueError):
+    """A test-supplied reference projection differs before publication."""
 
 
 class _BundleVerificationError(ValueError):
@@ -260,17 +251,21 @@ def _plain_json(value: object) -> object:
 
 def _canonical_mapping_bytes(
     value: Mapping[str, object],
-    schema_name: str,
+    contract: BundleContract,
+    role: str,
 ) -> bytes:
     plain = _plain_json(value)
     if not isinstance(plain, dict):
         raise TypeError("JSON artifact payload must be an object")
     payload = canonical_json_bytes(plain)
-    validate_normative_instance(schema_name, plain)
+    validate_contract_instance(contract, role, plain)
     return payload
 
 
-def _validate_exact_json_bytes(payload: bytes, schema_name: str) -> dict[str, object]:
+def _validate_exact_json_bytes(
+    payload: bytes, contract: BundleContract, role: str
+) -> dict[str, object]:
+    schema_name = contract.schema_resources[role].resource_path.rsplit("/", 1)[-1]
     try:
         decoded = payload.decode("utf-8")
         value = json.loads(decoded)
@@ -280,13 +275,14 @@ def _validate_exact_json_bytes(payload: bytes, schema_name: str) -> dict[str, ob
         raise ValueError(f"{schema_name} top level must be an object")
     if canonical_json_bytes(value) != payload:
         raise ValueError(f"{schema_name} bytes must use canonical JSON")
-    validate_normative_instance(schema_name, value)
+    validate_contract_instance(contract, role, value)
     return value
 
 
 def _validate_schema_descriptors(request: BundleWriteRequest) -> None:
-    for role, schema_name in _ARTIFACT_SCHEMA_NAMES.items():
-        expected = sha256_uri(normative_schema_bytes(schema_name))
+    contract = request.contract
+    for role in contract.schema_resources:
+        expected = sha256_uri(contract_schema_bytes(contract, role))
         if request.schema_digests.get(role) != expected:
             raise ValueError(f"schema digest for {role} does not match normative bytes")
 
@@ -294,26 +290,30 @@ def _validate_schema_descriptors(request: BundleWriteRequest) -> None:
 def _prepare_bundle(request: BundleWriteRequest) -> _PreparedBundle:
     if type(request) is not BundleWriteRequest:
         raise TypeError("request must be an exact BundleWriteRequest")
+    contract = request.contract
     _validate_schema_descriptors(request)
     _validate_exact_json_bytes(
-        request.analysis_config, _ARTIFACT_SCHEMA_NAMES["analysis_config"]
+        request.analysis_config, contract, "analysis_config"
     )
     _validate_exact_json_bytes(
-        request.producer_runtime, _ARTIFACT_SCHEMA_NAMES["producer_runtime"]
+        request.producer_runtime, contract, "producer_runtime"
     )
     ranges = _canonical_mapping_bytes(
         request.equipment_operating_ranges,
-        _ARTIFACT_SCHEMA_NAMES["equipment_operating_ranges"],
+        contract,
+        "equipment_operating_ranges",
     )
     rules = _canonical_mapping_bytes(
         request.quality_risk_intervals,
-        _ARTIFACT_SCHEMA_NAMES["quality_risk_intervals"],
+        contract,
+        "quality_risk_intervals",
     )
     # Task 7 performs the one and only full replay-row validation in this call.
     replay = serialize_replay_events(request.replay_events)
     summary = _canonical_mapping_bytes(
         request.analysis_summary,
-        _ARTIFACT_SCHEMA_NAMES["analysis_summary"],
+        contract,
+        "analysis_summary",
     )
     artifact_bytes = {
         "analysis_config": request.analysis_config,
@@ -326,7 +326,7 @@ def _prepare_bundle(request: BundleWriteRequest) -> _PreparedBundle:
     metadata = [
         {
             "role": role,
-            "schemaVersion": _ARTIFACT_SCHEMA_VERSIONS[role],
+            "schemaVersion": contract.artifact_versions[role],
             "sha256": sha256_uri(artifact_bytes[role]),
             "sizeBytes": len(artifact_bytes[role]),
         }
@@ -340,13 +340,11 @@ def _prepare_bundle(request: BundleWriteRequest) -> _PreparedBundle:
         "criteriaIdentity": dict(request.criteria_identity.fields),
         "identity": dict(request.bundle_identity.fields),
         "labelMaturityDays": request.label_maturity_days,
-        "schemaVersion": "sfep-equipment-bundle/v1",
+        "schemaVersion": contract.manifest_version,
         "timezone": request.timezone,
     }
     manifest_bytes = canonical_json_bytes(manifest)
-    validate_normative_instance(
-        _ARTIFACT_SCHEMA_NAMES["bundle_manifest"], manifest
-    )
+    validate_contract_instance(contract, "bundle_manifest", manifest)
     return _PreparedBundle(MappingProxyType(artifact_bytes), manifest_bytes)
 
 
@@ -483,7 +481,12 @@ def _verify_against_prepared(
     bundle_root: Path,
     request: BundleWriteRequest,
     prepared: _PreparedBundle,
+    *,
+    require_identity_name: bool = True,
 ) -> None:
+    contract = request.contract
+    if type(require_identity_name) is not bool:
+        raise TypeError("require_identity_name must be a built-in bool")
     if bundle_root.parent != request.output_root:
         raise _BundleVerificationError("bundle root must be a direct output-root child")
     if bundle_root.parent.resolve(strict=True) != request.output_root.resolve(strict=True):
@@ -493,7 +496,7 @@ def _verify_against_prepared(
         raise _BundleVerificationError("bundle root must be a non-symlink directory")
     if stat.S_IMODE(root_stat.st_mode) != _DIRECTORY_MODE:
         raise _BundleVerificationError("bundle root mode is invalid")
-    if bundle_root.name != request.bundle_identity.value:
+    if require_identity_name and bundle_root.name != request.bundle_identity.value:
         raise _BundleVerificationError("bundle path does not match request bundle ID")
     expected_names = {
         *FIXED_ARTIFACT_FILENAMES.values(),
@@ -515,24 +518,26 @@ def _verify_against_prepared(
         raise _BundleVerificationError("bundle manifest bytes differ")
 
     _validate_exact_json_bytes(
-        actual["analysis_config"], _ARTIFACT_SCHEMA_NAMES["analysis_config"]
+        actual["analysis_config"], contract, "analysis_config"
     )
     _validate_exact_json_bytes(
-        actual["producer_runtime"], _ARTIFACT_SCHEMA_NAMES["producer_runtime"]
+        actual["producer_runtime"], contract, "producer_runtime"
     )
     _validate_exact_json_bytes(
         actual["equipment_operating_ranges"],
-        _ARTIFACT_SCHEMA_NAMES["equipment_operating_ranges"],
+        contract,
+        "equipment_operating_ranges",
     )
     _validate_exact_json_bytes(
         actual["quality_risk_intervals"],
-        _ARTIFACT_SCHEMA_NAMES["quality_risk_intervals"],
+        contract,
+        "quality_risk_intervals",
     )
     _validate_exact_json_bytes(
-        actual["analysis_summary"], _ARTIFACT_SCHEMA_NAMES["analysis_summary"]
+        actual["analysis_summary"], contract, "analysis_summary"
     )
     manifest = _validate_exact_json_bytes(
-        manifest_bytes, _ARTIFACT_SCHEMA_NAMES["bundle_manifest"]
+        manifest_bytes, contract, "bundle_manifest"
     )
     if manifest["bundleId"] != request.bundle_identity.value:
         raise _BundleVerificationError("manifest bundle ID differs from request")
@@ -578,10 +583,37 @@ def _durability_unknown(error: OSError) -> PublishDurabilityError:
     )
 
 
-def write_bundle(request: BundleWriteRequest) -> Path:
-    """Validate, durably write, and atomically expose one immutable bundle."""
+def _publication_layout_snapshot(
+    bundle_root: Path,
+) -> tuple[tuple[int, int, int], tuple[tuple[str, int, int, int], ...]]:
+    root = bundle_root.lstat()
+    entries = tuple(
+        sorted(
+            (
+                entry.name,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+            )
+            for entry in os.scandir(bundle_root)
+            for metadata in (entry.stat(follow_symlinks=False),)
+        )
+    )
+    return (root.st_dev, root.st_ino, root.st_mode), entries
+
+
+def _write_bundle(
+    request: BundleWriteRequest,
+    *,
+    reference_projection: object | None = None,
+    project_bundle: Callable[[Path], object] | None = None,
+) -> Path:
     if type(request) is not BundleWriteRequest:
         raise TypeError("request must be an exact BundleWriteRequest")
+    if (reference_projection is None) != (project_bundle is None):
+        raise TypeError("semantic preflight requires both projection arguments")
+    if project_bundle is not None and not callable(project_bundle):
+        raise TypeError("semantic preflight projector must be callable")
     with output_lock(request.output_root):
         prepared = _prepare_bundle(request)
         final = request.output_root / request.bundle_identity.value
@@ -624,6 +656,23 @@ def write_bundle(request: BundleWriteRequest) -> Path:
             if _read_regular_file(manifest_path) != prepared.manifest_bytes:
                 raise ValueError("written artifact bytes differ for bundle_manifest")
             fsync_directory(temp)
+            if project_bundle is not None:
+                layout_before_projection = _publication_layout_snapshot(temp)
+                optimized_projection = project_bundle(temp)
+                if optimized_projection != reference_projection:
+                    raise SemanticPreflightError(
+                        "semantic preflight projection differs from reference"
+                    )
+                if _publication_layout_snapshot(temp) != layout_before_projection:
+                    raise SemanticPreflightError(
+                        "semantic preflight changed the publication layout"
+                    )
+                _verify_against_prepared(
+                    temp,
+                    request,
+                    prepared,
+                    require_identity_name=False,
+                )
             atomic_rename(temp, final)
             temp = None
         except BaseException:
@@ -641,3 +690,22 @@ def write_bundle(request: BundleWriteRequest) -> Path:
                 ) from verification_error
             raise _durability_unknown(error) from error
         return final
+
+
+def _write_bundle_with_reference_preflight(
+    request: BundleWriteRequest,
+    *,
+    reference_projection: object,
+    project_bundle: Callable[[Path], object],
+) -> Path:
+    """Internal migration-test hook for a pre-rename semantic comparison."""
+    return _write_bundle(
+        request,
+        reference_projection=reference_projection,
+        project_bundle=project_bundle,
+    )
+
+
+def write_bundle(request: BundleWriteRequest) -> Path:
+    """Validate, durably write, and atomically expose one immutable bundle."""
+    return _write_bundle(request)

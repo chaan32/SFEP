@@ -29,8 +29,8 @@ _SOURCE_DATE_EPOCH = "1735689600"
 _ZIP_EPOCH = (2025, 1, 1, 0, 0, 0)
 _SOURCE_HEADER = b"sfep-source-lines/v1\n"
 _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
-_PRODUCER_FILENAME = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
-_DIST_INFO = "sfep_equipment_quality-1.0.0.dist-info"
+_PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+_DIST_INFO = "sfep_equipment_quality-1.1.0.dist-info"
 _METADATA_PATH = f"{_DIST_INFO}/METADATA"
 _WHEEL_PATH = f"{_DIST_INFO}/WHEEL"
 _RECORD_PATH = f"{_DIST_INFO}/RECORD"
@@ -44,7 +44,7 @@ _GENERATED_MEMBERS = frozenset({
 _EXPECTED_METADATA = (
     b"Metadata-Version: 2.4\n"
     b"Name: sfep-equipment-quality\n"
-    b"Version: 1.0.0\n"
+    b"Version: 1.1.0\n"
     b"Requires-Python: ==3.12.*\n"
     b"Requires-Dist: numpy==2.2.6\n"
     b"Requires-Dist: pandas==2.3.0\n"
@@ -648,7 +648,7 @@ def _validate_pyproject(payload: bytes) -> None:
         project = value["project"]
     except (UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
         raise ProducerSealError("pyproject.toml is invalid") from error
-    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.0.0":
+    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.1.0":
         raise ProducerSealError("pyproject.toml producer name/version is invalid")
 
 
@@ -849,7 +849,7 @@ def _validate_metadata(members: dict[str, bytes]) -> None:
     _validate_email_field(
         members[_METADATA_PATH], "METADATA", "Name", "sfep-equipment-quality"
     )
-    _validate_email_field(members[_METADATA_PATH], "METADATA", "Version", "1.0.0")
+    _validate_email_field(members[_METADATA_PATH], "METADATA", "Version", "1.1.0")
     _validate_email_field(members[_WHEEL_PATH], "wheel metadata", "Wheel-Version", "1.0")
     _validate_email_field(members[_WHEEL_PATH], "wheel metadata", "Root-Is-Purelib", "true")
     _validate_email_field(members[_WHEEL_PATH], "wheel metadata", "Tag", "py3-none-any")
@@ -1249,7 +1249,7 @@ def _verify_producer_wheel(
 
 def _producer_lock_bytes(wheel: bytes) -> bytes:
     return (
-        "sfep-equipment-quality==1.0.0 "
+        "sfep-equipment-quality==1.1.0 "
         f"--hash=sha256:{hashlib.sha256(wheel).hexdigest()}\n"
     ).encode("ascii")
 
@@ -1777,7 +1777,7 @@ def _expected_provenance(snapshot: dict[str, bytes], requirements: bytes) -> byt
         "schemaVersion": "sfep-producer-provenance/v1",
         "producerName": "equipment-quality",
         "distributionName": "sfep-equipment-quality",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "sourceSha256": _source_digest(snapshot),
         "sourceDateEpoch": _SOURCE_DATE_EPOCH,
         "requirementsLockSha256": _sha256_uri(requirements),

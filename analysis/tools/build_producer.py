@@ -22,7 +22,7 @@ import tomllib
 _SOURCE_DATE_EPOCH = 1735689600
 _SOURCE_HEADER = b"sfep-source-lines/v1\n"
 _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
-_PRODUCER_FILENAME = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+_PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
 _RUNTIME_VERSIONS = {
     "attrs": "26.1.0",
     "jsonschema": "4.24.0",
@@ -698,7 +698,7 @@ def _validate_pyproject(payload: bytes) -> None:
         package_data = setuptools["package-data"]["equipment_quality"]
     except (UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
         raise ProducerBuildError("pyproject.toml does not define the producer") from error
-    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.0.0":
+    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.1.0":
         raise ProducerBuildError("pyproject.toml producer name/version is invalid")
     if "sfep_producer_provenance.json" not in package_data:
         raise ProducerBuildError("pyproject.toml does not package provenance")
@@ -723,7 +723,7 @@ def _provenance(snapshot: dict[str, bytes], requirements: bytes) -> bytes:
         "schemaVersion": "sfep-producer-provenance/v1",
         "producerName": "equipment-quality",
         "distributionName": "sfep-equipment-quality",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "sourceSha256": _source_digest(snapshot),
         "sourceDateEpoch": str(_SOURCE_DATE_EPOCH),
         "requirementsLockSha256": _sha256_uri(requirements),

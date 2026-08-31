@@ -15,7 +15,6 @@ import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
 
 import java.io.IOException;
-import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
@@ -23,13 +22,10 @@ import java.io.UncheckedIOException;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.Channels;
 import java.nio.file.Path;
-import java.security.DigestInputStream;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -91,12 +87,11 @@ public final class ReplayCsvValidator {
         ReplaySortKey previous = null;
         Set<String> eventIds = new HashSet<>();
         Map<String, String> idPreimages = new HashMap<>();
-        MessageDigest consumedDigest = sha256();
 
-        try (InputStream input = file.openInputStream("REPLAY_READ_FAILED");
-             DigestInputStream hashing = new DigestInputStream(input, consumedDigest);
-             CountingInputStream counting = new CountingInputStream(hashing);
-             Reader reader = new InputStreamReader(counting, decoder);
+        try (AuthenticatedReplaySnapshot snapshot = AuthenticatedReplaySnapshot.capture(
+                     file, expectedSize, expectedSha256);
+             InputStream input = Channels.newInputStream(snapshot.channel());
+             Reader reader = new InputStreamReader(input, decoder);
              CSVParser parser = format.parse(reader)) {
             if (!parser.getHeaderNames().equals(HEADER)) {
                 throw new BundleLoadException(
@@ -133,17 +128,6 @@ public final class ReplayCsvValidator {
                 }
                 lastEvent = event.eventId();
                 count++;
-            }
-            if (counting.count() != expectedSize) {
-                throw new BundleLoadException(
-                        "REPLAY_CONSUMED_SIZE_MISMATCH",
-                        "expected " + expectedSize + " but consumed " + counting.count());
-            }
-            String actualSha256 = "sha256:" + HexFormat.of().formatHex(consumedDigest.digest());
-            if (!actualSha256.equals(expectedSha256)) {
-                throw new BundleLoadException(
-                        "REPLAY_CONSUMED_HASH_MISMATCH",
-                        "expected " + expectedSha256 + " but consumed " + actualSha256);
             }
             file.assertUnchanged("REPLAY_FILE_CHANGED");
         } catch (BundleLoadException error) {
@@ -306,41 +290,4 @@ public final class ReplayCsvValidator {
         return false;
     }
 
-    private static MessageDigest sha256() {
-        try {
-            return MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 unavailable", impossible);
-        }
-    }
-
-    private static final class CountingInputStream extends FilterInputStream {
-        private long count;
-
-        private CountingInputStream(InputStream input) {
-            super(input);
-        }
-
-        @Override
-        public int read() throws IOException {
-            int value = super.read();
-            if (value != -1) {
-                count++;
-            }
-            return value;
-        }
-
-        @Override
-        public int read(byte[] bytes, int offset, int length) throws IOException {
-            int consumed = super.read(bytes, offset, length);
-            if (consumed > 0) {
-                count += consumed;
-            }
-            return consumed;
-        }
-
-        private long count() {
-            return count;
-        }
-    }
 }

@@ -28,10 +28,10 @@ import zipfile
 _SOURCE_HEADER = b"sfep-source-lines/v1\n"
 _SOURCE_DATE_EPOCH = "1735689600"
 _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
-_PRODUCER_FILENAME = "sfep_equipment_quality-1.0.0-py3-none-any.whl"
+_PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
 _PRODUCER_DISTRIBUTION = "sfep-equipment-quality"
-_PRODUCER_VERSION = "1.0.0"
-_PRODUCER_SHA256 = "3fc320e5c249d69723102abf2b535232befd39ee10ac80fecf2ef8ce243531a0"
+_PRODUCER_VERSION = "1.1.0"
+_PRODUCER_SHA256 = "abdfb2738c4eea6dd9e8c832951deef5faff4795ffbae39c6a9617cac293d514"
 _PIP_VERSION = "25.1.1"
 _PACKAGE_NAMES = (
     "attrs", "jsonschema", "jsonschema-specifications", "numpy", "pandas",

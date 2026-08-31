@@ -31,38 +31,62 @@ dependencies {
 }
 
 def repositoryRoot = layout.projectDirectory.dir('..')
-def contractRoot = repositoryRoot.dir('contracts/equipment-monitor/v1')
+def contractRoot = repositoryRoot.dir('contracts/equipment-monitor')
 def normativeSchemas = [
-        'analysis_config.schema.json',
-        'analysis_summary.schema.json',
-        'bundle_manifest.schema.json',
-        'equipment_operating_ranges.schema.json',
-        'producer_runtime.schema.json',
-        'quality_risk_intervals.schema.json',
-        'replay_event_row.schema.json'
+        v1: [
+                'analysis_config.schema.json',
+                'analysis_summary.schema.json',
+                'bundle_manifest.schema.json',
+                'equipment_operating_ranges.schema.json',
+                'producer_runtime.schema.json',
+                'quality_risk_intervals.schema.json',
+                'replay_event_row.schema.json'
+        ],
+        v2: [
+                'analysis_config.schema.json',
+                'analysis_summary.schema.json',
+                'bundle_manifest.schema.json'
+        ]
 ]
 
 tasks.named('processResources') {
-    from(contractRoot) {
-        include normativeSchemas
-        into 'contracts/equipment-monitor/v1'
+    normativeSchemas.each { profile, names ->
+        from(contractRoot.dir(profile)) {
+            include names
+            into "contracts/equipment-monitor/${profile}"
+        }
     }
 }
 
 tasks.register('verifyNormativeSchemas') {
     dependsOn tasks.named('processResources')
-    inputs.files(normativeSchemas.collect { contractRoot.file(it) })
-    inputs.files(normativeSchemas.collect {
-        layout.buildDirectory.file("resources/main/contracts/equipment-monitor/v1/${it}")
+    inputs.files(normativeSchemas.collectMany { profile, names ->
+        names.collect { contractRoot.dir(profile).file(it) }
+    })
+    inputs.files(normativeSchemas.collectMany { profile, names ->
+        names.collect {
+            layout.buildDirectory.file("resources/main/contracts/equipment-monitor/${profile}/${it}")
+        }
     })
     doLast {
-        normativeSchemas.each { name ->
-            byte[] source = contractRoot.file(name).asFile.bytes
-            byte[] embedded = layout.buildDirectory
-                    .file("resources/main/contracts/equipment-monitor/v1/${name}")
-                    .get().asFile.bytes
-            if (!Arrays.equals(source, embedded)) {
-                throw new GradleException("Normative schema byte drift: ${name}")
+        normativeSchemas.each { profile, names ->
+            def embeddedDirectory = layout.buildDirectory
+                    .dir("resources/main/contracts/equipment-monitor/${profile}")
+                    .get().asFile
+            def embeddedNames = embeddedDirectory.listFiles()
+                    .findAll { it.name.endsWith('.schema.json') }
+                    .collect { it.name }
+                    .sort()
+            if (embeddedNames != names.toSorted()) {
+                throw new GradleException(
+                        "Normative schema inventory drift for ${profile}: ${embeddedNames}")
+            }
+            names.each { name ->
+                byte[] source = contractRoot.dir(profile).file(name).asFile.bytes
+                byte[] embedded = new File(embeddedDirectory, name).bytes
+                if (!Arrays.equals(source, embedded)) {
+                    throw new GradleException("Normative schema byte drift: ${profile}/${name}")
+                }
             }
         }
     }
@@ -93,6 +117,96 @@ tasks.named('test') {
     dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')
     systemProperty 'sfep.repo-root', repositoryRoot.asFile.absolutePath
 }
+
+def configureCustomTestTask = { Test task ->
+    task.testClassesDirs = sourceSets.test.output.classesDirs
+    task.classpath = sourceSets.test.runtimeClasspath
+    task.dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')
+    task.systemProperty 'sfep.repo-root', repositoryRoot.asFile.absolutePath
+}
+
+def customTestTasks = []
+def configureActualBundleEnvironment = { Test task, List<String> variables ->
+    variables.each { name ->
+        task.inputs.property(
+                "sfep.environment.${name}", providers.environmentVariable(name).orElse(''))
+    }
+    // Environment validation lives in doFirst, so cached or up-to-date outcomes must be impossible.
+    task.outputs.upToDateWhen { false }
+    task.outputs.cacheIf { false }
+}
+customTestTasks << tasks.register('fastTest', Test) {
+    configureCustomTestTask(delegate)
+    useJUnitPlatform {
+        excludeTags 'actual-bundle-v1', 'actual-bundle-v2-parity'
+    }
+}
+
+customTestTasks << tasks.register('actualBundleTest', Test) {
+    configureCustomTestTask(delegate)
+    configureActualBundleEnvironment(delegate, ['SFEP_ACTUAL_BUNDLE'])
+    useJUnitPlatform { includeTags 'actual-bundle-v1' }
+    doFirst {
+        if (!System.getenv('SFEP_ACTUAL_BUNDLE')) {
+            throw new GradleException('Missing SFEP_ACTUAL_BUNDLE')
+        }
+        systemProperty 'sfep.actual-bundle', System.getenv('SFEP_ACTUAL_BUNDLE')
+    }
+}
+
+customTestTasks << tasks.register('actualBundleV2Test', Test) {
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    dependsOn verifyNormativeSchemas, verifyRuntimeShape
+    systemProperty 'sfep.repo-root', repositoryRoot.asFile.absolutePath
+    configureActualBundleEnvironment(delegate, ['SFEP_ACTUAL_BUNDLE', 'SFEP_ACTUAL_BUNDLE_V2'])
+    useJUnitPlatform { includeTags 'actual-bundle-v2-parity' }
+    doFirst {
+        ['SFEP_ACTUAL_BUNDLE', 'SFEP_ACTUAL_BUNDLE_V2'].each { name ->
+            if (!System.getenv(name)) throw new GradleException("Missing ${name}")
+        }
+        systemProperty 'sfep.actual-bundle', System.getenv('SFEP_ACTUAL_BUNDLE')
+        systemProperty 'sfep.actual-bundle-v2', System.getenv('SFEP_ACTUAL_BUNDLE_V2')
+    }
+}
+
+def customTestConfiguration = tasks.register('verifyCustomTestTaskConfiguration') {
+    doLast {
+        customTestTasks.each { provider ->
+            Test task = provider.get()
+            if (task.testClassesDirs.files != sourceSets.test.output.classesDirs.files) {
+                throw new GradleException("Custom Test task ${task.name} must use test output classes")
+            }
+            if (task.classpath.files != sourceSets.test.runtimeClasspath.files) {
+                throw new GradleException("Custom Test task ${task.name} must use the test runtime classpath")
+            }
+            def dependencyNames = task.taskDependencies.getDependencies(task)*.name
+            ['verifyNormativeSchemas', 'verifyRuntimeShape'].each { name ->
+                if (!dependencyNames.contains(name)) {
+                    throw new GradleException("Custom Test task ${task.name} must depend on ${name}")
+                }
+            }
+            if (task.systemProperties['sfep.repo-root'] != repositoryRoot.asFile.absolutePath) {
+                throw new GradleException("Custom Test task ${task.name} must set sfep.repo-root")
+            }
+            def environmentVariables = [
+                    actualBundleTest: ['SFEP_ACTUAL_BUNDLE'],
+                    actualBundleV2Test: ['SFEP_ACTUAL_BUNDLE', 'SFEP_ACTUAL_BUNDLE_V2']
+            ][task.name]
+            if (environmentVariables != null) {
+                environmentVariables.each { name ->
+                    if (task.inputs.properties.keySet().find {
+                        it.toString() == "sfep.environment.${name}"
+                    } == null) {
+                        throw new GradleException(
+                                "Actual Bundle task ${task.name} must track ${name} as an input")
+                    }
+                }
+            }
+        }
+    }
+}
+customTestTasks.each { provider -> provider.configure { dependsOn customTestConfiguration } }
 
 tasks.named('check') {
     dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')

@@ -3,10 +3,12 @@ package com.sfep.equipmentmonitor.replay;
 import com.sfep.equipmentmonitor.bundle.BundleLoadException;
 import com.sfep.equipmentmonitor.bundle.EmbeddedSchemas;
 import com.sfep.equipmentmonitor.bundle.Digests;
+import com.sfep.equipmentmonitor.bundle.SafeFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -115,6 +117,49 @@ class ReplayCsvValidatorTest {
                         CRITERIA_ID,
                         size,
                         "sha256:" + "0".repeat(64)));
+    }
+
+    @Test
+    void authenticatesCapturedReplayBytesBeforeParsingMalformedSameSizeMutation() throws Exception {
+        Path replay = temporary.toRealPath().resolve("captured-replay.csv");
+        Files.copy(goldenReplay(), replay);
+        long expectedSize = Files.size(replay);
+        String expectedSha256 = Digests.sha256Uri(replay);
+        SafeFile captured = SafeFile.captureStandalone(replay);
+
+        byte[] malformedSameSize = Files.readAllBytes(replay);
+        malformedSameSize[0] = (byte) 'x';
+        Files.write(replay, malformedSameSize);
+        Files.setLastModifiedTime(replay, captured.modifiedTime());
+
+        ReplayCsvValidator validator = new ReplayCsvValidator(EmbeddedSchemas.load());
+        assertCode("REPLAY_CONSUMED_HASH_MISMATCH", () ->
+                validator.validate(
+                        captured,
+                        BUNDLE_ID,
+                        CRITERIA_ID,
+                        expectedSize,
+                        expectedSha256));
+    }
+
+    @Test
+    void authenticatedReplaySnapshotIsDiskBackedAndDeletedWhenClosed() throws Exception {
+        Path replay = temporary.toRealPath().resolve("disk-backed-replay.csv");
+        Files.copy(goldenReplay(), replay);
+        SafeFile captured = SafeFile.captureStandalone(replay);
+        Path backingPath;
+
+        try (AuthenticatedReplaySnapshot snapshot = AuthenticatedReplaySnapshot.capture(
+                captured, Files.size(replay), Digests.sha256Uri(replay))) {
+            backingPath = snapshot.backingPath();
+            assertThat(snapshot.channel().size()).isEqualTo(Files.size(replay));
+            snapshot.rewind();
+            ByteBuffer firstByte = ByteBuffer.allocate(1);
+            assertThat(snapshot.channel().read(firstByte)).isEqualTo(1);
+            assertThat(firstByte.array()[0]).isEqualTo((byte) 's');
+        }
+
+        assertThat(backingPath).doesNotExist();
     }
 
     private static ReplayEvent furnaceEvent(String equipmentId) {

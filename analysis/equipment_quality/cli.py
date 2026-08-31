@@ -14,33 +14,30 @@ from equipment_quality.artifacts import (
     compute_criteria_identity,
     write_bundle,
 )
+from equipment_quality.bundle_contract import SCHEMA_ROLES
 from equipment_quality.criteria_projection import build_criteria_projection
 from equipment_quality.deterministic import sha256_uri
 from equipment_quality.event_builder import build_replay_events
 from equipment_quality.feature_roles import definitions
 from equipment_quality.genealogy import build_genealogy
-from equipment_quality.models import BundleWriteRequest, SummaryBuildRequest
+from equipment_quality.models import (
+    BundleWriteRequest,
+    SummaryBuildRequest,
+    resolve_bootstrap_seed,
+)
 from equipment_quality.operating_ranges import build_operating_ranges_result
-from equipment_quality.quality_intervals import build_quality_rules_result
+from equipment_quality.quality_intervals import build_quality_rules_result_with_seed
 from equipment_quality.runtime_verify import verify_runtime
 from equipment_quality.schema import (
-    load_analysis_config,
-    normative_schema_bytes,
+    contract_schema_bytes,
+    load_analysis_config_contract,
     read_inputs,
 )
 from equipment_quality.summary import build_summary
 from equipment_quality.time_split import build_time_split
 
 
-_SCHEMA_ROLE_NAMES = (
-    ("bundle_manifest", "bundle_manifest.schema.json"),
-    ("analysis_config", "analysis_config.schema.json"),
-    ("producer_runtime", "producer_runtime.schema.json"),
-    ("equipment_operating_ranges", "equipment_operating_ranges.schema.json"),
-    ("quality_risk_intervals", "quality_risk_intervals.schema.json"),
-    ("analysis_summary", "analysis_summary.schema.json"),
-    ("replay_events", "replay_event_row.schema.json"),
-)
+_SCHEMA_ROLES = tuple(sorted(SCHEMA_ROLES, key=str.encode))
 _CRITERIA_SCHEMA_ROLES = (
     "analysis_config",
     "equipment_operating_ranges",
@@ -177,15 +174,15 @@ def run_analysis(
     runtime_identity = verify_runtime(runtime)
     producer_runtime_bytes = runtime_identity.manifest_bytes
     analysis_config_bytes = _read_config_bytes(config)
-    analysis_config = load_analysis_config(config)
+    contract, analysis_config = load_analysis_config_contract(analysis_config_bytes)
     inputs = read_inputs(data)
     genealogy = build_genealogy(inputs)
     split = build_time_split(genealogy, analysis_config)
     configured_definitions = definitions(analysis_config)
 
     schema_digests = {
-        role: sha256_uri(normative_schema_bytes(schema_name))
-        for role, schema_name in _SCHEMA_ROLE_NAMES
+        role: sha256_uri(contract_schema_bytes(contract, role))
+        for role in _SCHEMA_ROLES
     }
     projection = build_criteria_projection(split, configured_definitions)
     criteria_identity = compute_criteria_identity(
@@ -197,6 +194,10 @@ def run_analysis(
             role: schema_digests[role] for role in _CRITERIA_SCHEMA_ROLES
         },
     )
+    bootstrap_seed = resolve_bootstrap_seed(
+        analysis_config,
+        criteria_identity.value,
+    )
 
     material_catalog = tuple(
         genealogy.lineage_rows["material_lineage"].tolist()
@@ -207,11 +208,11 @@ def run_analysis(
         analysis_config,
         material_catalog=material_catalog,
     )
-    quality_rules = build_quality_rules_result(
+    quality_rules = build_quality_rules_result_with_seed(
         split,
         configured_definitions,
         analysis_config,
-        criteria_identity.value,
+        bootstrap_seed,
         material_catalog=material_catalog,
     )
     bundle_identity = compute_bundle_identity(
@@ -230,7 +231,9 @@ def run_analysis(
         )
     )
     summary_request = SummaryBuildRequest(
+        contract=contract,
         analysis_config=analysis_config,
+        bootstrap_seed=bootstrap_seed,
         analysis_config_bytes=analysis_config_bytes,
         producer_runtime_bytes=producer_runtime_bytes,
         schema_digests=schema_digests,
@@ -247,18 +250,19 @@ def run_analysis(
     )
     analysis_summary = build_summary(summary_request)
     range_envelope = {
-        "schemaVersion": "sfep-operating-ranges/v1",
+        "schemaVersion": contract.artifact_versions["equipment_operating_ranges"],
         "asOf": split.as_of.isoformat(),
         "criteriaId": criteria_identity.value,
         "ranges": operating_ranges.to_wire(),
     }
     rule_envelope = {
-        "schemaVersion": "sfep-quality-rules/v1",
+        "schemaVersion": contract.artifact_versions["quality_risk_intervals"],
         "asOf": split.as_of.isoformat(),
         "criteriaId": criteria_identity.value,
         "rules": quality_rules.to_wire(),
     }
     bundle_request = BundleWriteRequest(
+        contract=contract,
         output_root=output,
         analysis_config=analysis_config_bytes,
         producer_runtime=producer_runtime_bytes,
@@ -273,6 +277,7 @@ def run_analysis(
         as_of=split.as_of,
         timezone=analysis_config.timezone,
         label_maturity_days=analysis_config.label_maturity_days,
+        manifest_version=contract.manifest_version,
     )
     return write_bundle(bundle_request)
 

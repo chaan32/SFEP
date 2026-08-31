@@ -10,6 +10,8 @@ from pathlib import Path, PurePath
 from types import MappingProxyType
 import pandas as pd
 
+from equipment_quality.bundle_contract import BundleContract, V1_CONTRACT
+
 
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
@@ -674,6 +676,58 @@ class AnalysisConfig:
 
 
 @dataclass(frozen=True)
+class BootstrapSeed:
+    protocol: str
+    material: str
+    lineage_dependencies: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.protocol != "LEGACY_CRITERIA_ID_UTF8_V1":
+            raise ValueError("bootstrap seed protocol is not supported")
+        _validate_sha256_uri(self.material, "bootstrap seed material")
+        dependencies = tuple(self.lineage_dependencies)
+        if dependencies not in {
+            ("identity.criteria_id",),
+            (
+                "config.bootstrap.seedMaterial",
+                "config.bootstrap.seedProtocol",
+            ),
+        }:
+            raise ValueError("bootstrap seed lineage dependencies are invalid")
+        object.__setattr__(self, "lineage_dependencies", dependencies)
+
+
+def resolve_bootstrap_seed(
+    config: AnalysisConfig,
+    criteria_id: str,
+) -> BootstrapSeed:
+    """Resolve one authenticated bootstrap seed at the analysis boundary."""
+    if type(config) is not AnalysisConfig:
+        raise TypeError("config must be an exact AnalysisConfig")
+    version_pair = (config.schema_version, config.analysis_config_version)
+    if version_pair == ("sfep-analysis-config/v1", "quality-analysis-v1"):
+        return BootstrapSeed(
+            "LEGACY_CRITERIA_ID_UTF8_V1",
+            _validate_sha256_uri(criteria_id, "criteria_id"),
+            ("identity.criteria_id",),
+        )
+    if version_pair == ("sfep-analysis-config/v2", "quality-analysis-v2"):
+        protocol = config.bootstrap.get("seedProtocol")
+        material = config.bootstrap.get("seedMaterial")
+        if protocol != "LEGACY_CRITERIA_ID_UTF8_V1":
+            raise ValueError("v2 bootstrap seed protocol is not supported")
+        return BootstrapSeed(
+            protocol,
+            _validate_sha256_uri(material, "config.bootstrap.seedMaterial"),
+            (
+                "config.bootstrap.seedMaterial",
+                "config.bootstrap.seedProtocol",
+            ),
+        )
+    raise ValueError("analysis config version pair does not support bootstrap seeding")
+
+
+@dataclass(frozen=True)
 class InputTables:
     sm_cc: pd.DataFrame
     fur_hr: pd.DataFrame
@@ -746,6 +800,7 @@ def _analysis_config_payload(config: AnalysisConfig) -> dict[str, object]:
 @dataclass(frozen=True)
 class SummaryBuildRequest:
     analysis_config: AnalysisConfig
+    bootstrap_seed: BootstrapSeed
     analysis_config_bytes: bytes
     producer_runtime_bytes: bytes
     schema_digests: Mapping[str, str]
@@ -759,6 +814,7 @@ class SummaryBuildRequest:
     operating_ranges: OperatingRangesResult
     quality_rules: QualityRulesResult
     events: tuple[object, ...]
+    contract: BundleContract = V1_CONTRACT
 
     def __post_init__(self) -> None:
         from equipment_quality.deterministic import canonical_json_bytes, sha256_uri
@@ -767,6 +823,12 @@ class SummaryBuildRequest:
 
         if type(self.analysis_config) is not AnalysisConfig:
             raise TypeError("analysis_config must be an exact AnalysisConfig")
+        if type(self.contract) is not BundleContract:
+            raise TypeError("contract must be an exact BundleContract")
+        if self.analysis_config.schema_version != self.contract.config_version:
+            raise ValueError("analysis config version does not match the contract")
+        if type(self.bootstrap_seed) is not BootstrapSeed:
+            raise TypeError("bootstrap_seed must be an exact BootstrapSeed")
         for label, value in (
             ("analysis_config_bytes", self.analysis_config_bytes),
             ("producer_runtime_bytes", self.producer_runtime_bytes),
@@ -935,10 +997,19 @@ class BundleWriteRequest:
     as_of: date
     timezone: str
     label_maturity_days: int
+    manifest_version: str = "sfep-equipment-bundle/v1"
+    contract: BundleContract = V1_CONTRACT
 
     def __post_init__(self) -> None:
         from equipment_quality.deterministic import id_lines, sha256_uri
         from equipment_quality.event_builder import ReplayEvent
+
+        if type(self.contract) is not BundleContract:
+            raise TypeError("contract must be an exact BundleContract")
+        if type(self.manifest_version) is not str:
+            raise TypeError("manifest version must be a built-in string")
+        if self.manifest_version != self.contract.manifest_version:
+            raise ValueError("manifest version does not match the contract")
 
         if not isinstance(self.output_root, Path):
             raise TypeError("output_root must be a pathlib Path")
