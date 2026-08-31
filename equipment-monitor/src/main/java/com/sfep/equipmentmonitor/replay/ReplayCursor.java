@@ -12,15 +12,10 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
-import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.LinkOption;
-import java.nio.file.OpenOption;
-import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -30,13 +25,11 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
-/** Streams replay rows from one verified open file descriptor with one-event lookahead. */
+/** Streams replay rows from an authenticated disk snapshot while retaining the original descriptor. */
 public final class ReplayCursor implements ReplayUnitCursor {
     private final ReplaySource source;
-    private final SafeFile snapshot;
-    private final FileChannel channel;
+    private final AuthenticatedReplaySnapshot snapshot;
     private final CSVParser parser;
     private final Iterator<CSVRecord> records;
     private final CountingInputStream consumedBytes;
@@ -45,20 +38,19 @@ public final class ReplayCursor implements ReplayUnitCursor {
     private ReplayEvent lookahead;
     private boolean eofVerified;
     private boolean closed;
+    private boolean resourcesClosed;
     private long rowCount;
     private String firstEventId;
     private String lastEventId;
 
     private ReplayCursor(
             ReplaySource source,
-            SafeFile snapshot,
-            FileChannel channel,
+            AuthenticatedReplaySnapshot snapshot,
             CSVParser parser,
             CountingInputStream consumedBytes,
             MessageDigest consumedDigest) {
         this.source = source;
         this.snapshot = snapshot;
-        this.channel = channel;
         this.parser = parser;
         this.records = parser.iterator();
         this.consumedBytes = consumedBytes;
@@ -67,18 +59,19 @@ public final class ReplayCursor implements ReplayUnitCursor {
 
     public static ReplayCursor open(ReplaySource source) {
         Objects.requireNonNull(source, "source");
-        SafeFile snapshot = SafeFile.captureStandalone(source.path());
-        FileChannel channel = null;
+        SafeFile original = SafeFile.captureStandalone(source.path());
+        AuthenticatedReplaySnapshot snapshot = null;
         CSVParser parser = null;
         try {
-            channel = FileChannel.open(
-                    snapshot.path(), Set.<OpenOption>of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
-            snapshot.assertUnchanged("REPLAY_FILE_CHANGED");
-            verifyDescriptor(channel, source);
-            channel.position(0);
+            snapshot = AuthenticatedReplaySnapshot.capture(
+                    original,
+                    source.sizeBytes(),
+                    source.sha256(),
+                    "REPLAY_DESCRIPTOR_SIZE_MISMATCH",
+                    "REPLAY_DESCRIPTOR_HASH_MISMATCH");
 
             MessageDigest consumedDigest = sha256();
-            InputStream input = Channels.newInputStream(channel);
+            InputStream input = Channels.newInputStream(snapshot.channel());
             DigestInputStream hashing = new DigestInputStream(input, consumedDigest);
             CountingInputStream counting = new CountingInputStream(hashing);
             var decoder = StandardCharsets.UTF_8.newDecoder()
@@ -95,18 +88,18 @@ public final class ReplayCursor implements ReplayUnitCursor {
                         "REPLAY_HEADER_INVALID",
                         "expected " + ReplayCsvValidator.HEADER + " but found " + parser.getHeaderNames());
             }
-            return new ReplayCursor(source, snapshot, channel, parser, counting, consumedDigest);
+            return new ReplayCursor(source, snapshot, parser, counting, consumedDigest);
         } catch (BundleLoadException error) {
-            closeQuietly(parser, channel);
+            closeQuietly(parser, snapshot, error);
             throw error;
         } catch (UncheckedIOException | IOException error) {
-            closeQuietly(parser, channel);
-            if (hasCharacterCodingCause(error)) {
-                throw new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error);
-            }
-            throw new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            BundleLoadException failure = hasCharacterCodingCause(error)
+                    ? new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error)
+                    : new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            closeQuietly(parser, snapshot, failure);
+            throw failure;
         } catch (RuntimeException error) {
-            closeQuietly(parser, channel);
+            closeQuietly(parser, snapshot, error);
             throw error;
         }
     }
@@ -171,17 +164,20 @@ public final class ReplayCursor implements ReplayUnitCursor {
             rowCount++;
             return event;
         } catch (BundleLoadException error) {
+            closeAfterFailure(error);
             throw error;
         } catch (UncheckedIOException error) {
-            if (hasCharacterCodingCause(error)) {
-                throw new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error);
-            }
-            throw new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            BundleLoadException failure = hasCharacterCodingCause(error)
+                    ? new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error)
+                    : new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            closeAfterFailure(failure);
+            throw failure;
         } catch (RuntimeException error) {
-            if (hasCharacterCodingCause(error)) {
-                throw new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error);
-            }
-            throw new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            RuntimeException failure = hasCharacterCodingCause(error)
+                    ? new BundleLoadException("REPLAY_UTF8_INVALID", source.path().toString(), error)
+                    : new BundleLoadException("REPLAY_CSV_INVALID", source.path().toString(), error);
+            closeAfterFailure(failure);
+            throw failure;
         }
     }
 
@@ -197,6 +193,7 @@ public final class ReplayCursor implements ReplayUnitCursor {
                     "REPLAY_CONSUMED_HASH_MISMATCH",
                     "expected " + source.sha256() + " but consumed " + actualSha256);
         }
+        snapshot.verifyOriginal(source.sizeBytes(), source.sha256());
         ReplayMetadata expected = source.metadata();
         if (expected == null
                 || rowCount != expected.rowCount()
@@ -206,37 +203,8 @@ public final class ReplayCursor implements ReplayUnitCursor {
                     "REPLAY_METADATA_MISMATCH",
                     "consumed rows/events differ from validated replay metadata");
         }
-        snapshot.assertUnchanged("REPLAY_FILE_CHANGED");
-    }
-
-    private static void verifyDescriptor(FileChannel channel, ReplaySource source) throws IOException {
-        MessageDigest digest = sha256();
-        long count = 0;
-        ByteBuffer buffer = ByteBuffer.allocate(64 * 1024);
-        while (true) {
-            int read = channel.read(buffer);
-            if (read < 0) {
-                break;
-            }
-            if (read == 0) {
-                continue;
-            }
-            count += read;
-            buffer.flip();
-            digest.update(buffer);
-            buffer.clear();
-        }
-        if (count != source.sizeBytes()) {
-            throw new BundleLoadException(
-                    "REPLAY_DESCRIPTOR_SIZE_MISMATCH",
-                    "expected " + source.sizeBytes() + " but descriptor has " + count);
-        }
-        String actual = digestUri(digest);
-        if (!actual.equals(source.sha256())) {
-            throw new BundleLoadException(
-                    "REPLAY_DESCRIPTOR_HASH_MISMATCH",
-                    "expected " + source.sha256() + " but descriptor has " + actual);
-        }
+        snapshot.assertOriginalUnchanged();
+        closeResources();
     }
 
     private void ensureOpen() {
@@ -256,28 +224,52 @@ public final class ReplayCursor implements ReplayUnitCursor {
             return;
         }
         closed = true;
+        closeResources();
+    }
+
+    private void closeResources() {
+        if (resourcesClosed) return;
+        resourcesClosed = true;
+        BundleLoadException failure = null;
         try {
             parser.close();
         } catch (IOException error) {
-            throw new BundleLoadException("REPLAY_CLOSE_FAILED", source.path().toString(), error);
-        } finally {
-            try {
-                channel.close();
-            } catch (IOException ignored) {
-                // Parser normally owns the channel; a second close is harmless.
-            }
+            failure = new BundleLoadException("REPLAY_CLOSE_FAILED", source.path().toString(), error);
+        }
+        try {
+            snapshot.close();
+        } catch (RuntimeException error) {
+            if (failure == null) throw error;
+            failure.addSuppressed(error);
+        }
+        if (failure != null) throw failure;
+    }
+
+    private void closeAfterFailure(Throwable failure) {
+        try {
+            closeResources();
+        } catch (RuntimeException cleanupError) {
+            failure.addSuppressed(cleanupError);
         }
     }
 
-    private static void closeQuietly(CSVParser parser, FileChannel channel) {
+    private static void closeQuietly(
+            CSVParser parser,
+            AuthenticatedReplaySnapshot snapshot,
+            Throwable failure) {
         try {
             if (parser != null) {
                 parser.close();
-            } else if (channel != null) {
-                channel.close();
             }
-        } catch (IOException ignored) {
-            // Preserve the construction failure.
+        } catch (IOException cleanupError) {
+            failure.addSuppressed(cleanupError);
+        }
+        if (snapshot != null) {
+            try {
+                snapshot.close();
+            } catch (RuntimeException cleanupError) {
+                failure.addSuppressed(cleanupError);
+            }
         }
     }
 

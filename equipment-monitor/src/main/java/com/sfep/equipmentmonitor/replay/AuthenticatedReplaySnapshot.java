@@ -4,7 +4,6 @@ import com.sfep.equipmentmonitor.bundle.BundleLoadException;
 import com.sfep.equipmentmonitor.bundle.SafeFile;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
@@ -41,41 +40,69 @@ final class AuthenticatedReplaySnapshot implements AutoCloseable {
 
     private final Path backingPath;
     private final FileChannel channel;
+    private final SafeFile original;
+    private final FileChannel originalChannel;
 
-    private AuthenticatedReplaySnapshot(Path backingPath, FileChannel channel) {
+    private AuthenticatedReplaySnapshot(
+            Path backingPath,
+            FileChannel channel,
+            SafeFile original,
+            FileChannel originalChannel) {
         this.backingPath = backingPath;
         this.channel = channel;
+        this.original = original;
+        this.originalChannel = originalChannel;
     }
 
     static AuthenticatedReplaySnapshot capture(
             SafeFile original,
             long expectedSize,
             String expectedSha256) {
+        return capture(
+                original,
+                expectedSize,
+                expectedSha256,
+                "REPLAY_CONSUMED_SIZE_MISMATCH",
+                "REPLAY_CONSUMED_HASH_MISMATCH");
+    }
+
+    static AuthenticatedReplaySnapshot capture(
+            SafeFile original,
+            long expectedSize,
+            String expectedSha256,
+            String sizeMismatchCode,
+            String hashMismatchCode) {
         OpenSnapshot opened = openSnapshot();
+        FileChannel originalChannel = null;
         try {
+            original.assertUnchanged("REPLAY_FILE_CHANGED");
+            originalChannel = openOriginal(original);
+            original.assertUnchanged("REPLAY_FILE_CHANGED");
             MessageDigest digest = sha256();
-            long consumed = copy(original, opened.channel(), digest);
+            long consumed = copy(original, originalChannel, opened.channel(), digest, sizeMismatchCode);
             original.assertUnchanged("REPLAY_FILE_CHANGED");
             if (consumed != expectedSize) {
                 throw new BundleLoadException(
-                        "REPLAY_CONSUMED_SIZE_MISMATCH",
+                        sizeMismatchCode,
                         "expected " + expectedSize + " but consumed " + consumed);
             }
             String actualSha256 = digestUri(digest);
             if (!actualSha256.equals(expectedSha256)) {
                 throw new BundleLoadException(
-                        "REPLAY_CONSUMED_HASH_MISMATCH",
+                        hashMismatchCode,
                         "expected " + expectedSha256 + " but consumed " + actualSha256);
             }
             opened.channel().position(0);
-            return new AuthenticatedReplaySnapshot(opened.path(), opened.channel());
+            originalChannel.position(0);
+            return new AuthenticatedReplaySnapshot(
+                    opened.path(), opened.channel(), original, originalChannel);
         } catch (IOException error) {
             BundleLoadException failure = new BundleLoadException(
                     "REPLAY_SNAPSHOT_FAILED", original.path().toString(), error);
-            closeAfterFailure(opened.channel(), failure);
+            closeAfterFailure(opened.channel(), originalChannel, failure);
             throw failure;
         } catch (RuntimeException | Error error) {
-            closeAfterFailure(opened.channel(), error);
+            closeAfterFailure(opened.channel(), originalChannel, error);
             throw error;
         }
     }
@@ -96,47 +123,114 @@ final class AuthenticatedReplaySnapshot implements AutoCloseable {
         }
     }
 
+    void verifyOriginal(long expectedSize, String expectedSha256) {
+        try {
+            originalChannel.position(0);
+            MessageDigest digest = sha256();
+            long consumed = digest(originalChannel, digest, "REPLAY_CONSUMED_SIZE_MISMATCH");
+            if (consumed != expectedSize) {
+                throw new BundleLoadException(
+                        "REPLAY_CONSUMED_SIZE_MISMATCH",
+                        "expected " + expectedSize + " but consumed " + consumed);
+            }
+            String actualSha256 = digestUri(digest);
+            if (!actualSha256.equals(expectedSha256)) {
+                throw new BundleLoadException(
+                        "REPLAY_CONSUMED_HASH_MISMATCH",
+                        "expected " + expectedSha256 + " but consumed " + actualSha256);
+            }
+        } catch (BundleLoadException error) {
+            throw error;
+        } catch (IOException error) {
+            throw new BundleLoadException("REPLAY_CSV_INVALID", original.path().toString(), error);
+        }
+    }
+
+    void assertOriginalUnchanged() {
+        original.assertUnchanged("REPLAY_FILE_CHANGED");
+    }
+
     @Override
     public void close() {
+        IOException failure = null;
         try {
             channel.close();
         } catch (IOException error) {
+            failure = error;
+        }
+        try {
+            originalChannel.close();
+        } catch (IOException error) {
+            if (failure == null) {
+                failure = error;
+            } else {
+                failure.addSuppressed(error);
+            }
+        }
+        if (failure != null) {
             throw new BundleLoadException(
-                    "REPLAY_SNAPSHOT_CLEANUP_FAILED", backingPath.toString(), error);
+                    "REPLAY_SNAPSHOT_CLEANUP_FAILED", backingPath.toString(), failure);
         }
     }
 
     private static long copy(
             SafeFile original,
+            FileChannel source,
             FileChannel destination,
-            MessageDigest digest) {
-        byte[] bytes = new byte[BUFFER_SIZE];
-        long consumed = 0;
-        try (InputStream input = original.openInputStream("REPLAY_READ_FAILED")) {
+            MessageDigest digest,
+            String sizeMismatchCode) {
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+            long consumed = 0;
             while (true) {
-                int count = input.read(bytes);
-                if (count < 0) {
-                    break;
-                }
-                if (count == 0) {
-                    continue;
-                }
-                try {
-                    consumed = Math.addExact(consumed, count);
-                } catch (ArithmeticException error) {
-                    throw new BundleLoadException(
-                            "REPLAY_CONSUMED_SIZE_MISMATCH", "consumed size overflow", error);
-                }
-                digest.update(bytes, 0, count);
-                ByteBuffer buffer = ByteBuffer.wrap(bytes, 0, count);
-                while (buffer.hasRemaining()) {
-                    destination.write(buffer);
-                }
+                int count = source.read(buffer);
+                if (count < 0) break;
+                if (count == 0) continue;
+                consumed = addCount(consumed, count, sizeMismatchCode);
+                buffer.flip();
+                digest.update(buffer.asReadOnlyBuffer());
+                while (buffer.hasRemaining()) destination.write(buffer);
+                buffer.clear();
             }
             destination.force(false);
             return consumed;
         } catch (BundleLoadException error) {
             throw error;
+        } catch (IOException error) {
+            throw new BundleLoadException("REPLAY_READ_FAILED", original.path().toString(), error);
+        }
+    }
+
+    private static long digest(
+            FileChannel source,
+            MessageDigest digest,
+            String sizeMismatchCode) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+        long consumed = 0;
+        while (true) {
+            int count = source.read(buffer);
+            if (count < 0) return consumed;
+            if (count == 0) continue;
+            consumed = addCount(consumed, count, sizeMismatchCode);
+            buffer.flip();
+            digest.update(buffer);
+            buffer.clear();
+        }
+    }
+
+    private static long addCount(long consumed, int count, String sizeMismatchCode) {
+        try {
+            return Math.addExact(consumed, count);
+        } catch (ArithmeticException error) {
+            throw new BundleLoadException(sizeMismatchCode, "consumed size overflow", error);
+        }
+    }
+
+    private static FileChannel openOriginal(SafeFile original) {
+        try {
+            return FileChannel.open(
+                    original.path(),
+                    Set.<OpenOption>of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
         } catch (IOException error) {
             throw new BundleLoadException("REPLAY_READ_FAILED", original.path().toString(), error);
         }
@@ -205,11 +299,21 @@ final class AuthenticatedReplaySnapshot implements AutoCloseable {
         return "sha256:" + HexFormat.of().formatHex(digest.digest());
     }
 
-    private static void closeAfterFailure(FileChannel channel, Throwable failure) {
+    private static void closeAfterFailure(
+            FileChannel channel,
+            FileChannel originalChannel,
+            Throwable failure) {
         try {
             channel.close();
         } catch (IOException cleanupError) {
             failure.addSuppressed(cleanupError);
+        }
+        if (originalChannel != null) {
+            try {
+                originalChannel.close();
+            } catch (IOException cleanupError) {
+                failure.addSuppressed(cleanupError);
+            }
         }
     }
 

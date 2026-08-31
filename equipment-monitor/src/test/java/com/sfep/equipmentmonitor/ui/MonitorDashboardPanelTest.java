@@ -18,6 +18,7 @@ import com.sfep.equipmentmonitor.risk.RangeEvaluation;
 import com.sfep.equipmentmonitor.risk.RangeSelectionReason;
 import com.sfep.equipmentmonitor.risk.RangeStatus;
 import com.sfep.equipmentmonitor.risk.ReasonCode;
+import com.sfep.equipmentmonitor.risk.QualityRuleEvaluator;
 import com.sfep.equipmentmonitor.risk.RiskGrade;
 import com.sfep.equipmentmonitor.risk.RiskScalar;
 import com.sfep.equipmentmonitor.risk.RuleEvaluation;
@@ -118,6 +119,38 @@ class MonitorDashboardPanelTest {
                 fixture.panel, "overview-selection-detail", JLabel.class).getText());
         assertThat(detail).contains(
                 "mat-normal", "판정 근거 확인 필요", "AP 후행 품질: 근거 부족");
+    }
+
+    @Test
+    void presentsMissingQualityInputAsDataMissingWithoutClaimingTheSealedDangerGrade() throws Exception {
+        Fixture fixture = panel();
+        fixture.panel.acceptUpdate(missingQualityUpdate());
+        onEdt(() -> { });
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+        JTable evidence = onEdt(() -> component(fixture.panel, "evidence-table", JTable.class));
+
+        assertOverview(
+                overview, "mat-quality-missing", "● 전형 범위", "? 데이터 누락", "? 근거 부족");
+        int evidenceRow = rowOf(evidence, "구분", "품질 위험 연결");
+        assertThat(evidence.getValueAt(evidenceRow, columnOf(evidence, "소재")))
+                .isEqualTo("mat-quality-missing");
+        assertThat(evidence.getValueAt(evidenceRow, columnOf(evidence, "판정")))
+                .isEqualTo("? 데이터 누락");
+        assertThat(tableRowText(evidence, evidenceRow))
+                .contains(
+                        "규칙 입력 누락",
+                        "조기 품질 위험 판정 보류",
+                        "입력 데이터가 없어 현재 소재의 품질 위험 연결 여부를 판정하지 않음")
+                .doesNotContain("■ 위험", "규칙 일치");
+
+        int overviewRow = rowOf(overview, "소재", "mat-quality-missing");
+        onEdt(() -> overview.setRowSelectionInterval(overviewRow, overviewRow));
+        JLabel detail = onEdt(() -> component(
+                fixture.panel, "overview-selection-detail", JLabel.class));
+        assertThat(onEdt(detail::getText)).contains(
+                "판정 근거 확인 필요", "조기 품질 위험: 데이터 누락");
+        assertThat(onEdt(() -> detail.getAccessibleContext().getAccessibleName()))
+                .contains("판정 근거 확인 필요", "조기 품질 위험: 데이터 누락");
     }
 
     @Test
@@ -285,6 +318,21 @@ class MonitorDashboardPanelTest {
                 "상대위험 계산 불가 · 사유: 표본 부족",
                 "q-value -",
                 "직접 원인으로 단정하지 않음");
+    }
+
+    @Test
+    void rendersValidConfirmationRelativeRiskWhenItsCiIsNotProducedByContract() throws Exception {
+        Fixture fixture = panel();
+        fixture.panel.acceptUpdate(validConfirmationEvidenceUpdate());
+        onEdt(() -> { });
+        JTable evidence = onEdt(() -> component(fixture.panel, "evidence-table", JTable.class));
+
+        int qualityRow = rowOf(evidence, "구분", "품질 위험 연결");
+        String confirmation = String.valueOf(evidence.getValueAt(
+                qualityRow, columnOf(evidence, "확인구간 통계")));
+        assertThat(confirmation)
+                .contains("상대위험 2.093", "95% CI는 계약상 산출하지 않음")
+                .doesNotContain("계산 불가", "계산값 없음");
     }
 
     @Test
@@ -660,6 +708,27 @@ class MonitorDashboardPanelTest {
         return evidenceUpdateWithAlerts(List.of());
     }
 
+    private static MonitorUpdate missingQualityUpdate() {
+        MetricEvidence evidence = new MetricEvidence(
+                100, 20, .20, .12, .28, .18, .08, .10,
+                2.25, 1.5, 3.1, .01, .02, ReasonCode.NONE);
+        RuleEvaluation missing = new RuleEvaluation(
+                "sha256:" + "e".repeat(64), EvidenceFamily.HEATING, RuleMatchStatus.DATA_MISSING,
+                false, RiskGrade.DANGER, false, false, evidence, evidence);
+        RiskGrade state = new QualityRuleEvaluator()
+                .summarize(List.of(missing))
+                .highestMatchedGrade();
+        ReplayEvent event = event("evt-quality-missing", "mat-quality-missing", "FURNACE_1");
+        ReplayUnit unit = new ReplayUnit(
+                "batch-1", "FURNACE_CHARGED", "2025-02-03", 14,
+                "HOUR", "HOUR", List.of(event), false);
+        MaterialSnapshot material = material(
+                "mat-quality-missing", List.of(range(RangeStatus.TYPICAL)),
+                List.of(missing), state, RiskGrade.INSUFFICIENT_EVIDENCE);
+        return new MonitorUpdate(
+                unit, 1, 1, Map.of("mat-quality-missing", material), Map.of(), List.of());
+    }
+
     private static MonitorUpdate evidenceUpdateWithAlerts(List<HistoricalAlert> alerts) {
         MetricEvidence discovery = new MetricEvidence(
                 100, 20, .20, .12, .28, .18, .08, .10,
@@ -681,6 +750,27 @@ class MonitorDashboardPanelTest {
                         "sha256:" + "r".repeat(64), 2, RangeSelectionReason.EXACT_CONTEXT, true)),
                 List.of(rule), RiskGrade.DANGER, RiskGrade.INSUFFICIENT_EVIDENCE);
         return new MonitorUpdate(unit, 1, 1, Map.of("mat-evidence", material), Map.of(), alerts);
+    }
+
+    private static MonitorUpdate validConfirmationEvidenceUpdate() {
+        MetricEvidence discovery = new MetricEvidence(
+                100, 20, .20, .12, .28, .18, .08, .10,
+                2.25, 1.5, 3.1, .01, .02, ReasonCode.NONE);
+        MetricEvidence confirmation = new MetricEvidence(
+                335, 5, .014925, .006392, .034458, .008524, .002697, .005826,
+                2.093261, null, null, null, null, ReasonCode.NONE);
+        RuleEvaluation rule = new RuleEvaluation(
+                "sha256:" + "d".repeat(64), EvidenceFamily.CHARGE, RuleMatchStatus.MATCHED,
+                true, RiskGrade.DANGER, true, false, discovery, confirmation);
+        ReplayEvent event = event("evt-valid-confirmation", "mat-valid-confirmation", "FURNACE_1");
+        ReplayUnit unit = new ReplayUnit(
+                "batch-1", "FURNACE_CHARGED", "2025-02-03", 14,
+                "HOUR", "HOUR", List.of(event), false);
+        MaterialSnapshot material = material(
+                "mat-valid-confirmation", List.of(), List.of(rule),
+                RiskGrade.DANGER, RiskGrade.INSUFFICIENT_EVIDENCE);
+        return new MonitorUpdate(
+                unit, 1, 1, Map.of("mat-valid-confirmation", material), Map.of(), List.of());
     }
 
     private static MonitorUpdate fiveMaterialEquipmentUpdate() {

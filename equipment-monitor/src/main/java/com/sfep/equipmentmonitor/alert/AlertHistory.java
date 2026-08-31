@@ -7,12 +7,19 @@ import java.io.IOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /** In-memory, insertion-ordered history with contract-key duplicate suppression. */
 public final class AlertHistory {
@@ -24,6 +31,10 @@ public final class AlertHistory {
             "discovery_rr_ci_upper", "discovery_q_value", "confirmation_support",
             "confirmation_defects"
     };
+    private static final FileAttribute<Set<PosixFilePermission>> OWNER_ONLY =
+            PosixFilePermissions.asFileAttribute(Set.of(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE));
 
     private final LinkedHashMap<AlertKey, HistoricalAlert> alerts = new LinkedHashMap<>();
 
@@ -47,10 +58,30 @@ public final class AlertHistory {
     public void exportCsv(Path destination) {
         Objects.requireNonNull(destination, "destination");
         List<HistoricalAlert> stable = snapshot();
+        Path temporary = null;
+        try {
+            Path absoluteDestination = destination.toAbsolutePath().normalize();
+            temporary = createTemporarySibling(absoluteDestination);
+            writeCsv(temporary, stable);
+            Files.move(
+                    temporary,
+                    absoluteDestination,
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+            temporary = null;
+        } catch (IOException error) {
+            deleteAfterFailure(temporary, error);
+            throw new AlertExportException("ALERT_EXPORT_FAILED: " + destination, error);
+        } catch (RuntimeException | Error error) {
+            deleteAfterFailure(temporary, error);
+            throw error;
+        }
+    }
+
+    private static void writeCsv(Path temporary, List<HistoricalAlert> stable) throws IOException {
         try (Writer writer = Files.newBufferedWriter(
-                destination,
+                temporary,
                 StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING,
                 StandardOpenOption.WRITE);
              CSVPrinter printer = CSVFormat.RFC4180.builder().setHeader(CSV_HEADER).get().print(writer)) {
@@ -74,8 +105,30 @@ public final class AlertHistory {
                 appendConfirmation(row, alert.confirmation());
                 printer.printRecord(row);
             }
-        } catch (IOException error) {
-            throw new AlertExportException("ALERT_EXPORT_FAILED: " + destination, error);
+        }
+    }
+
+    private static Path createTemporarySibling(Path destination) throws IOException {
+        Path parent = destination.getParent();
+        if (parent == null) {
+            throw new IOException("destination has no parent");
+        }
+        boolean posixPermissionsSupported = Files.getFileAttributeView(
+                parent,
+                PosixFileAttributeView.class,
+                LinkOption.NOFOLLOW_LINKS) != null;
+        if (posixPermissionsSupported) {
+            return Files.createTempFile(parent, ".sfep-alert-export-", ".tmp", OWNER_ONLY);
+        }
+        return Files.createTempFile(parent, ".sfep-alert-export-", ".tmp");
+    }
+
+    private static void deleteAfterFailure(Path temporary, Throwable failure) {
+        if (temporary == null) return;
+        try {
+            Files.deleteIfExists(temporary);
+        } catch (IOException cleanupError) {
+            failure.addSuppressed(cleanupError);
         }
     }
 

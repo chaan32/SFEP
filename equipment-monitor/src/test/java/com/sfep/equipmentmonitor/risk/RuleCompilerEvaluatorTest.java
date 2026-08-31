@@ -94,11 +94,14 @@ class RuleCompilerEvaluatorTest {
                 "[{\"field\":\"f_jangip_gubun\",\"type\":\"CATEGORY_IN\",\"lower\":null,\"lowerInclusive\":null,\"upper\":null,\"upperInclusive\":null,\"values\":[\"CCR\"]}]", "{}"))).getFirst();
 
         RuleEvaluation missing = evaluator.evaluate(event("1호기", Map.of("f_jangip_gubun", "CCR")), List.of(first)).getFirst();
+        RuleEvaluationSummary missingSummary = evaluator.summarize(List.of(missing));
         RuleEvaluationSummary twoCautions = evaluator.summarize(
                 evaluator.evaluate(event("1호기", Map.of("f_jangip_temp", 1150, "f_jangip_gubun", "CCR")), List.of(first, second)));
 
         assertThat(missing.status()).isEqualTo(RuleMatchStatus.DATA_MISSING);
         assertThat(missing.alertEligible()).isFalse();
+        assertThat(missingSummary.highestMatchedGrade()).isEqualTo(RiskGrade.INSUFFICIENT_EVIDENCE);
+        assertThat(missingSummary.matchedCount()).isZero();
         assertThat(twoCautions.highestMatchedGrade()).isEqualTo(RiskGrade.CAUTION);
         assertThat(twoCautions.matchedCount()).isEqualTo(1);
     }
@@ -129,13 +132,18 @@ class RuleCompilerEvaluatorTest {
                 "[{\"field\":\"judge\",\"type\":\"CATEGORY_IN\",\"lower\":null,\"lowerInclusive\":null,\"upper\":null,\"upperInclusive\":null,\"values\":[\"불량\"]}]", "{}"))).getFirst();
         RiskEvent event = RiskEvent.of(ProcessStage.AP_RECORDED_WITH_RESULT, EquipmentType.AP, "AP1",
                 Map.of("judge", RiskScalar.of("불량")));
+        RiskEvent missingEvent = RiskEvent.of(
+                ProcessStage.AP_RECORDED_WITH_RESULT, EquipmentType.AP, "AP1", Map.of());
 
         RuleEvaluation evaluation = evaluator.evaluate(event, List.of(ap)).getFirst();
+        RuleEvaluation missing = evaluator.evaluate(missingEvent, List.of(ap)).getFirst();
 
         assertThat(evaluation.matched()).isTrue();
         assertThat(evaluation.grade()).isEqualTo(RiskGrade.DANGER);
         assertThat(evaluation.alertEligible()).isFalse();
         assertThat(evaluation.historicalEvidenceOnly()).isTrue();
+        assertThat(missing.status()).isEqualTo(RuleMatchStatus.DATA_MISSING);
+        assertThat(missing.historicalEvidenceOnly()).isTrue();
     }
 
     @Test

@@ -96,6 +96,36 @@ class ReplayUnitCursorTest {
     }
 
     @Test
+    void neverEmitsRowsChangedAfterAuthentication() throws Exception {
+        Path replay = copyOfGolden("changed-after-authentication.csv");
+        ReplaySource source = source(replay);
+        List<Integer> observedSpeeds = new ArrayList<>();
+
+        try (ReplayCursor cursor = ReplayCursor.open(source)) {
+            String csv = Files.readString(replay, StandardCharsets.UTF_8);
+            String original = "\"\"ap_line_speed\"\":69";
+            String altered = "\"\"ap_line_speed\"\":99";
+            assertThat(csv).containsOnlyOnce(original);
+            Files.writeString(replay, csv.replace(original, altered), StandardCharsets.UTF_8);
+            assertThat(Files.size(replay)).isEqualTo(source.sizeBytes());
+
+            assertThatThrownBy(() -> {
+                Optional<ReplayUnit> next;
+                while ((next = cursor.nextUnit()).isPresent()) {
+                    next.orElseThrow().events().stream()
+                            .filter(event -> event.eventId().equals(
+                                    "sha256:6dda359b09b54d4f101774fd9b4a62e8e2adc1fe2b9dac081bb606fbdf60aed6"))
+                            .map(event -> event.values().path("ap_line_speed").intValue())
+                            .forEach(observedSpeeds::add);
+                }
+            }).isInstanceOf(BundleLoadException.class)
+                    .hasMessageStartingWith("REPLAY_CONSUMED_HASH_MISMATCH:");
+        }
+
+        assertThat(observedSpeeds).containsExactly(69);
+    }
+
+    @Test
     void detectsWhenThePathIsReplacedAfterOpeningTheRetainedDescriptor() throws Exception {
         Path replay = copyOfGolden("replace.csv");
         ReplaySource source = source(replay);

@@ -24,6 +24,8 @@ public final class QualityRuleEvaluator {
 
     public RuleEvaluationSummary summarize(List<RuleEvaluation> evaluations) {
         List<RuleEvaluation> matched = evaluations.stream().filter(RuleEvaluation::matched).toList();
+        boolean dataMissing = evaluations.stream()
+                .anyMatch(value -> value.status() == RuleMatchStatus.DATA_MISSING);
         Map<EvidenceFamily, RiskGrade> actionableByFamily = new java.util.EnumMap<>(EvidenceFamily.class);
         matched.stream()
                 .filter(value -> value.grade() == RiskGrade.CAUTION || value.grade() == RiskGrade.DANGER)
@@ -34,7 +36,7 @@ public final class QualityRuleEvaluator {
                 .orElseGet(() -> !matched.isEmpty()
                         && matched.stream().allMatch(value -> value.grade() == RiskGrade.INSUFFICIENT_EVIDENCE)
                         ? RiskGrade.INSUFFICIENT_EVIDENCE
-                        : RiskGrade.NORMAL);
+                        : dataMissing ? RiskGrade.INSUFFICIENT_EVIDENCE : RiskGrade.NORMAL);
         return new RuleEvaluationSummary(highest, actionableByFamily.size());
     }
 
@@ -65,7 +67,7 @@ public final class QualityRuleEvaluator {
         boolean alert = matched && rule.earlyWarningEligible()
                 && (rule.grade() == RiskGrade.CAUTION || rule.grade() == RiskGrade.DANGER);
         return new RuleEvaluation(rule.ruleId(), rule.evidenceFamily(), status, matched, rule.grade(), alert,
-                matched && !rule.earlyWarningEligible(), rule.discovery(), rule.confirmation());
+                !rule.earlyWarningEligible(), rule.discovery(), rule.confirmation());
     }
 
     private static RiskGrade higher(RiskGrade left, RiskGrade right) {

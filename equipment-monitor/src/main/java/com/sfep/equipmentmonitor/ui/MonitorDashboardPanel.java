@@ -67,6 +67,8 @@ public final class MonitorDashboardPanel extends JPanel {
     private static final String ALL = "전체";
     private static final String ASSOCIATION_NOTICE =
             "과거 품질 결과와 통계적으로 연결된 위험 근거이며, 직접 원인으로 단정하지 않음";
+    private static final String MISSING_QUALITY_NOTICE =
+            "입력 데이터가 없어 현재 소재의 품질 위험 연결 여부를 판정하지 않음";
 
     private final ReplayControl replayControl;
     private final UpdateScheduler updateScheduler;
@@ -615,8 +617,8 @@ public final class MonitorDashboardPanel extends JPanel {
         for (MaterialSnapshot material : materials) {
             Object[] row = {
                     operatingRangeSymbol(material.rangeEvaluations()),
-                    symbol(material.qualityRisk()),
-                    symbol(material.historicalEvidenceRisk()),
+                    qualityStatus(material, false),
+                    qualityStatus(material, true),
                     material.materialKey(),
                     stageLabel(material.eventStage()),
                     equipmentLabel(material.equipmentType(), material.equipmentId()),
@@ -724,8 +726,8 @@ public final class MonitorDashboardPanel extends JPanel {
                             materialKey,
                             representativeValues(snapshot.valuesByMaterial().get(materialKey)),
                             material == null ? "? 근거 부족" : operatingRangeSymbol(material.rangeEvaluations()),
-                            material == null ? "? 근거 부족" : symbol(material.qualityRisk()),
-                            material == null ? "? 근거 부족" : symbol(material.historicalEvidenceRisk()),
+                            material == null ? "? 근거 부족" : qualityStatus(material, false),
+                            material == null ? "? 근거 부족" : qualityStatus(material, true),
                             snapshot.orderedWithinUnit() ? "입력 순서 제공" : "정확한 순서 없음"
                     });
                 }));
@@ -937,7 +939,9 @@ public final class MonitorDashboardPanel extends JPanel {
                 || material.qualityRisk() == RiskGrade.UNCONFIRMED
                 || material.qualityRisk() == RiskGrade.INSUFFICIENT_EVIDENCE
                 || material.historicalEvidenceRisk() == RiskGrade.UNCONFIRMED
-                || material.historicalEvidenceRisk() == RiskGrade.INSUFFICIENT_EVIDENCE;
+                || material.historicalEvidenceRisk() == RiskGrade.INSUFFICIENT_EVIDENCE
+                || material.ruleEvaluations().stream()
+                        .anyMatch(value -> value.status() == RuleMatchStatus.DATA_MISSING);
         return insufficient ? 2 : 3;
     }
 
@@ -965,7 +969,11 @@ public final class MonitorDashboardPanel extends JPanel {
 
     private static String ruleCriteria(RuleEvaluation rule) {
         String applicability;
-        if (rule.historicalEvidenceOnly()) {
+        if (rule.status() == RuleMatchStatus.DATA_MISSING) {
+            applicability = rule.historicalEvidenceOnly()
+                    ? "AP 후행 품질 확인 판정 보류"
+                    : "조기 품질 위험 판정 보류";
+        } else if (rule.historicalEvidenceOnly()) {
             applicability = "AP 후행 품질 확인 전용";
         } else if (rule.alertEligible()) {
             applicability = "조기 품질 위험 대상";
@@ -990,13 +998,17 @@ public final class MonitorDashboardPanel extends JPanel {
     }
 
     private static String relativeRisk(MetricEvidence evidence) {
-        if (evidence.relativeRisk() == null
-                || evidence.relativeRiskCiLower() == null
-                || evidence.relativeRiskCiUpper() == null) {
+        if (evidence.reasonCode() != ReasonCode.NONE) {
             return "상대위험 계산 불가 · 사유: " + reasonLabel(evidence.reasonCode());
         }
-        return "상대위험 " + decimal(evidence.relativeRisk(), 3)
-                + " · 95% CI " + decimal(evidence.relativeRiskCiLower(), 3)
+        String relativeRisk = "상대위험 " + decimal(evidence.relativeRisk(), 3);
+        if (evidence.relativeRiskCiLower() == null && evidence.relativeRiskCiUpper() == null) {
+            return relativeRisk + " · 95% CI는 계약상 산출하지 않음";
+        }
+        if (evidence.relativeRiskCiLower() == null || evidence.relativeRiskCiUpper() == null) {
+            return relativeRisk + " · 95% CI 일부 미제공";
+        }
+        return relativeRisk + " · 95% CI " + decimal(evidence.relativeRiskCiLower(), 3)
                 + "~" + decimal(evidence.relativeRiskCiUpper(), 3);
     }
 
@@ -1063,7 +1075,7 @@ public final class MonitorDashboardPanel extends JPanel {
     private static String reasonLabel(ReasonCode reason) {
         if (reason == null) return "사유 미제공";
         return switch (reason) {
-            case NONE -> "계산값 없음";
+            case NONE -> "계산 실패 사유 없음";
             case LOW_SUPPORT -> "표본 부족";
             case LOW_DEFECT_COUNT -> "불량 건수 부족";
             case ZERO_COMPARATOR_RISK -> "비교군 위험률 0";
@@ -1173,10 +1185,11 @@ public final class MonitorDashboardPanel extends JPanel {
             rows.add(new EvidenceRow(key, List.of(
                     material.materialKey(), stageLabel(material.eventStage()),
                     "품질 위험 연결", shortId(rule.ruleId()),
-                    symbol(rule.grade()), "-", ruleCriteria(rule),
+                    ruleEvaluationStatus(rule), "-", ruleCriteria(rule),
                     metricText("발견구간", rule.discovery()),
                     metricText("확인구간 결과", rule.confirmation()),
-                    ASSOCIATION_NOTICE)));
+                    rule.status() == RuleMatchStatus.DATA_MISSING
+                            ? MISSING_QUALITY_NOTICE : ASSOCIATION_NOTICE)));
         }
         return rows;
     }
@@ -1221,6 +1234,25 @@ public final class MonitorDashboardPanel extends JPanel {
             case DANGER -> "■ 위험";
             case UNCONFIRMED, INSUFFICIENT_EVIDENCE -> "? 근거 부족";
         };
+    }
+
+    private static String qualityStatus(MaterialSnapshot material, boolean historicalEvidenceOnly) {
+        RiskGrade grade = historicalEvidenceOnly
+                ? material.historicalEvidenceRisk()
+                : material.qualityRisk();
+        if (grade == RiskGrade.CAUTION || grade == RiskGrade.DANGER) {
+            return symbol(grade);
+        }
+        boolean dataMissing = material.ruleEvaluations().stream()
+                .filter(value -> value.historicalEvidenceOnly() == historicalEvidenceOnly)
+                .anyMatch(value -> value.status() == RuleMatchStatus.DATA_MISSING);
+        return dataMissing ? "? 데이터 누락" : symbol(grade);
+    }
+
+    private static String ruleEvaluationStatus(RuleEvaluation evaluation) {
+        return evaluation.status() == RuleMatchStatus.DATA_MISSING
+                ? "? 데이터 누락"
+                : symbol(evaluation.grade());
     }
 
     private static String riskExplanation(RiskGrade grade) {
