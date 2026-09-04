@@ -35,6 +35,7 @@ import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JProgressBar;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.SwingUtilities;
@@ -224,6 +225,69 @@ class MonitorDashboardPanelTest {
     }
 
     @Test
+    void showsReplayEventCountPercentageAndPoscoProgressBar() throws Exception {
+        Fixture fixture = panel(20_137);
+        MonitorUpdate source = update(false, List.of());
+        fixture.panel.acceptUpdate(new MonitorUpdate(
+                source.unit(), 8, 12_480,
+                source.changedMaterials(), source.changedEquipment(), source.newAlerts()));
+        onEdt(() -> { });
+
+        JLabel label = onEdt(() -> component(
+                fixture.panel, "replay-progress-label", JLabel.class));
+        JProgressBar bar = onEdt(() -> component(
+                fixture.panel, "replay-progress", JProgressBar.class));
+
+        assertThat(onEdt(label::getText))
+                .isEqualTo("재생 진행 · 12,480 / 20,137 이벤트 · 62%");
+        assertThat(onEdt(bar::getValue)).isEqualTo(62);
+        assertThat(onEdt(bar::getMaximum)).isEqualTo(100);
+        assertThat(onEdt(bar::getForeground)).isEqualTo(Color.decode("#05507D"));
+        assertThat(onEdt(() -> bar.getPreferredSize().height)).isEqualTo(8);
+        assertThat(onEdt(() -> bar.getAccessibleContext().getAccessibleDescription()))
+                .isEqualTo("재생 진행 · 12,480 / 20,137 이벤트 · 62%");
+        assertThat(onEdt(() -> visibleText(fixture.panel))).contains("처리 · 8 시간대");
+    }
+
+    @Test
+    void marksReplayCompleteOnlyAfterTheFinalEventAndHandlesAnEmptyReplay() throws Exception {
+        Fixture fixture = panel(200);
+        MonitorUpdate source = update(false, List.of());
+        fixture.panel.acceptUpdate(new MonitorUpdate(
+                source.unit(), 9, 199,
+                source.changedMaterials(), source.changedEquipment(), source.newAlerts()));
+        onEdt(() -> { });
+
+        JLabel label = onEdt(() -> component(
+                fixture.panel, "replay-progress-label", JLabel.class));
+        JProgressBar bar = onEdt(() -> component(
+                fixture.panel, "replay-progress", JProgressBar.class));
+        assertThat(onEdt(label::getText)).endsWith("199 / 200 이벤트 · 99%");
+        assertThat(onEdt(bar::getValue)).isEqualTo(99);
+
+        fixture.panel.acceptUpdate(new MonitorUpdate(
+                source.unit(), 10, 200,
+                source.changedMaterials(), source.changedEquipment(), source.newAlerts()));
+        onEdt(() -> { });
+        assertThat(onEdt(label::getText)).endsWith("200 / 200 이벤트 · 100%");
+        assertThat(onEdt(bar::getValue)).isEqualTo(100);
+
+        fixture.panel.acceptUpdate(new MonitorUpdate(
+                source.unit(), 11, 201,
+                source.changedMaterials(), source.changedEquipment(), source.newAlerts()));
+        onEdt(() -> { });
+        assertThat(onEdt(label::getText)).endsWith("200 / 200 이벤트 · 100%");
+        assertThat(onEdt(bar::getValue)).isEqualTo(100);
+
+        Fixture empty = panel(0);
+        assertThat(onEdt(() -> component(
+                empty.panel, "replay-progress-label", JLabel.class).getText()))
+                .isEqualTo("재생 진행 · 0 / 0 이벤트 · 0%");
+        assertThat(onEdt(() -> component(
+                empty.panel, "replay-progress", JProgressBar.class).getValue())).isZero();
+    }
+
+    @Test
     void explainsQualityAlertsAsHistoricalAssociationsWithoutClaimingDirectCausation() throws Exception {
         Fixture fixture = panel();
         fixture.panel.acceptUpdate(update(false, List.of(alert())));
@@ -395,7 +459,9 @@ class MonitorDashboardPanelTest {
         assertThat(onEdt(history::getRowCount)).isEqualTo(100);
         assertThat(history.getValueAt(0, columnOf(history, "소재"))).isEqualTo("mat-00001");
         assertThat(history.getValueAt(99, columnOf(history, "소재"))).isEqualTo("mat-00100");
-        assertThat(visible).contains("처리 · 100 시간대 / 100 이벤트");
+        assertThat(visible).contains(
+                "처리 · 100 시간대",
+                "재생 진행 · 100 / 189,043 이벤트 · 0%");
         assertThat(scheduler.pendingCount()).isZero();
     }
 
@@ -606,7 +672,17 @@ class MonitorDashboardPanelTest {
         return panel(SwingUtilities::invokeLater);
     }
 
+    private static Fixture panel(long replayRows) throws Exception {
+        return panel(SwingUtilities::invokeLater, replayRows);
+    }
+
     private static Fixture panel(MonitorDashboardPanel.UpdateScheduler scheduler) throws Exception {
+        return panel(scheduler, 189_043);
+    }
+
+    private static Fixture panel(
+            MonitorDashboardPanel.UpdateScheduler scheduler,
+            long replayRows) throws Exception {
         MonitorDashboardMetadata metadata = new MonitorDashboardMetadata(
                 BUNDLE,
                 CRITERIA,
@@ -615,7 +691,7 @@ class MonitorDashboardPanelTest {
                 "2025-01-01",
                 "2025-03-31",
                 23_631,
-                189_043,
+                replayRows,
                 424,
                 313,
                 List.of(

@@ -7,6 +7,7 @@ import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
@@ -14,6 +15,7 @@ import javax.swing.SwingConstants;
 import javax.swing.border.Border;
 import javax.swing.plaf.basic.BasicTabbedPaneUI;
 import javax.swing.plaf.basic.BasicButtonUI;
+import javax.swing.plaf.basic.BasicProgressBarUI;
 import javax.swing.table.DefaultTableCellRenderer;
 import java.awt.BasicStroke;
 import java.awt.Color;
@@ -22,6 +24,7 @@ import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.Insets;
 import java.awt.LayoutManager;
 import java.awt.RenderingHints;
 
@@ -119,6 +122,18 @@ final class MonitorUiTheme {
                 BorderFactory.createLineBorder(LINE, 1, true),
                 BorderFactory.createEmptyBorder(4, 8, 4, 8)));
         combo.setPreferredSize(new Dimension(Math.max(100, combo.getPreferredSize().width), 40));
+    }
+
+    static void progressBar(JProgressBar progress) {
+        progress.setUI(new SlimProgressBarUi());
+        progress.setForeground(POSCO_BLUE);
+        progress.setBackground(LINE);
+        progress.setBorderPainted(false);
+        progress.setStringPainted(false);
+        progress.setOpaque(false);
+        progress.setPreferredSize(new Dimension(0, 8));
+        progress.setMinimumSize(new Dimension(0, 8));
+        progress.setMaximumSize(new Dimension(Integer.MAX_VALUE, 8));
     }
 
     static void tabs(JTabbedPane tabs) {
@@ -296,6 +311,32 @@ final class MonitorUiTheme {
 
         private static boolean isNormal(String value) {
             return value.startsWith("● ");
+        }
+    }
+
+    private static final class SlimProgressBarUi extends BasicProgressBarUI {
+        @Override
+        protected void paintDeterminate(Graphics graphics, JComponent component) {
+            Insets insets = progressBar.getInsets();
+            int x = insets.left;
+            int y = insets.top;
+            int width = progressBar.getWidth() - insets.left - insets.right;
+            int height = progressBar.getHeight() - insets.top - insets.bottom;
+            if (width <= 0 || height <= 0) return;
+
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            canvas.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int arc = height;
+            canvas.setColor(progressBar.getBackground());
+            canvas.fillRoundRect(x, y, width, height, arc, arc);
+
+            int filled = (int) Math.round(width * progressBar.getPercentComplete());
+            if (filled > 0) {
+                canvas.setClip(x, y, Math.min(filled, width), height);
+                canvas.setColor(progressBar.getForeground());
+                canvas.fillRoundRect(x, y, width, height, arc, arc);
+            }
+            canvas.dispose();
         }
     }
 

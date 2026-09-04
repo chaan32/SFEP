@@ -27,6 +27,7 @@ import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
@@ -76,8 +77,11 @@ public final class MonitorDashboardPanel extends JPanel {
     private final JLabel replayStatus = new JLabel();
     private final JLabel replayFailureDetails = new JLabel(" ");
     private final JLabel replayDate = new JLabel("재생 날짜 · 시작 전");
-    private final JLabel progress = new JLabel("처리 · 0 시간대 / 0 이벤트");
+    private final JLabel processedUnits = new JLabel("처리 · 0 시간대");
+    private final JLabel replayProgressLabel = new JLabel();
+    private final JProgressBar replayProgress = new JProgressBar(0, 100);
     private final JLabel unitNotice = new JLabel("시간대 데이터를 재생하면 처리 묶음이 표시됩니다.");
+    private final long totalReplayEvents;
     private final ReadOnlyTableModel overviewModel = model(
             "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
             "소재", "공정 단계", "설비", "재생 시각", "우선순위");
@@ -133,6 +137,8 @@ public final class MonitorDashboardPanel extends JPanel {
         this.replayControl = Objects.requireNonNull(replayControl, "replayControl");
         this.updateScheduler = Objects.requireNonNull(updateScheduler, "updateScheduler");
         Objects.requireNonNull(metadata, "metadata");
+        totalReplayEvents = metadata.replayRows();
+        updateReplayProgress(0, 0);
         setBorder(BorderFactory.createEmptyBorder(18, 20, 16, 20));
         setBackground(MonitorUiTheme.PAGE);
 
@@ -232,8 +238,20 @@ public final class MonitorDashboardPanel extends JPanel {
         styleTimelineLabel(replayDate);
         controls.add(replayDate);
         controls.add(Box.createHorizontalStrut(16));
-        styleTimelineLabel(progress);
-        controls.add(progress);
+        styleTimelineLabel(processedUnits);
+        controls.add(processedUnits);
+
+        JPanel progressArea = new JPanel(new BorderLayout(0, 7));
+        progressArea.setOpaque(false);
+        progressArea.setBorder(BorderFactory.createEmptyBorder(7, 8, 5, 8));
+        replayProgressLabel.setName("replay-progress-label");
+        replayProgressLabel.setForeground(MonitorUiTheme.POSCO_BLUE);
+        replayProgressLabel.setFont(MonitorUiTheme.preferredFont(Font.BOLD, 13));
+        replayProgress.setName("replay-progress");
+        replayProgress.getAccessibleContext().setAccessibleName("재생 진행률");
+        MonitorUiTheme.progressBar(replayProgress);
+        progressArea.add(replayProgressLabel, BorderLayout.NORTH);
+        progressArea.add(replayProgress, BorderLayout.CENTER);
 
         JPanel context = new JPanel(new BorderLayout(12, 0));
         context.setOpaque(false);
@@ -245,8 +263,13 @@ public final class MonitorDashboardPanel extends JPanel {
         replayFailureDetails.setFont(MonitorUiTheme.preferredFont(Font.BOLD, 13));
         context.add(unitNotice, BorderLayout.WEST);
         context.add(replayFailureDetails, BorderLayout.EAST);
+        JPanel progressAndContext = new JPanel();
+        progressAndContext.setOpaque(false);
+        progressAndContext.setLayout(new BoxLayout(progressAndContext, BoxLayout.Y_AXIS));
+        progressAndContext.add(progressArea);
+        progressAndContext.add(context);
         controlCard.add(controls, BorderLayout.CENTER);
-        controlCard.add(context, BorderLayout.SOUTH);
+        controlCard.add(progressAndContext, BorderLayout.SOUTH);
         header.add(title);
         header.add(Box.createVerticalStrut(12));
         header.add(controlCard);
@@ -596,8 +619,7 @@ public final class MonitorDashboardPanel extends JPanel {
         ReplayControllerState state = replayControl.state();
         String date = update.lastUnit.replayDate();
         replayDate.setText("재생 날짜 · " + date);
-        progress.setText("처리 · " + number(update.unitsProcessed)
-                + " 시간대 / " + number(update.eventsProcessed) + " 이벤트");
+        updateReplayProgress(update.unitsProcessed, update.eventsProcessed);
         unitNotice.setText(unitNotice(update.lastUnit));
 
         upsertMaterials(update.changedMaterials.values());
@@ -608,6 +630,25 @@ public final class MonitorDashboardPanel extends JPanel {
         renderRetainedEvidence();
         appendAlerts(update.alerts);
         renderReplayState(state);
+    }
+
+    private void updateReplayProgress(long unitsProcessed, long eventsProcessed) {
+        long safeUnits = Math.max(0, unitsProcessed);
+        long safeEvents = Math.max(0, eventsProcessed);
+        long displayedEvents = Math.min(safeEvents, totalReplayEvents);
+        int percentage = replayPercentage(displayedEvents, totalReplayEvents);
+        processedUnits.setText("처리 · " + number(safeUnits) + " 시간대");
+        String text = "재생 진행 · " + number(displayedEvents)
+                + " / " + number(totalReplayEvents) + " 이벤트 · " + percentage + "%";
+        replayProgressLabel.setText(text);
+        replayProgress.setValue(percentage);
+        replayProgress.getAccessibleContext().setAccessibleDescription(text);
+    }
+
+    private static int replayPercentage(long processed, long total) {
+        if (total <= 0 || processed <= 0) return 0;
+        if (processed >= total) return 100;
+        return (int) Math.min(99, Math.round(processed * 100.0 / total));
     }
 
     private void upsertMaterials(Iterable<MaterialSnapshot> materials) {
