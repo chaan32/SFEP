@@ -1,0 +1,2293 @@
+"""Label-free quality-risk candidates and globally adjusted evidence metrics."""
+
+from __future__ import annotations
+
+import errno
+import io
+import math
+import os
+import pickle
+from pathlib import Path
+import signal
+import sys
+import tempfile
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from numbers import Integral, Real
+from types import MappingProxyType
+
+import pandas as pd
+
+from equipment_quality.deterministic import canonical_json_bytes, sha256_uri, type1_quantile
+from equipment_quality.feature_roles import STAGE_RANK, FeatureDefinition, definitions as configured_definitions
+from equipment_quality.models import (
+    AnalysisConfig,
+    BootstrapSeed,
+    MaterialLineage,
+    QualityRuleSidecar,
+    QualityRulesResult,
+    QualitySplitSidecar,
+    TimeSplitResult,
+    _MaterialCatalogIndex,
+)
+from equipment_quality.statistics import (
+    BootstrapCi,
+    Stratum,
+    benjamini_hochberg,
+    charge_bootstrap_rr_ci_with_seed,
+    cmh_p_value,
+    mantel_haenszel_rr,
+    standardized_rates,
+    wilson_interval,
+)
+
+
+_CANDIDATE_ROLES = {
+    "DIRECT_OPERATION",
+    "PRODUCT_STATE_REFERENCE",
+    "CONTEXT",
+    "EQUIPMENT_IDENTIFIER",
+}
+_EQUIPMENT_IDENTIFIER_ROLE = "EQUIPMENT_IDENTIFIER"
+_MISSING = object()
+_PARALLEL_BOOTSTRAP_MINIMUM = 16
+_MAX_BOOTSTRAP_WORKERS = 10
+_BOOTSTRAP_PROTOCOL = "sfep-bootstrap-worker/v2"
+_BOOTSTRAP_WORKER_ARGUMENT = "--bootstrap-worker"
+_MAX_BOOTSTRAP_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MAX_BOOTSTRAP_RESPONSE_BYTES = 1024 * 1024
+_BOOTSTRAP_WORKER_TIMEOUT_SECONDS = 120.0
+_BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS = 1.0
+_BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS = 1.0
+_WAITPID_RETRY_SECONDS = 0.001
+_UINT64_MAX = (1 << 64) - 1
+
+
+def _is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return False
+    missing = pd.isna(value)
+    return bool(missing) if isinstance(missing, (bool, type(pd.NA))) else False
+
+
+def _finite_number(value: object) -> float | None:
+    if _is_missing(value):
+        return None
+    if isinstance(value, bool) or getattr(getattr(value, "dtype", None), "kind", None) == "b":
+        return None
+    if not isinstance(value, Real):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _category(value: object) -> str | None:
+    return value if type(value) is str else None
+
+
+def _scalar(value: object) -> str | int | float | bool | object:
+    if _is_missing(value):
+        return _MISSING
+    if type(value) is str:
+        return value
+    if type(value) is bool:
+        return value
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, Real):
+        number = float(value)
+        return number if math.isfinite(number) else _MISSING
+    return _MISSING
+
+
+@dataclass(frozen=True)
+class PredicateClause:
+    field: str
+    type: str
+    lower: float | None
+    lower_inclusive: bool | None
+    upper: float | None
+    upper_inclusive: bool | None
+    values: tuple[str | int | float | bool, ...] | None
+
+    def __post_init__(self) -> None:
+        if type(self.field) is not str or not self.field:
+            raise ValueError("predicate field must be a non-empty built-in string")
+        if self.type == "NUMERIC_INTERVAL":
+            if self.values is not None:
+                raise ValueError("numeric predicate values must be null")
+            if self.lower is None or self.upper is None:
+                raise ValueError("numeric predicate bounds must be present")
+            lower = _finite_number(self.lower)
+            upper = _finite_number(self.upper)
+            if lower is None or upper is None or lower > upper:
+                raise ValueError("numeric predicate bounds must be finite and ordered")
+            if type(self.lower_inclusive) is not bool or type(self.upper_inclusive) is not bool:
+                raise TypeError("numeric predicate inclusion flags must be booleans")
+            object.__setattr__(self, "lower", lower)
+            object.__setattr__(self, "upper", upper)
+            return
+        if self.type != "CATEGORY_IN":
+            raise ValueError(f"unknown predicate type: {self.type}")
+        if any(value is not None for value in (self.lower, self.lower_inclusive, self.upper, self.upper_inclusive)):
+            raise ValueError("category predicate bounds must be null")
+        if not isinstance(self.values, tuple) or not self.values:
+            raise ValueError("category predicate values must be a non-empty tuple")
+        checked: list[str | int | float | bool] = []
+        for value in self.values:
+            scalar = _scalar(value)
+            if scalar is _MISSING:
+                raise ValueError("category predicate values must be finite non-null scalars")
+            checked.append(scalar)
+        if len(set(checked)) != len(checked):
+            raise ValueError("category predicate values must be unique")
+        object.__setattr__(self, "values", tuple(checked))
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "field": self.field,
+            "type": self.type,
+            "lower": self.lower,
+            "lowerInclusive": self.lower_inclusive,
+            "upper": self.upper,
+            "upperInclusive": self.upper_inclusive,
+            "values": None if self.values is None else list(self.values),
+        }
+
+
+@dataclass(frozen=True)
+class Candidate:
+    analysis_family: str
+    evidence_family: str
+    field_names: tuple[str, ...]
+    predicate: tuple[PredicateClause, ...]
+    first_available_stage: str
+    equipment_type: str
+    application_scope: str
+    equipment_id: str
+    application_context: Mapping[str, str | int | float | bool]
+    adjustment_level: int
+    adjustment_fields_dropped: tuple[str, ...]
+    adjustment_kind: str
+    early_warning_eligible: bool
+    support: int
+    comparator_support: int
+    informative_strata: int
+    rule_id: str
+    adjustment_fields: tuple[str, ...]
+    discovery_weights: Mapping[str, float]
+    band_boundaries: Mapping[str, tuple[float, float, float] | None]
+
+    def __post_init__(self) -> None:
+        if not self.predicate or len(self.predicate) != len(self.field_names):
+            raise ValueError("candidate predicate must match its non-empty field names")
+        if self.support < 1 or self.comparator_support < 0 or self.informative_strata < 0:
+            raise ValueError("candidate support metadata must be non-negative")
+        object.__setattr__(self, "field_names", tuple(self.field_names))
+        object.__setattr__(self, "predicate", tuple(self.predicate))
+        object.__setattr__(self, "adjustment_fields_dropped", tuple(self.adjustment_fields_dropped))
+        object.__setattr__(self, "adjustment_fields", tuple(self.adjustment_fields))
+        object.__setattr__(
+            self,
+            "application_context",
+            MappingProxyType(dict(self.application_context)),
+        )
+        object.__setattr__(
+            self,
+            "discovery_weights",
+            MappingProxyType(dict(self.discovery_weights)),
+        )
+        object.__setattr__(
+            self,
+            "band_boundaries",
+            MappingProxyType(dict(self.band_boundaries)),
+        )
+
+    @property
+    def canonical_predicate(self) -> bytes:
+        return canonical_json_bytes(
+            {"allOf": [clause.to_wire() for clause in self.predicate]}
+        )
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "analysisFamily": self.analysis_family,
+            "fieldNames": list(self.field_names),
+            "predicate": {"allOf": [clause.to_wire() for clause in self.predicate]},
+            "firstAvailableStage": self.first_available_stage,
+            "equipmentType": self.equipment_type,
+            "applicationScope": self.application_scope,
+            "equipmentId": self.equipment_id,
+            "applicationContext": dict(self.application_context),
+            "adjustmentLevel": self.adjustment_level,
+            "adjustmentFieldsDropped": list(self.adjustment_fields_dropped),
+            "adjustmentKind": self.adjustment_kind,
+        }
+
+
+@dataclass(frozen=True)
+class QualityMetric:
+    support: int
+    defects: int
+    crude_rate: float | None
+    crude_rate_ci_lower: float | None
+    crude_rate_ci_upper: float | None
+    adjusted_rate: float | None
+    comparator_adjusted_rate: float | None
+    risk_difference: float | None
+    relative_risk: float | None
+    relative_risk_ci_lower: float | None
+    relative_risk_ci_upper: float | None
+    p_value: float | None
+    q_value: float | None
+    reason_code: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "support": self.support,
+            "defects": self.defects,
+            "crudeRate": self.crude_rate,
+            "crudeRateCiLower": self.crude_rate_ci_lower,
+            "crudeRateCiUpper": self.crude_rate_ci_upper,
+            "adjustedRate": self.adjusted_rate,
+            "comparatorAdjustedRate": self.comparator_adjusted_rate,
+            "riskDifference": self.risk_difference,
+            "relativeRisk": self.relative_risk,
+            "relativeRiskCiLower": self.relative_risk_ci_lower,
+            "relativeRiskCiUpper": self.relative_risk_ci_upper,
+            "pValue": self.p_value,
+            "qValue": self.q_value,
+            "reasonCode": self.reason_code,
+        }
+
+
+@dataclass(frozen=True)
+class _MetricComputation:
+    metric: QualityMetric
+    informative_stratum_keys: tuple[str, ...]
+    candidate_positions: tuple[int, ...]
+    comparator_positions: tuple[int, ...]
+    row_position_to_stratum: Mapping[int, str]
+    comparator_counts_by_stratum: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        if type(self.metric) is not QualityMetric:
+            raise TypeError("metric computation must contain a QualityMetric")
+        informative = tuple(self.informative_stratum_keys)
+        if any(type(key) is not str for key in informative):
+            raise TypeError("metric informative stratum keys must be built-in strings")
+        if len(informative) != len(set(informative)):
+            raise ValueError("metric informative stratum keys must be unique")
+        if informative != tuple(sorted(informative, key=lambda key: key.encode("utf-8"))):
+            raise ValueError("metric informative stratum keys must be UTF-8 sorted")
+        candidate_positions = tuple(self.candidate_positions)
+        comparator_positions = tuple(self.comparator_positions)
+        for label, positions in (
+            ("candidate", candidate_positions),
+            ("comparator", comparator_positions),
+        ):
+            if any(type(position) is not int or position < 0 for position in positions):
+                raise ValueError(f"metric {label} positions must be non-negative integers")
+            if len(positions) != len(set(positions)) or positions != tuple(sorted(positions)):
+                raise ValueError(f"metric {label} positions must be unique and sorted")
+        if set(candidate_positions) & set(comparator_positions):
+            raise ValueError("metric candidate/comparator positions overlap")
+        if not isinstance(self.row_position_to_stratum, Mapping):
+            raise TypeError("metric row-position strata must be a mapping")
+        position_to_stratum = dict(self.row_position_to_stratum)
+        expected_positions = set(candidate_positions) | set(comparator_positions)
+        if set(position_to_stratum) != expected_positions:
+            raise ValueError("metric row-position strata must cover selected positions exactly")
+        if any(
+            type(position) is not int
+            or type(key) is not str
+            or key not in informative
+            for position, key in position_to_stratum.items()
+        ):
+            raise ValueError("metric row-position strata contain invalid entries")
+        if not isinstance(self.comparator_counts_by_stratum, Mapping):
+            raise TypeError("metric comparator counts must be a mapping")
+        comparator_counts = dict(self.comparator_counts_by_stratum)
+        if set(comparator_counts) != set(informative) or any(
+            type(value) is not int or value <= 0
+            for value in comparator_counts.values()
+        ):
+            raise ValueError("metric comparator counts must match informative strata")
+        observed_comparator_counts = {
+            key: sum(
+                1
+                for position in comparator_positions
+                if position_to_stratum[position] == key
+            )
+            for key in informative
+        }
+        if comparator_counts != observed_comparator_counts:
+            raise ValueError("metric comparator counts do not match comparator positions")
+        if self.metric.support != len(candidate_positions):
+            raise ValueError("metric support does not match candidate positions")
+        object.__setattr__(self, "informative_stratum_keys", informative)
+        object.__setattr__(self, "candidate_positions", candidate_positions)
+        object.__setattr__(self, "comparator_positions", comparator_positions)
+        object.__setattr__(
+            self,
+            "row_position_to_stratum",
+            MappingProxyType(dict(sorted(position_to_stratum.items()))),
+        )
+        object.__setattr__(
+            self,
+            "comparator_counts_by_stratum",
+            MappingProxyType(
+                dict(
+                    sorted(
+                        comparator_counts.items(),
+                        key=lambda item: item[0].encode("utf-8"),
+                    )
+                )
+            ),
+        )
+
+
+def _validate_sha256_uri(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{label} must be a built-in string")
+    if (
+        len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError(f"{label} must use the lowercase sha256 URI form")
+    return value
+
+
+@dataclass(frozen=True)
+class QualityRule:
+    candidate: Candidate
+    discovery: QualityMetric
+    confirmation: QualityMetric
+    grade: str
+    display_merge_rule_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, Candidate):
+            raise TypeError("candidate must be a Candidate")
+        if not isinstance(self.discovery, QualityMetric):
+            raise TypeError("discovery must be a QualityMetric")
+        if not isinstance(self.confirmation, QualityMetric):
+            raise TypeError("confirmation must be a QualityMetric")
+        if type(self.grade) is not str:
+            raise TypeError("grade must be a built-in string")
+        if self.grade not in {
+            "NORMAL",
+            "UNCONFIRMED",
+            "INSUFFICIENT_EVIDENCE",
+            "CAUTION",
+            "DANGER",
+        }:
+            raise ValueError(f"unknown quality rule grade: {self.grade}")
+        if any(
+            value is not None
+            for value in (
+                self.confirmation.relative_risk_ci_lower,
+                self.confirmation.relative_risk_ci_upper,
+                self.confirmation.p_value,
+                self.confirmation.q_value,
+            )
+        ):
+            raise ValueError("confirmation RR CI, pValue, and qValue must be null")
+        if self.grade == "DANGER" and (
+            self.candidate.adjustment_kind != "STRATIFIED"
+            or self.discovery.relative_risk_ci_lower is None
+            or self.discovery.relative_risk_ci_lower <= 1.0
+        ):
+            raise ValueError("DANGER requires STRATIFIED discovery with RR CI lower > 1")
+        try:
+            display_ids = tuple(self.display_merge_rule_ids)
+        except TypeError as error:
+            raise TypeError("display_merge_rule_ids must be an iterable of SHA IDs") from error
+        checked = tuple(
+            _validate_sha256_uri(value, "display_merge_rule_ids item")
+            for value in display_ids
+        )
+        if len(checked) != len(set(checked)):
+            raise ValueError("display_merge_rule_ids must be unique")
+        object.__setattr__(
+            self,
+            "display_merge_rule_ids",
+            tuple(sorted(checked, key=lambda value: value.encode("utf-8"))),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        candidate = self.candidate
+        return {
+            "ruleId": candidate.rule_id,
+            "analysisFamily": candidate.analysis_family,
+            "evidenceFamily": candidate.evidence_family,
+            "firstAvailableStage": candidate.first_available_stage,
+            "equipmentType": candidate.equipment_type,
+            "applicationScope": candidate.application_scope,
+            "equipmentId": candidate.equipment_id,
+            "fieldNames": list(candidate.field_names),
+            "predicate": {"allOf": [clause.to_wire() for clause in candidate.predicate]},
+            "applicationContext": dict(candidate.application_context),
+            "adjustmentLevel": candidate.adjustment_level,
+            "adjustmentFieldsDropped": list(candidate.adjustment_fields_dropped),
+            "adjustmentKind": candidate.adjustment_kind,
+            "grade": self.grade,
+            "earlyWarningEligible": candidate.early_warning_eligible,
+            "discovery": self.discovery.to_wire(),
+            "confirmation": self.confirmation.to_wire(),
+            "displayMergeRuleIds": list(self.display_merge_rule_ids),
+        }
+
+
+@dataclass(frozen=True)
+class _Rows:
+    columns: Mapping[str, tuple[object, ...]]
+    count: int
+
+
+def _snapshot_rows(
+    rows: pd.DataFrame,
+    included_columns: frozenset[str] | None = None,
+) -> _Rows:
+    if not isinstance(rows, pd.DataFrame):
+        raise TypeError("quality rows must be a pandas DataFrame")
+    if not rows.columns.is_unique:
+        raise ValueError("quality rows must have unique columns")
+    selected = [
+        column
+        for column in rows.columns
+        if included_columns is None or str(column) in included_columns
+    ]
+    snapshot = rows.loc[:, selected].copy(deep=True)
+    columns = {
+        str(column): tuple(snapshot[column].tolist()) for column in snapshot.columns
+    }
+    return _Rows(MappingProxyType(columns), len(snapshot))
+
+
+def _definition_surface(
+    requested: Sequence[FeatureDefinition], config: AnalysisConfig
+) -> tuple[FeatureDefinition, ...]:
+    expected = configured_definitions(config)
+    expected_by_name = {definition.name: definition for definition in expected}
+    snapshot = tuple(requested)
+    names = [definition.name for definition in snapshot]
+    if len(names) != len(set(names)):
+        raise ValueError("feature definitions must be unique")
+    if set(names) != set(expected_by_name):
+        raise ValueError("feature definitions must be complete")
+    if any(expected_by_name[definition.name] != definition for definition in snapshot):
+        raise ValueError("feature definition does not match immutable config")
+    return expected
+
+
+def _field_policy(config: AnalysisConfig) -> dict[str, Mapping[str, object]]:
+    result: dict[str, Mapping[str, object]] = {}
+    for field in config.fields:
+        name = str(field["field"])
+        if name in result:
+            raise ValueError("configured quality fields must be unique")
+        result[name] = field
+    return result
+
+
+def _numeric_predicates(field: str, values: tuple[object, ...], bins: int) -> tuple[PredicateClause, ...]:
+    finite = [number for value in values if (number := _finite_number(value)) is not None]
+    if not finite:
+        return ()
+    boundaries = []
+    for index in range(1, bins + 1):
+        boundary = type1_quantile(finite, index / bins)
+        if boundary is not None and (not boundaries or boundary != boundaries[-1]):
+            boundaries.append(float(boundary))
+    lower = min(finite)
+    predicates: list[PredicateClause] = []
+    for upper in boundaries:
+        predicates.append(
+            PredicateClause(
+                field=field,
+                type="NUMERIC_INTERVAL",
+                lower=float(lower),
+                lower_inclusive=not predicates,
+                upper=float(upper),
+                upper_inclusive=True,
+                values=None,
+            )
+        )
+        lower = upper
+    return tuple(predicates)
+
+
+def _category_predicates(field: str, values: tuple[object, ...]) -> tuple[PredicateClause, ...]:
+    levels = sorted(
+        {_category(value) for value in values if _category(value) is not None},
+        key=lambda value: value.encode("utf-8"),
+    )
+    return tuple(
+        PredicateClause(field, "CATEGORY_IN", None, None, None, None, (level,))
+        for level in levels
+    )
+
+
+def _clause_mask(rows: _Rows, clause: PredicateClause) -> tuple[bool, ...]:
+    values = rows.columns.get(clause.field, (None,) * rows.count)
+    if clause.type == "CATEGORY_IN":
+        wanted = set(clause.values or ())
+        return tuple(_category(value) in wanted for value in values)
+    lower = float(clause.lower)
+    upper = float(clause.upper)
+    result: list[bool] = []
+    for raw in values:
+        value = _finite_number(raw)
+        result.append(
+            value is not None
+            and (value >= lower if clause.lower_inclusive else value > lower)
+            and (value <= upper if clause.upper_inclusive else value < upper)
+        )
+    return tuple(result)
+
+
+def _predicate_mask(rows: _Rows, predicate: tuple[PredicateClause, ...]) -> tuple[bool, ...]:
+    masks = [_clause_mask(rows, clause) for clause in predicate]
+    return tuple(all(mask[index] for mask in masks) for index in range(rows.count))
+
+
+def _eligible_mask(rows: _Rows, predicate: tuple[PredicateClause, ...]) -> tuple[bool, ...]:
+    result = [True] * rows.count
+    for clause in predicate:
+        values = rows.columns.get(clause.field, (None,) * rows.count)
+        for index, raw in enumerate(values):
+            valid = _finite_number(raw) is not None if clause.type == "NUMERIC_INTERVAL" else _category(raw) is not None
+            result[index] = result[index] and valid
+    return tuple(result)
+
+
+def _band_boundaries(rows: _Rows, fields: set[str]) -> dict[str, tuple[float, float, float] | None]:
+    result: dict[str, tuple[float, float, float] | None] = {}
+    for band in sorted(fields, key=lambda value: value.encode("utf-8")):
+        base = band.removesuffix("_band")
+        values = [number for raw in rows.columns.get(base, ()) if (number := _finite_number(raw)) is not None]
+        quartiles = tuple(type1_quantile(values, q) for q in (0.25, 0.5, 0.75))
+        result[band] = None if any(value is None for value in quartiles) else tuple(float(value) for value in quartiles)
+    return result
+
+
+def _context_column(rows: _Rows, field: str, bands: Mapping[str, tuple[float, float, float] | None]) -> tuple[object, ...]:
+    if field.endswith("_band"):
+        boundaries = bands.get(field)
+        base_values = rows.columns.get(field.removesuffix("_band"), (None,) * rows.count)
+        if boundaries is None:
+            return (_MISSING,) * rows.count
+        lower, median, upper = boundaries
+        result: list[object] = []
+        for raw in base_values:
+            value = _finite_number(raw)
+            if value is None:
+                result.append(_MISSING)
+            elif value <= lower:
+                result.append("Q1")
+            elif value <= median:
+                result.append("Q2")
+            elif value <= upper:
+                result.append("Q3")
+            else:
+                result.append("Q4")
+        return tuple(result)
+    return tuple(_scalar(value) for value in rows.columns.get(field, (None,) * rows.count))
+
+
+class _StrataCache:
+    """Cache label-free context columns and canonical keys for one row snapshot."""
+
+    def __init__(
+        self,
+        rows: _Rows,
+        bands: Mapping[str, tuple[float, float, float] | None],
+    ) -> None:
+        self.rows = rows
+        self.bands = bands
+        self._columns: dict[str, tuple[object, ...]] = {}
+        self._keys: dict[tuple[str, ...], tuple[str | None, ...]] = {}
+
+    def keys(self, fields: tuple[str, ...]) -> tuple[str | None, ...]:
+        cached = self._keys.get(fields)
+        if cached is not None:
+            return cached
+        if not fields:
+            result: tuple[str | None, ...] = ("",) * self.rows.count
+            self._keys[fields] = result
+            return result
+        columns = []
+        for field in fields:
+            column = self._columns.get(field)
+            if column is None:
+                column = _context_column(self.rows, field, self.bands)
+                self._columns[field] = column
+            columns.append(column)
+        encoded: dict[tuple[object, ...], str] = {}
+        result_values: list[str | None] = []
+        for index in range(self.rows.count):
+            values = tuple(column[index] for column in columns)
+            if any(value is _MISSING for value in values):
+                result_values.append(None)
+                continue
+            key = encoded.get(values)
+            if key is None:
+                key = canonical_json_bytes(
+                    dict(zip(fields, values, strict=True))
+                )[:-1].decode("utf-8")
+                encoded[values] = key
+            result_values.append(key)
+        result = tuple(result_values)
+        self._keys[fields] = result
+        return result
+
+
+def _field_stage(field: str, policy: Mapping[str, Mapping[str, object]]) -> str:
+    base = field.removesuffix("_band") if field.endswith("_band") else field
+    if base not in policy:
+        raise ValueError(f"adjustment field is not configured: {field}")
+    return str(policy[base]["firstAvailableStage"])
+
+
+def _dropped_fields(
+    field_names: tuple[str, ...],
+    first_stage: str,
+    equipment_type: str,
+    analysis_family: str,
+    config: AnalysisConfig,
+    policy: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    dropped: set[str] = set(field_names)
+    dropped.update(f"{field}_band" for field in field_names)
+    changed = True
+    while changed:
+        changed = False
+        for name, configured in policy.items():
+            dependencies = {str(value) for value in configured["dependencies"]}
+            if name in dropped or dependencies & dropped:
+                before = len(dropped)
+                dropped.add(name)
+                dropped.update(dependencies)
+                changed = changed or len(dropped) != before
+    for name in field_names:
+        configured = policy[name]
+        stage = configured["firstAvailableStage"]
+        dropped.update(
+            other
+            for other, other_policy in policy.items()
+            if other_policy["featureRole"] == "DIRECT_OPERATION"
+            and other_policy["dataType"] == "NUMBER"
+            and other_policy["firstAvailableStage"] == stage
+        )
+    if equipment_type == "AP" and analysis_family != "INTERACTION":
+        dropped.update(
+            f"{name}_band"
+            for name, configured in policy.items()
+            if configured["equipmentType"] == equipment_type
+            and configured["featureRole"] == "PRODUCT_STATE_REFERENCE"
+            and configured["dataType"] == "NUMBER"
+        )
+    for level in config.risk_adjustment_hierarchies[equipment_type]:
+        dropped.update(
+            field
+            for field in level
+            if STAGE_RANK[_field_stage(field, policy)] > STAGE_RANK[first_stage]
+        )
+    return tuple(sorted(dropped, key=lambda value: value.encode("utf-8")))
+
+
+def _select_adjustment(
+    rows: _Rows,
+    candidate_mask: tuple[bool, ...],
+    eligible: tuple[bool, ...],
+    equipment_type: str,
+    first_stage: str,
+    dropped: tuple[str, ...],
+    strata_cache: _StrataCache,
+    config: AnalysisConfig,
+    policy: Mapping[str, Mapping[str, object]],
+) -> tuple[int, tuple[str, ...], str, int, int, int, Mapping[str, float]]:
+    minimum_support = int(config.quality_risk["minimumDiscoverySupport"])
+    minimum_strata = int(config.quality_risk["minimumInformativeStrata"])
+    hierarchy = config.risk_adjustment_hierarchies[equipment_type]
+    dropped_set = set(dropped)
+    for level_index, configured_level in enumerate(hierarchy):
+        fields = tuple(
+            field
+            for field in configured_level
+            if field not in dropped_set
+            and STAGE_RANK[_field_stage(field, policy)] <= STAGE_RANK[first_stage]
+        )
+        keys = strata_cache.keys(fields)
+        counts: dict[str, list[int]] = {}
+        for index, key in enumerate(keys):
+            if key is None or not eligible[index]:
+                continue
+            cell = counts.setdefault(key, [0, 0])
+            cell[0 if candidate_mask[index] else 1] += 1
+        informative = {
+            key: value for key, value in counts.items() if value[0] > 0 and value[1] > 0
+        }
+        support = sum(value[0] for value in informative.values())
+        comparator = sum(value[1] for value in informative.values())
+        if len(informative) >= minimum_strata and support >= minimum_support and comparator >= minimum_support:
+            total = sum(sum(value) for value in informative.values())
+            weights = {
+                key: (value[0] + value[1]) / total
+                for key, value in sorted(informative.items(), key=lambda item: item[0].encode("utf-8"))
+            }
+            return level_index, fields, "STRATIFIED", support, comparator, len(informative), weights
+
+    support = sum(1 for index in range(rows.count) if eligible[index] and candidate_mask[index])
+    comparator = sum(1 for index in range(rows.count) if eligible[index] and not candidate_mask[index])
+    weights = {"": 1.0} if support and comparator else {}
+    return len(hierarchy) - 1, (), "UNADJUSTED_FALLBACK", support, comparator, int(bool(weights)), weights
+
+
+def _make_candidate(
+    *,
+    rows: _Rows,
+    analysis_family: str,
+    evidence_family: str,
+    field_names: tuple[str, ...],
+    predicate: tuple[PredicateClause, ...],
+    first_stage: str,
+    equipment_type: str,
+    config: AnalysisConfig,
+    policy: Mapping[str, Mapping[str, object]],
+    bands: Mapping[str, tuple[float, float, float] | None],
+    strata_cache: _StrataCache,
+) -> Candidate | None:
+    candidate_mask = _predicate_mask(rows, predicate)
+    support_all = sum(candidate_mask)
+    if support_all == 0:
+        return None
+    eligible = _eligible_mask(rows, predicate)
+    equipment_specific = (
+        analysis_family == "CATEGORICAL"
+        and policy[field_names[0]]["featureRole"] == _EQUIPMENT_IDENTIFIER_ROLE
+    )
+    equipment_id = str(predicate[0].values[0]) if equipment_specific else "ALL"
+    dropped = _dropped_fields(
+        field_names, first_stage, equipment_type, analysis_family, config, policy
+    )
+    level, fields, kind, support, comparator, informative, weights = _select_adjustment(
+        rows,
+        candidate_mask,
+        eligible,
+        equipment_type,
+        first_stage,
+        dropped,
+        strata_cache,
+        config,
+        policy,
+    )
+    provisional = Candidate(
+        analysis_family=analysis_family,
+        evidence_family=evidence_family,
+        field_names=field_names,
+        predicate=predicate,
+        first_available_stage=first_stage,
+        equipment_type=equipment_type,
+        application_scope="EQUIPMENT_SPECIFIC" if equipment_specific else "PROCESS_GLOBAL",
+        equipment_id=equipment_id,
+        application_context={},
+        adjustment_level=level,
+        adjustment_fields_dropped=dropped,
+        adjustment_kind=kind,
+        early_warning_eligible=first_stage != "AP_RECORDED_WITH_RESULT",
+        support=support,
+        comparator_support=comparator,
+        informative_strata=informative,
+        rule_id="sha256:" + "0" * 64,
+        adjustment_fields=fields,
+        discovery_weights=weights,
+        band_boundaries=bands,
+    )
+    return replace(provisional, rule_id=sha256_uri(canonical_json_bytes(provisional.identity())))
+
+
+def _generate_candidates(rows: _Rows, wanted: tuple[FeatureDefinition, ...], config: AnalysisConfig) -> tuple[Candidate, ...]:
+    policy = _field_policy(config)
+    if not config.fdr_families or len(config.fdr_families) != len(set(config.fdr_families)):
+        raise ValueError("quality FDR families must be non-empty and unique")
+    eligible_definitions = tuple(
+        definition for definition in wanted if definition.field_role in _CANDIDATE_ROLES
+    )
+    for definition in eligible_definitions:
+        evidence = policy[definition.name]["evidenceFamily"]
+        if evidence not in config.evidence_families:
+            raise ValueError(f"quality field has no configured evidence family: {definition.name}")
+
+    all_band_fields = {
+        field
+        for hierarchy in config.risk_adjustment_hierarchies.values()
+        for level in hierarchy
+        for field in level
+        if field.endswith("_band")
+    }
+    bands = _band_boundaries(rows, all_band_fields)
+    strata_cache = _StrataCache(rows, bands)
+    candidates: list[Candidate] = []
+    definition_by_name = {definition.name: definition for definition in wanted}
+    definition_rank = {definition.name: index for index, definition in enumerate(wanted)}
+    interaction_rank = {pair: index for index, pair in enumerate(config.fixed_interactions)}
+
+    for definition in eligible_definitions:
+        if definition.name not in rows.columns:
+            continue
+        if definition.data_type == "NUMBER":
+            predicates = _numeric_predicates(
+                definition.name,
+                rows.columns[definition.name],
+                int(config.quality_risk["numericBins"]),
+            )
+            family = "NUMERIC"
+        elif definition.data_type == "STRING":
+            predicates = _category_predicates(definition.name, rows.columns[definition.name])
+            family = "CATEGORICAL"
+        else:
+            raise ValueError(f"candidate data type is not supported: {definition.data_type}")
+        for clause in predicates:
+            candidate = _make_candidate(
+                rows=rows,
+                analysis_family=family,
+                evidence_family=str(policy[definition.name]["evidenceFamily"]),
+                field_names=(definition.name,),
+                predicate=(clause,),
+                first_stage=definition.first_stage,
+                equipment_type=definition.equipment_type,
+                config=config,
+                policy=policy,
+                bands=bands,
+                strata_cache=strata_cache,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    for pair in config.fixed_interactions:
+        first_name, second_name = pair
+        first = definition_by_name.get(first_name)
+        second = definition_by_name.get(second_name)
+        if first is None or second is None:
+            raise ValueError(f"configured interaction field is missing: {pair}")
+        if first.data_type != "NUMBER" or second.data_type != "NUMBER":
+            raise ValueError(f"configured interaction fields must be numeric: {pair}")
+        if first.equipment_type != second.equipment_type:
+            raise ValueError(f"configured interaction must remain within one equipment type: {pair}")
+        if first_name not in rows.columns or second_name not in rows.columns:
+            continue
+        first_predicates = _numeric_predicates(first_name, rows.columns[first_name], int(config.quality_risk["interactionBins"]))
+        second_predicates = _numeric_predicates(second_name, rows.columns[second_name], int(config.quality_risk["interactionBins"]))
+        if len(first_predicates) < 2 or len(second_predicates) < 2:
+            continue
+        later = first if STAGE_RANK[first.first_stage] >= STAGE_RANK[second.first_stage] else second
+        for first_clause in first_predicates:
+            for second_clause in second_predicates:
+                candidate = _make_candidate(
+                    rows=rows,
+                    analysis_family="INTERACTION",
+                    evidence_family=str(policy[first_name]["evidenceFamily"]),
+                    field_names=(first_name, second_name),
+                    predicate=(first_clause, second_clause),
+                    first_stage=later.first_stage,
+                    equipment_type=later.equipment_type,
+                    config=config,
+                    policy=policy,
+                    bands=bands,
+                    strata_cache=strata_cache,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+
+    family_rank = {name: index for index, name in enumerate(config.fdr_families)}
+    missing_families = {
+        candidate.analysis_family for candidate in candidates
+    } - set(family_rank)
+    if missing_families:
+        raise ValueError(
+            "candidate analysis families are missing from configured FDR families: "
+            + ", ".join(sorted(missing_families))
+        )
+
+    def predicate_sort_key(candidate: Candidate) -> tuple[object, ...]:
+        terms: list[object] = []
+        for clause in candidate.predicate:
+            if clause.type == "NUMERIC_INTERVAL":
+                terms.append(
+                    (0, float(clause.lower), not bool(clause.lower_inclusive), float(clause.upper))
+                )
+            else:
+                terms.append(
+                    (1, tuple(str(value).encode("utf-8") for value in clause.values or ()))
+                )
+        return tuple(terms)
+
+    candidates.sort(
+        key=lambda candidate: (
+            family_rank[candidate.analysis_family],
+            interaction_rank.get(candidate.field_names, definition_rank.get(candidate.field_names[0], 0)),
+            predicate_sort_key(candidate),
+            candidate.rule_id.encode("utf-8"),
+        )
+    )
+    seen_predicates: set[tuple[str, bytes]] = set()
+    preimages: dict[str, bytes] = {}
+    unique: list[Candidate] = []
+    for candidate in candidates:
+        predicate_key = (candidate.analysis_family, candidate.canonical_predicate)
+        if predicate_key in seen_predicates:
+            continue
+        seen_predicates.add(predicate_key)
+        preimage = canonical_json_bytes(candidate.identity())
+        previous = preimages.setdefault(candidate.rule_id, preimage)
+        if previous != preimage:
+            raise ValueError("quality rule ID collision")
+        unique.append(candidate)
+    return tuple(unique)
+
+
+def generate_candidates(
+    discovery_rows: pd.DataFrame,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+) -> tuple[Candidate, ...]:
+    """Generate all unique non-empty predicates without reading labels."""
+    wanted = _definition_surface(definitions, config)
+    feature_columns = frozenset(definition.name for definition in wanted)
+    return _generate_candidates(
+        _snapshot_rows(discovery_rows, feature_columns), wanted, config
+    )
+
+
+def _judges(rows: _Rows) -> tuple[bool, ...]:
+    raw = rows.columns.get("judge")
+    if raw is None:
+        raise ValueError("quality metric rows must contain judge")
+    result: list[bool] = []
+    for value in raw:
+        if value not in {"양품", "불량"}:
+            raise ValueError("quality metric judge must be 양품 or 불량")
+        result.append(value == "불량")
+    return tuple(result)
+
+
+def _metric(
+    rows: _Rows,
+    candidate: Candidate,
+    config: AnalysisConfig,
+    *,
+    confirmation: bool,
+    strata_cache: _StrataCache | None = None,
+) -> _MetricComputation:
+    mask = _predicate_mask(rows, candidate.predicate)
+    eligible = _eligible_mask(rows, candidate.predicate)
+    cache = strata_cache or _StrataCache(rows, candidate.band_boundaries)
+    keys = cache.keys(candidate.adjustment_fields)
+    allowed_keys = set(candidate.discovery_weights)
+    judges = _judges(rows)
+    counts: dict[str, list[int]] = {}
+    for index, key in enumerate(keys):
+        if key is None or not eligible[index] or key not in allowed_keys:
+            continue
+        cells = counts.setdefault(key, [0, 0, 0, 0])
+        cell = 0 if mask[index] and judges[index] else 1 if mask[index] else 2 if judges[index] else 3
+        cells[cell] += 1
+    informative = {
+        key: cells
+        for key, cells in counts.items()
+        if cells[0] + cells[1] > 0 and cells[2] + cells[3] > 0
+    }
+    strata = tuple(
+        Stratum(*informative[key], key=key)
+        for key in sorted(informative, key=lambda value: value.encode("utf-8"))
+    )
+    support = sum(stratum.a + stratum.b for stratum in strata)
+    comparator_support = sum(stratum.c + stratum.d for stratum in strata)
+    defects = sum(stratum.a for stratum in strata)
+    informative_keys = tuple(
+        sorted(informative, key=lambda value: value.encode("utf-8"))
+    )
+    candidate_positions = tuple(
+        index
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index] and mask[index]
+    )
+    comparator_positions = tuple(
+        index
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index] and not mask[index]
+    )
+    row_position_to_stratum = {
+        index: key
+        for index, key in enumerate(keys)
+        if key in informative and eligible[index]
+    }
+    comparator_counts = {
+        key: informative[key][2] + informative[key][3]
+        for key in informative_keys
+    }
+
+    def computation(metric: QualityMetric) -> _MetricComputation:
+        return _MetricComputation(
+            metric,
+            informative_keys,
+            candidate_positions,
+            comparator_positions,
+            row_position_to_stratum,
+            comparator_counts,
+        )
+
+    crude = defects / support if support else None
+    wilson = wilson_interval(defects, support, config.wilson_z)
+    minimum_support = int(
+        config.quality_risk[
+            "minimumConfirmationSupport" if confirmation else "minimumDiscoverySupport"
+        ]
+    )
+    minimum_defects = int(
+        config.quality_risk[
+            "minimumConfirmationDefects" if confirmation else "minimumCautionDefects"
+        ]
+    )
+    required_strata = (
+        int(config.quality_risk["minimumInformativeStrata"])
+        if candidate.adjustment_kind == "STRATIFIED"
+        else 1
+    )
+    low_structure = len(strata) < required_strata
+    low_support = support < minimum_support or comparator_support < minimum_support
+    if low_structure or low_support:
+        reason = "NO_INFORMATIVE_STRATA" if low_structure else "LOW_SUPPORT"
+        return computation(
+            QualityMetric(
+                support,
+                defects,
+                crude,
+                None if wilson is None else wilson[0],
+                None if wilson is None else wilson[1],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None if confirmation else 1.0,
+                None,
+                reason,
+            )
+        )
+    rates = standardized_rates(strata, candidate.discovery_weights)
+    relative_risk = mantel_haenszel_rr(strata)
+    p_value, p_reason = cmh_p_value(strata)
+    reason = "LOW_DEFECT_COUNT" if defects < minimum_defects else p_reason
+    return computation(
+        QualityMetric(
+            support,
+            defects,
+            crude,
+            None if wilson is None else wilson[0],
+            None if wilson is None else wilson[1],
+            rates.candidate,
+            rates.comparator,
+            rates.risk_difference,
+            relative_risk,
+            None,
+            None,
+            None if confirmation else p_value,
+            None,
+            reason,
+        )
+    )
+
+
+def _validate_criteria_id(value: object) -> str:
+    return _validate_sha256_uri(value, "criteria_id")
+
+
+def _metric_is_insufficient(metric: QualityMetric) -> bool:
+    return metric.reason_code in {
+        "LOW_SUPPORT",
+        "LOW_DEFECT_COUNT",
+        "NO_INFORMATIVE_STRATA",
+        "NO_VARIATION",
+        "NON_FINITE_ESTIMATE",
+        "ZERO_COMPARATOR_RISK",
+    }
+
+
+def _discovery_caution_pass(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    policy = config.quality_risk
+    return (
+        not _metric_is_insufficient(metric)
+        and metric.relative_risk is not None
+        and metric.risk_difference is not None
+        and metric.q_value is not None
+        and metric.relative_risk >= float(policy["relativeRisk"]["caution"])
+        and metric.risk_difference >= float(policy["riskDifference"]["caution"])
+        and metric.q_value <= float(policy["bhQ"]["caution"])
+    )
+
+
+def _discovery_danger_prebootstrap(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    policy = config.quality_risk
+    return (
+        _discovery_caution_pass(metric, config)
+        and metric.defects >= int(policy["minimumDangerDefects"])
+        and metric.relative_risk is not None
+        and metric.risk_difference is not None
+        and metric.q_value is not None
+        and metric.relative_risk >= float(policy["relativeRisk"]["danger"])
+        and metric.risk_difference >= float(policy["riskDifference"]["danger"])
+        and metric.q_value <= float(policy["bhQ"]["danger"])
+    )
+
+
+def _bootstrap_applicable(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    return (
+        metric.support >= int(config.quality_risk["minimumDiscoverySupport"])
+        and metric.defects >= int(config.quality_risk["minimumCautionDefects"])
+        and metric.adjusted_rate is not None
+        and metric.comparator_adjusted_rate is not None
+        and metric.relative_risk is not None
+        and math.isfinite(metric.relative_risk)
+        and metric.relative_risk > 0.0
+    )
+
+
+def _confirmation_caution_pass(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    policy = config.quality_risk
+    return (
+        not _metric_is_insufficient(metric)
+        and metric.relative_risk is not None
+        and metric.risk_difference is not None
+        and metric.relative_risk
+        > float(policy["confirmationRelativeRisk"]["cautionExclusive"])
+        and metric.risk_difference > 0.0
+    )
+
+
+def _confirmation_danger_pass(metric: QualityMetric, config: AnalysisConfig) -> bool:
+    return (
+        _confirmation_caution_pass(metric, config)
+        and metric.relative_risk is not None
+        and metric.relative_risk
+        >= float(config.quality_risk["confirmationRelativeRisk"]["danger"])
+    )
+
+
+def _bootstrap_rows(
+    rows: _Rows,
+    computation: _MetricComputation,
+) -> pd.DataFrame:
+    charge_ids = rows.columns.get("charge_id")
+    if charge_ids is None:
+        raise ValueError("quality bootstrap rows must contain charge_id")
+    judges = rows.columns.get("judge")
+    if judges is None:
+        raise ValueError("quality bootstrap rows must contain judge")
+    records: list[dict[str, object]] = []
+    candidate_positions = set(computation.candidate_positions)
+    for index, key in computation.row_position_to_stratum.items():
+        charge_id = charge_ids[index]
+        if type(charge_id) is not str or not charge_id:
+            raise ValueError("quality bootstrap charge_id must be a non-empty string")
+        judge = judges[index]
+        if judge not in {"양품", "불량"}:
+            raise ValueError("quality bootstrap judge must be 양품 or 불량")
+        records.append(
+            {
+                "charge_id": charge_id,
+                "stratum": key,
+                "candidate": index in candidate_positions,
+                "judge": judge,
+            }
+        )
+    return pd.DataFrame(
+        records,
+        columns=("charge_id", "stratum", "candidate", "judge"),
+    )
+
+
+@dataclass(frozen=True)
+class _BootstrapResponse:
+    index: int
+    rule_id: str
+    interval: BootstrapCi
+
+
+def _bootstrap_task(
+    task: tuple[int, pd.DataFrame, str, str, int],
+) -> _BootstrapResponse:
+    index, rows, seed_material, rule_id, replicates = task
+    return _BootstrapResponse(
+        index,
+        rule_id,
+        charge_bootstrap_rr_ci_with_seed(
+            rows,
+            seed_material,
+            rule_id,
+            replicates=replicates,
+        ),
+    )
+
+
+def _write_all(file_descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(file_descriptor, payload[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("bootstrap worker output made no write progress")
+        offset += written
+
+
+def _decode_bootstrap_worker_input(
+    payload: bytes,
+) -> tuple[int, tuple[tuple[int, pd.DataFrame, str, str, int], ...]]:
+    try:
+        stream = io.BytesIO(payload)
+        message = pickle.Unpickler(stream).load()
+        if stream.tell() != len(payload):
+            raise ValueError("trailing input bytes")
+        if type(message) is not dict or set(message) != {
+            "protocol",
+            "workerOrdinal",
+            "tasks",
+        }:
+            raise ValueError("input envelope shape is invalid")
+        protocol = message["protocol"]
+        worker_ordinal = message["workerOrdinal"]
+        raw_tasks = message["tasks"]
+        if (
+            protocol != _BOOTSTRAP_PROTOCOL
+            or type(worker_ordinal) is not int
+            or worker_ordinal < 0
+            or type(raw_tasks) is not tuple
+        ):
+            raise ValueError("input protocol or task collection is invalid")
+        tasks: list[tuple[int, pd.DataFrame, str, str, int]] = []
+        for raw_task in raw_tasks:
+            if type(raw_task) is not dict or set(raw_task) != {
+                "index",
+                "rows",
+                "seedMaterial",
+                "ruleId",
+                "replicates",
+            }:
+                raise ValueError("input task shape is invalid")
+            index = raw_task["index"]
+            rows = raw_task["rows"]
+            seed_material = raw_task["seedMaterial"]
+            rule_id = raw_task["ruleId"]
+            replicates = raw_task["replicates"]
+            if type(index) is not int or index < 0:
+                raise ValueError("input task index must be a non-negative integer")
+            if type(rows) is not pd.DataFrame:
+                raise TypeError("input task rows must be a pandas DataFrame")
+            if type(seed_material) is not str or type(rule_id) is not str:
+                raise TypeError("input task identifiers must be built-in strings")
+            if (
+                type(replicates) is not int
+                or not 1 <= replicates <= _UINT64_MAX
+            ):
+                raise ValueError("input task replicates must be a positive integer")
+            tasks.append((index, rows, seed_material, rule_id, replicates))
+        return worker_ordinal, tuple(tasks)
+    except Exception as error:
+        raise RuntimeError(f"bootstrap worker input protocol invalid: {error}") from error
+
+
+def _decode_bootstrap_worker_response(
+    payload: bytes,
+) -> tuple[int, tuple[_BootstrapResponse, ...]]:
+    try:
+        if type(payload) is not bytes or not payload:
+            raise ValueError("response must be non-empty built-in bytes")
+        if len(payload) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+            raise ValueError("response exceeds the byte limit")
+        stream = io.BytesIO(payload)
+        message = pickle.Unpickler(stream).load()
+        if stream.tell() != len(payload):
+            raise ValueError("trailing response bytes")
+        if type(message) is not tuple or len(message) != 3:
+            raise ValueError("response envelope must contain protocol, ordinal, and results")
+        protocol, worker_ordinal, raw_responses = message
+        if (
+            protocol != _BOOTSTRAP_PROTOCOL
+            or type(worker_ordinal) is not int
+            or worker_ordinal < 0
+            or type(raw_responses) is not tuple
+        ):
+            raise ValueError("response protocol or result collection is invalid")
+        responses: list[_BootstrapResponse] = []
+        for raw_response in raw_responses:
+            if type(raw_response) is not tuple or len(raw_response) != 3:
+                raise ValueError("response result must contain exactly three fields")
+            responses.append(_BootstrapResponse(*raw_response))
+        return worker_ordinal, tuple(responses)
+    except Exception as error:
+        raise RuntimeError(f"bootstrap worker protocol invalid: {error}") from error
+
+
+def _validate_bootstrap_responses(
+    expected: Sequence[tuple[int, str, int]],
+    responses: Sequence[_BootstrapResponse],
+    *,
+    result_size: int,
+) -> tuple[_BootstrapResponse, ...]:
+    expected_snapshot, expected_by_index = _validate_expected_bootstrap_identities(
+        expected,
+        result_size=result_size,
+    )
+    response_snapshot = tuple(responses)
+    if len(response_snapshot) != len(expected_snapshot):
+        raise RuntimeError(
+            "bootstrap response cardinality does not match submitted tasks"
+        )
+
+    validated: dict[int, _BootstrapResponse] = {}
+    interval_fields = {
+        "lower",
+        "upper",
+        "valid_replicates",
+        "reason_code",
+    }
+    for response in response_snapshot:
+        if type(response) is not _BootstrapResponse:
+            raise RuntimeError("bootstrap response has an unexpected payload type")
+        if type(response.index) is not int or not 0 <= response.index < result_size:
+            raise RuntimeError("bootstrap response index is outside the result range")
+        if response.index in validated:
+            raise RuntimeError("bootstrap response contains a duplicate or conflicting index")
+        expected_metadata = expected_by_index.get(response.index)
+        if expected_metadata is None:
+            raise RuntimeError("bootstrap response contains an unexpected index")
+        expected_rule_id, submitted_replicates = expected_metadata
+        if type(response.rule_id) is not str or response.rule_id != expected_rule_id:
+            raise RuntimeError("bootstrap response ruleId does not match its submitted task")
+        interval = response.interval
+        if type(interval) is not BootstrapCi:
+            raise RuntimeError("bootstrap response interval must be an exact BootstrapCi")
+        if set(vars(interval)) != interval_fields:
+            raise RuntimeError("bootstrap response BootstrapCi shape is invalid")
+        if (
+            type(interval.valid_replicates) is not int
+            or not 0 <= interval.valid_replicates <= submitted_replicates
+        ):
+            raise RuntimeError(
+                "bootstrap response validReplicates must be a built-in integer "
+                "bounded by the submitted replicates"
+            )
+        try:
+            checked_interval = BootstrapCi(
+                interval.lower,
+                interval.upper,
+                interval.valid_replicates,
+                interval.reason_code,
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"bootstrap response BootstrapCi semantics are invalid: {error}"
+            ) from error
+        validated[response.index] = _BootstrapResponse(
+            response.index,
+            response.rule_id,
+            checked_interval,
+        )
+    if set(validated) != set(expected_by_index):
+        raise RuntimeError("bootstrap response is missing a submitted task")
+    return tuple(validated[index] for index, _, _ in expected_snapshot)
+
+
+def _validate_expected_bootstrap_identities(
+    expected: Sequence[tuple[int, str, int]],
+    *,
+    result_size: int,
+) -> tuple[
+    tuple[tuple[int, str, int], ...],
+    dict[int, tuple[str, int]],
+]:
+    if type(result_size) is not int or result_size < 0:
+        raise RuntimeError("bootstrap result index range is invalid")
+    expected_snapshot = tuple(expected)
+    expected_by_index: dict[int, tuple[str, int]] = {}
+    for item in expected_snapshot:
+        if type(item) is not tuple or len(item) != 3:
+            raise RuntimeError("bootstrap expected metadata shape is invalid")
+        index, rule_id, replicates = item
+        if type(index) is not int or not 0 <= index < result_size:
+            raise RuntimeError("bootstrap expected index range is invalid")
+        try:
+            checked_rule_id = _validate_sha256_uri(rule_id, "bootstrap expected ruleId")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"bootstrap expected ruleId is invalid: {error}") from error
+        if (
+            type(replicates) is not int
+            or not 1 <= replicates <= _UINT64_MAX
+        ):
+            raise RuntimeError(
+                "bootstrap expected replicates must be a positive built-in integer"
+            )
+        if index in expected_by_index:
+            raise RuntimeError("bootstrap expected identities contain a duplicate index")
+        expected_by_index[index] = (checked_rule_id, replicates)
+    if len({item[0] for item in expected_by_index.values()}) != len(expected_by_index):
+        raise RuntimeError("bootstrap expected identities contain a duplicate ruleId")
+    return expected_snapshot, expected_by_index
+
+
+def _best_effort_worker_error(error: BaseException) -> None:
+    message = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")[:4096]
+    try:
+        _write_all(2, message + b"\n")
+    except BaseException:
+        pass
+
+
+def _bootstrap_worker_main(input_path: Path, *, output_fd: int = 1) -> int:
+    try:
+        path = Path(input_path)
+        if path.stat().st_size > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise ValueError("bootstrap worker input exceeds the byte limit")
+        with path.open("rb") as input_file:
+            payload = input_file.read(_MAX_BOOTSTRAP_PAYLOAD_BYTES + 1)
+        if len(payload) > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise ValueError("bootstrap worker input exceeds the byte limit")
+        worker_ordinal, tasks = _decode_bootstrap_worker_input(payload)
+        responses = tuple(_bootstrap_task(task) for task in tasks)
+        result = pickle.dumps(
+            (
+                _BOOTSTRAP_PROTOCOL,
+                worker_ordinal,
+                tuple(
+                    (response.index, response.rule_id, response.interval)
+                    for response in responses
+                ),
+            ),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        if len(result) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+            raise ValueError("bootstrap worker response exceeds the byte limit")
+    except BaseException as error:
+        _best_effort_worker_error(error)
+        return 70
+    try:
+        _write_all(output_fd, result)
+    except BaseException as error:
+        _best_effort_worker_error(error)
+        return 74
+    return 0
+
+
+@dataclass
+class _SpawnedBootstrapWorker:
+    pid: int
+    output_path: Path
+    error_path: Path
+    returncode: int | None = None
+
+    @staticmethod
+    def _retry_after_interruption(deadline: float, operation: str) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(f"bootstrap worker {operation} exceeded its deadline")
+        time.sleep(min(_WAITPID_RETRY_SECONDS, remaining))
+
+    def poll(self, deadline: float) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        while True:
+            try:
+                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+                break
+            except InterruptedError:
+                self._retry_after_interruption(deadline, "poll")
+            except ChildProcessError:
+                self.returncode = 255
+                return self.returncode
+            except OSError as error:
+                if error.errno != errno.ECHILD:
+                    raise
+                self.returncode = 255
+                return self.returncode
+        if waited_pid == self.pid:
+            self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def _signal(self, signal_number: int, deadline: float, operation: str) -> None:
+        while True:
+            try:
+                os.kill(self.pid, signal_number)
+                return
+            except InterruptedError:
+                self._retry_after_interruption(deadline, operation)
+
+    def terminate(self, deadline: float) -> None:
+        self._signal(signal.SIGTERM, deadline, "TERM")
+
+    def kill(self, deadline: float) -> None:
+        self._signal(signal.SIGKILL, deadline, "KILL")
+
+    def reap(self, deadline: float) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        while True:
+            try:
+                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except InterruptedError:
+                self._retry_after_interruption(deadline, "reap")
+                continue
+            except ChildProcessError:
+                self.returncode = 255
+                return self.returncode
+            except OSError as error:
+                if error.errno != errno.ECHILD:
+                    raise
+                self.returncode = 255
+                return self.returncode
+            if waited_pid == self.pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                return self.returncode
+            if waited_pid != 0:
+                raise RuntimeError("bootstrap worker wait returned an unexpected pid")
+            self._retry_after_interruption(deadline, "reap")
+
+
+def _start_bootstrap_worker(
+    input_path: Path,
+    output_path: Path,
+    error_path: Path,
+) -> _SpawnedBootstrapWorker:
+    arguments = (
+        sys.executable,
+        "-m",
+        "equipment_quality._bootstrap_worker",
+        _BOOTSTRAP_WORKER_ARGUMENT,
+        str(input_path),
+    )
+    output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    file_actions = (
+        (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 1, str(output_path), output_flags, 0o600),
+        (os.POSIX_SPAWN_OPEN, 2, str(error_path), output_flags, 0o600),
+    )
+    process_id = os.posix_spawn(
+        sys.executable,
+        arguments,
+        dict(os.environ),
+        file_actions=file_actions,
+        setsigmask=(),
+    )
+    return _SpawnedBootstrapWorker(
+        process_id,
+        output_path,
+        error_path,
+    )
+
+
+def _cleanup_bootstrap_workers(processes: Sequence[_SpawnedBootstrapWorker]) -> None:
+    snapshot = tuple(processes)
+    terminate_deadline = time.monotonic() + _BOOTSTRAP_TERMINATE_TIMEOUT_SECONDS
+    targeted: list[_SpawnedBootstrapWorker] = []
+    running: list[_SpawnedBootstrapWorker] = []
+    errors: list[str] = []
+    for process in snapshot:
+        poll_deadline = min(
+            terminate_deadline,
+            time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+        )
+        try:
+            if process.poll(poll_deadline) is None:
+                targeted.append(process)
+                running.append(process)
+                try:
+                    process.terminate(terminate_deadline)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    errors.append(
+                        f"worker {process.pid} TERM failed: {type(error).__name__}: {error}"
+                    )
+        except TimeoutError:
+            targeted.append(process)
+            running.append(process)
+            try:
+                process.terminate(terminate_deadline)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                errors.append(
+                    f"worker {process.pid} TERM failed: {type(error).__name__}: {error}"
+                )
+        except OSError as error:
+            targeted.append(process)
+            running.append(process)
+            errors.append(
+                f"worker {process.pid} initial poll failed: {type(error).__name__}: {error}"
+            )
+    while running:
+        if time.monotonic() >= terminate_deadline:
+            break
+        still_running: list[_SpawnedBootstrapWorker] = []
+        for process in running:
+            poll_deadline = min(
+                terminate_deadline,
+                time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+            )
+            try:
+                if process.poll(poll_deadline) is None:
+                    still_running.append(process)
+            except TimeoutError:
+                still_running.append(process)
+            except OSError as error:
+                errors.append(
+                    f"worker {process.pid} TERM poll failed: {type(error).__name__}: {error}"
+                )
+                still_running.append(process)
+        running = still_running
+        if running:
+            remaining = terminate_deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(0.005, remaining))
+    reap_deadline = time.monotonic() + _BOOTSTRAP_KILL_REAP_TIMEOUT_SECONDS
+    for process in running:
+        try:
+            process.kill(reap_deadline)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            errors.append(
+                f"worker {process.pid} KILL failed: {type(error).__name__}: {error}"
+            )
+    pending_reap = list(targeted)
+    while pending_reap and time.monotonic() < reap_deadline:
+        still_pending: list[_SpawnedBootstrapWorker] = []
+        for process in pending_reap:
+            process_deadline = min(
+                reap_deadline,
+                time.monotonic() + 5 * _WAITPID_RETRY_SECONDS,
+            )
+            try:
+                process.reap(process_deadline)
+            except TimeoutError:
+                still_pending.append(process)
+            except (OSError, RuntimeError) as error:
+                errors.append(
+                    f"worker {process.pid} reap failed: {type(error).__name__}: {error}"
+                )
+        pending_reap = still_pending
+    for process in pending_reap:
+        errors.append(
+            f"worker {process.pid} reap failed: TimeoutError: "
+            "bootstrap worker reap exceeded its deadline"
+        )
+    if errors:
+        raise RuntimeError("bootstrap worker cleanup failed: " + "; ".join(errors))
+
+
+def _write_bootstrap_worker_inputs(
+    directory: Path,
+    partitions: Sequence[Sequence[tuple[int, pd.DataFrame, str, str, int]]],
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for index, partition in enumerate(partitions):
+        try:
+            payload = pickle.dumps(
+                {
+                    "protocol": _BOOTSTRAP_PROTOCOL,
+                    "workerOrdinal": index,
+                    "tasks": tuple(
+                        {
+                            "index": task[0],
+                            "rows": task[1],
+                            "seedMaterial": task[2],
+                            "ruleId": task[3],
+                            "replicates": task[4],
+                        }
+                        for task in partition
+                    ),
+                },
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"bootstrap worker input serialization failed: {error}"
+            ) from error
+        if len(payload) > _MAX_BOOTSTRAP_PAYLOAD_BYTES:
+            raise RuntimeError(
+                "bootstrap worker input partition exceeds the bounded byte limit"
+            )
+        path = directory / f"worker-{index:02d}.pickle"
+        with path.open("xb") as output_file:
+            output_file.write(payload)
+        paths.append(path)
+    return tuple(paths)
+
+
+def _wait_for_bootstrap_workers(
+    processes: Sequence[_SpawnedBootstrapWorker], deadline: float
+) -> None:
+    pending = list(processes)
+    while pending:
+        pending = [process for process in pending if process.poll(deadline) is None]
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("bootstrap workers exceeded their global timeout")
+        time.sleep(min(0.005, remaining))
+
+
+def _read_bounded_worker_file(path: Path, *, label: str) -> bytes:
+    with path.open("rb") as input_file:
+        payload = input_file.read(_MAX_BOOTSTRAP_RESPONSE_BYTES + 1)
+    if len(payload) > _MAX_BOOTSTRAP_RESPONSE_BYTES:
+        raise RuntimeError(f"bootstrap worker {label} exceeded the byte limit")
+    return payload
+
+
+def _partition_bootstrap_tasks(
+    tasks: Sequence[tuple[int, pd.DataFrame, str, str, int]],
+    worker_count: int,
+) -> tuple[tuple[tuple[int, pd.DataFrame, str, str, int], ...], ...]:
+    weighted: list[
+        tuple[int, int, bytes, tuple[int, pd.DataFrame, str, str, int]]
+    ] = []
+    for task in tasks:
+        index, rows, _, rule_id, _ = task
+        statistical_cost = int(rows["charge_id"].nunique(dropna=False)) + int(
+            rows[["charge_id", "stratum"]].drop_duplicates().shape[0]
+        )
+        weighted.append((statistical_cost, index, rule_id.encode("utf-8"), task))
+    weighted.sort(key=lambda item: (-item[0], item[1], item[2]))
+    loads = [0] * worker_count
+    partitions: list[list[tuple[int, pd.DataFrame, str, str, int]]] = [
+        [] for _ in range(worker_count)
+    ]
+    for cost, _, _, task in weighted:
+        worker = min(range(worker_count), key=lambda item: (loads[item], item))
+        partitions[worker].append(task)
+        loads[worker] += cost
+    return tuple(tuple(partition) for partition in partitions)
+
+
+def _parallel_bootstrap_tasks(
+    tasks: list[tuple[int, pd.DataFrame, str, str, int]],
+    worker_count: int,
+    *,
+    result_size: int | None = None,
+) -> tuple[_BootstrapResponse, ...]:
+    task_snapshot = tuple(tasks)
+    if not task_snapshot:
+        return ()
+    if type(worker_count) is not int or worker_count < 1:
+        raise ValueError("bootstrap worker_count must be a positive integer")
+    worker_count = min(worker_count, len(task_snapshot))
+    expected_items: list[tuple[int, str, int]] = []
+    for task in task_snapshot:
+        if type(task) is not tuple or len(task) != 5:
+            raise RuntimeError("bootstrap submitted task shape is invalid")
+        index, _, _, rule_id, replicates = task
+        if type(index) is not int or index < 0:
+            raise RuntimeError("bootstrap submitted task index range is invalid")
+        if (
+            type(replicates) is not int
+            or not 1 <= replicates <= _UINT64_MAX
+        ):
+            raise RuntimeError(
+                "bootstrap submitted task replicates must be a positive built-in integer"
+            )
+        expected_items.append((index, rule_id, replicates))
+    expected = tuple(expected_items)
+    if result_size is None:
+        result_size = max(index for index, _, _ in expected) + 1
+    _validate_expected_bootstrap_identities(expected, result_size=result_size)
+    partitions = _partition_bootstrap_tasks(task_snapshot, worker_count)
+    processes: list[_SpawnedBootstrapWorker] = []
+    raw_results: list[_BootstrapResponse] = []
+    with tempfile.TemporaryDirectory(prefix="sfep-quality-bootstrap-") as raw_directory:
+        directory = Path(raw_directory)
+        paths = _write_bootstrap_worker_inputs(directory, partitions)
+        try:
+            for ordinal, path in enumerate(paths):
+                processes.append(
+                    _start_bootstrap_worker(
+                        path,
+                        directory / f"worker-{ordinal:02d}.response",
+                        directory / f"worker-{ordinal:02d}.stderr",
+                    )
+                )
+            deadline = time.monotonic() + _BOOTSTRAP_WORKER_TIMEOUT_SECONDS
+            _wait_for_bootstrap_workers(processes, deadline)
+            errors: list[str] = []
+            for ordinal, process in enumerate(processes):
+                error = _read_bounded_worker_file(
+                    process.error_path,
+                    label="stderr",
+                )
+                returncode = process.returncode
+                if returncode != 0:
+                    if returncode is not None and returncode < 0:
+                        status = f"terminated by signal {-returncode}"
+                    else:
+                        status = f"exited with status {returncode}"
+                    detail = error[:4096].decode("utf-8", errors="replace").strip()
+                    errors.append(
+                        f"bootstrap worker {process.pid} {status}"
+                        + (f": {detail}" if detail else "")
+                    )
+                    continue
+                output = _read_bounded_worker_file(
+                    process.output_path,
+                    label="response",
+                )
+                response_ordinal, worker_results = (
+                    _decode_bootstrap_worker_response(output)
+                )
+                if response_ordinal != ordinal:
+                    raise RuntimeError(
+                        "bootstrap worker protocol returned an unexpected worker ordinal"
+                    )
+                partition_expected = tuple(
+                    (task[0], task[3], task[4]) for task in partitions[ordinal]
+                )
+                if tuple(
+                    (response.index, response.rule_id)
+                    for response in worker_results
+                ) != tuple(
+                    (index, rule_id)
+                    for index, rule_id, _ in partition_expected
+                ):
+                    raise RuntimeError(
+                        "bootstrap worker partition identities or order do not match submission"
+                    )
+                raw_results.extend(
+                    _validate_bootstrap_responses(
+                        partition_expected,
+                        worker_results,
+                        result_size=result_size,
+                    )
+                )
+            if errors:
+                raise RuntimeError("; ".join(errors))
+        finally:
+            active_error = sys.exception()
+            try:
+                _cleanup_bootstrap_workers(processes)
+            except BaseException as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(
+                    "bootstrap cleanup also failed without replacing the original error: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+    return _validate_bootstrap_responses(
+        expected,
+        raw_results,
+        result_size=result_size,
+    )
+
+
+def _bootstrap_discovery_metrics(
+    rows: _Rows,
+    candidates: tuple[Candidate, ...],
+    discovery: list[_MetricComputation],
+    bootstrap_seed: BootstrapSeed,
+    config: AnalysisConfig,
+) -> list[_MetricComputation]:
+    replicates = int(config.bootstrap["replicates"])
+    tasks = [
+        (
+            index,
+            _bootstrap_rows(rows, discovery[index]),
+            bootstrap_seed.material,
+            candidate.rule_id,
+            replicates,
+        )
+        for index, candidate in enumerate(candidates)
+        if _bootstrap_applicable(discovery[index].metric, config)
+    ]
+    expected = tuple((task[0], task[3], task[4]) for task in tasks)
+    _validate_expected_bootstrap_identities(
+        expected,
+        result_size=len(discovery),
+    )
+    worker_count = min(
+        len(tasks),
+        _MAX_BOOTSTRAP_WORKERS,
+        os.cpu_count() or 1,
+    )
+    if len(tasks) >= _PARALLEL_BOOTSTRAP_MINIMUM and worker_count > 1:
+        responses = _parallel_bootstrap_tasks(
+            tasks,
+            worker_count,
+            result_size=len(discovery),
+        )
+    else:
+        responses = tuple(_bootstrap_task(task) for task in tasks)
+    validated = _validate_bootstrap_responses(
+        expected,
+        responses,
+        result_size=len(discovery),
+    )
+
+    result = list(discovery)
+    for response in validated:
+        computation = result[response.index]
+        metric = computation.metric
+        result[response.index] = replace(
+            computation,
+            metric=replace(
+                metric,
+                relative_risk_ci_lower=response.interval.lower,
+                relative_risk_ci_upper=response.interval.upper,
+                reason_code=(
+                    response.interval.reason_code
+                    if metric.reason_code == "NONE"
+                    else metric.reason_code
+                ),
+            ),
+        )
+    return result
+
+
+def _grade(
+    candidate: Candidate,
+    discovery: QualityMetric,
+    confirmation: QualityMetric,
+    config: AnalysisConfig,
+) -> tuple[str, QualityMetric]:
+    if _metric_is_insufficient(discovery) or _metric_is_insufficient(confirmation):
+        return "INSUFFICIENT_EVIDENCE", confirmation
+    caution = _discovery_caution_pass(discovery, config)
+    danger = (
+        _discovery_danger_prebootstrap(discovery, config)
+        and discovery.relative_risk_ci_lower is not None
+        and discovery.relative_risk_ci_lower > 1.0
+    )
+    confirmation_caution = _confirmation_caution_pass(confirmation, config)
+    confirmation_danger = _confirmation_danger_pass(confirmation, config)
+    if (
+        danger
+        and confirmation_danger
+        and candidate.adjustment_kind == "STRATIFIED"
+    ):
+        return "DANGER", confirmation
+    if (caution or danger) and confirmation_caution:
+        return "CAUTION", confirmation
+    if caution or danger:
+        return "UNCONFIRMED", replace(
+            confirmation, reason_code="DIRECTION_NOT_REPEATED"
+        )
+    return "NORMAL", confirmation
+
+
+def _annotate_display_merges(rules: list[QualityRule]) -> list[QualityRule]:
+    grouped: dict[tuple[object, ...], list[int]] = {}
+    for index, rule in enumerate(rules):
+        candidate = rule.candidate
+        if candidate.analysis_family != "NUMERIC":
+            continue
+        grouped.setdefault(
+            (
+                candidate.field_names,
+                candidate.first_available_stage,
+                candidate.equipment_type,
+                candidate.application_scope,
+                candidate.equipment_id,
+                canonical_json_bytes(dict(candidate.application_context)),
+                candidate.adjustment_level,
+                candidate.adjustment_fields_dropped,
+                candidate.adjustment_kind,
+                rule.grade,
+            ),
+            [],
+        ).append(index)
+    result = list(rules)
+    for indexes in grouped.values():
+        indexes.sort(
+            key=lambda index: (
+                float(result[index].candidate.predicate[0].lower),
+                float(result[index].candidate.predicate[0].upper),
+            )
+        )
+        run: list[int] = []
+        for index in indexes:
+            if not run:
+                run = [index]
+                continue
+            previous = result[run[-1]].candidate.predicate[0]
+            current = result[index].candidate.predicate[0]
+            if (
+                previous.upper == current.lower
+                and previous.upper_inclusive is True
+                and current.lower_inclusive is False
+            ):
+                run.append(index)
+                continue
+            if len(run) >= 2:
+                merge_ids = tuple(
+                    sorted(
+                        (result[item].candidate.rule_id for item in run),
+                        key=lambda value: value.encode("utf-8"),
+                    )
+                )
+                for item in run:
+                    result[item] = replace(
+                        result[item], display_merge_rule_ids=merge_ids
+                    )
+            run = [index]
+        if len(run) >= 2:
+            merge_ids = tuple(
+                sorted(
+                    (result[item].candidate.rule_id for item in run),
+                    key=lambda value: value.encode("utf-8"),
+                )
+            )
+            for item in run:
+                result[item] = replace(result[item], display_merge_rule_ids=merge_ids)
+    return result
+
+
+@dataclass(frozen=True)
+class _QualityCoreItem:
+    rule: QualityRule
+    discovery: _MetricComputation
+    confirmation: _MetricComputation
+
+
+def _build_quality_rules_core_with_seed(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    bootstrap_seed: BootstrapSeed,
+) -> tuple[_QualityCoreItem, ...]:
+    if type(bootstrap_seed) is not BootstrapSeed:
+        raise TypeError("bootstrap_seed must be an exact BootstrapSeed")
+    wanted = _definition_surface(definitions, config)
+    discovery_rows = _snapshot_rows(split.discovery_rows)
+    confirmation_rows = _snapshot_rows(split.confirmation_rows)
+    candidates = _generate_candidates(discovery_rows, wanted, config)
+    common_bands = candidates[0].band_boundaries if candidates else {}
+    discovery_cache = _StrataCache(discovery_rows, common_bands)
+    confirmation_cache = _StrataCache(confirmation_rows, common_bands)
+    discovery = [
+        _metric(
+            discovery_rows,
+            candidate,
+            config,
+            confirmation=False,
+            strata_cache=discovery_cache,
+        )
+        for candidate in candidates
+    ]
+    for family in config.fdr_families:
+        indexes = [index for index, candidate in enumerate(candidates) if candidate.analysis_family == family]
+        adjusted = benjamini_hochberg(
+            [
+                1.0
+                if discovery[index].metric.p_value is None
+                else discovery[index].metric.p_value
+                for index in indexes
+            ]
+        )
+        for index, q_value in zip(indexes, adjusted, strict=True):
+            discovery[index] = replace(
+                discovery[index],
+                metric=replace(discovery[index].metric, q_value=q_value),
+            )
+    discovery = _bootstrap_discovery_metrics(
+        discovery_rows,
+        candidates,
+        discovery,
+        bootstrap_seed,
+        config,
+    )
+
+    rules: list[QualityRule] = []
+    confirmation_computations: list[_MetricComputation] = []
+    for index, candidate in enumerate(candidates):
+        confirmation = _metric(
+            confirmation_rows,
+            candidate,
+            config,
+            confirmation=True,
+            strata_cache=confirmation_cache,
+        )
+        grade, confirmation_metric = _grade(
+            candidate, discovery[index].metric, confirmation.metric, config
+        )
+        confirmation = replace(confirmation, metric=confirmation_metric)
+        confirmation_computations.append(confirmation)
+        rules.append(
+            QualityRule(
+                candidate,
+                discovery[index].metric,
+                confirmation.metric,
+                grade,
+            )
+        )
+    rules = _annotate_display_merges(rules)
+    return tuple(
+        _QualityCoreItem(rule, discovery[index], confirmation_computations[index])
+        for index, rule in enumerate(rules)
+    )
+
+
+def _build_quality_rules_core(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+) -> tuple[_QualityCoreItem, ...]:
+    criteria = _validate_criteria_id(criteria_id)
+    return _build_quality_rules_core_with_seed(
+        split,
+        definitions,
+        config,
+        BootstrapSeed(
+            "LEGACY_CRITERIA_ID_UTF8_V1",
+            criteria,
+            ("identity.criteria_id",),
+        ),
+    )
+
+
+def build_quality_rules(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+) -> list[dict[str, object]]:
+    """Build the byte-compatible legacy quality-rule wire records."""
+    return [
+        item.rule.to_wire()
+        for item in _build_quality_rules_core(
+            split, definitions, config, criteria_id
+        )
+    ]
+
+
+def _quality_split_sidecar(
+    candidate: Candidate,
+    computation: _MetricComputation,
+    material_keys: tuple[str, ...],
+) -> QualitySplitSidecar:
+    projected_bands = {
+        field: candidate.band_boundaries[field]
+        for field in candidate.adjustment_fields
+        if field.endswith("_band")
+    }
+    candidate_material_keys = tuple(
+        sorted(
+            (material_keys[position] for position in computation.candidate_positions),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    return QualitySplitSidecar(
+        candidate.adjustment_fields,
+        projected_bands,
+        computation.informative_stratum_keys,
+        candidate.discovery_weights,
+        candidate_material_keys,
+        computation.comparator_counts_by_stratum,
+    )
+
+
+def build_quality_rules_result(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    criteria_id: str,
+    *,
+    material_catalog: Sequence[MaterialLineage],
+) -> QualityRulesResult:
+    """Build quality wire records plus exact fixed statistical input sidecars."""
+    catalog = _MaterialCatalogIndex(material_catalog)
+    discovery_material_keys = catalog.resolve_rows(
+        split.discovery_rows, "quality discovery"
+    )
+    confirmation_material_keys = catalog.resolve_rows(
+        split.confirmation_rows, "quality confirmation"
+    )
+    if set(discovery_material_keys) & set(confirmation_material_keys):
+        raise ValueError("quality discovery/confirmation material identity overlap")
+    items = _build_quality_rules_core(split, definitions, config, criteria_id)
+    records = tuple(item.rule.to_wire() for item in items)
+    sidecars = tuple(
+        QualityRuleSidecar(
+            item.rule.candidate.rule_id,
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.discovery,
+                discovery_material_keys,
+            ),
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.confirmation,
+                confirmation_material_keys,
+            ),
+        )
+        for item in items
+    )
+    return QualityRulesResult(records, sidecars)
+
+
+def build_quality_rules_result_with_seed(
+    split: TimeSplitResult,
+    definitions: Sequence[FeatureDefinition],
+    config: AnalysisConfig,
+    bootstrap_seed: BootstrapSeed,
+    *,
+    material_catalog: Sequence[MaterialLineage],
+) -> QualityRulesResult:
+    """Build rich quality results from one resolved bootstrap seed."""
+    catalog = _MaterialCatalogIndex(material_catalog)
+    discovery_material_keys = catalog.resolve_rows(
+        split.discovery_rows, "quality discovery"
+    )
+    confirmation_material_keys = catalog.resolve_rows(
+        split.confirmation_rows, "quality confirmation"
+    )
+    if set(discovery_material_keys) & set(confirmation_material_keys):
+        raise ValueError("quality discovery/confirmation material identity overlap")
+    items = _build_quality_rules_core_with_seed(
+        split, definitions, config, bootstrap_seed
+    )
+    records = tuple(item.rule.to_wire() for item in items)
+    sidecars = tuple(
+        QualityRuleSidecar(
+            item.rule.candidate.rule_id,
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.discovery,
+                discovery_material_keys,
+            ),
+            _quality_split_sidecar(
+                item.rule.candidate,
+                item.confirmation,
+                confirmation_material_keys,
+            ),
+        )
+        for item in items
+    )
+    return QualityRulesResult(records, sidecars)
+
+
+def _module_main(arguments: Sequence[str] | None = None) -> int:
+    argv = tuple(sys.argv[1:] if arguments is None else arguments)
+    if len(argv) == 2 and argv[0] == _BOOTSTRAP_WORKER_ARGUMENT:
+        return _bootstrap_worker_main(Path(argv[1]))
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(_module_main())

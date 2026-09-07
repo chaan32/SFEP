@@ -1,0 +1,672 @@
+"""Independent RECORD-backed runtime fixtures for verifier tests."""
+
+from __future__ import annotations
+
+import base64
+import copy
+import csv
+from dataclasses import dataclass, replace
+from email.message import Message
+import hashlib
+import io
+from importlib.metadata import Distribution
+import json
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+from typing import Callable, Iterable, Mapping
+import zipfile
+
+from equipment_quality.deterministic import canonical_json_bytes
+from equipment_quality.runtime_verify import RuntimeEnvironment, RuntimeImportOrigin
+
+
+PACKAGE_SPECS = (
+    ("attrs", "25.3.0", False),
+    ("jsonschema", "4.24.0", True),
+    ("jsonschema-specifications", "2025.4.1", False),
+    ("numpy", "2.2.6", True),
+    ("pandas", "2.3.0", True),
+    ("python-dateutil", "2.9.0.post0", False),
+    ("pytz", "2025.2", False),
+    ("referencing", "0.36.2", False),
+    ("rpds-py", "0.25.1", False),
+    ("six", "1.17.0", False),
+    ("typing-extensions", "4.14.0", False),
+    ("tzdata", "2025.2", False),
+)
+PRODUCER_NAME = "sfep-equipment-quality"
+PRODUCER_VERSION = "1.1.0"
+PIP_VERSION = "25.1.1"
+SOURCE_DATE_EPOCH = "1735689600"
+PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
+HASH_SEED_PROBES = (-4218979432691865272, 1379760580859628941)
+IMPORT_ROOTS = {
+    "attrs": ("attr", "attrs"),
+    "jsonschema": ("jsonschema",),
+    "jsonschema-specifications": ("jsonschema_specifications",),
+    "numpy": ("numpy",),
+    "pandas": ("pandas",),
+    "python-dateutil": ("dateutil",),
+    "pytz": ("pytz",),
+    "referencing": ("referencing",),
+    "rpds-py": ("rpds",),
+    "six": ("six",),
+    "typing-extensions": ("typing_extensions",),
+    "tzdata": ("tzdata",),
+    PRODUCER_NAME: ("equipment_quality",),
+}
+MODULE_IMPORT_ROOTS = frozenset({"six", "typing_extensions"})
+
+
+def sha256_uri(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def record_hash(data: bytes) -> str:
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
+    return "sha256=" + digest.decode("ascii")
+
+
+def _distribution_stem(name: str) -> str:
+    return name.replace("-", "_").replace(".", "_")
+
+
+class FakeDistribution(Distribution):
+    """A real-filesystem Distribution adapter with an editable RECORD."""
+
+    def __init__(
+        self,
+        root: Path,
+        name: str,
+        version: str,
+        *,
+        payload_files: Mapping[str, bytes] | None = None,
+        direct_url_bytes: bytes = b'{"url":"file:///build/source"}\n',
+        import_roots: tuple[str, ...] | None = None,
+    ) -> None:
+        self.root = root
+        self._name = name
+        self._version = version
+        self._on_record_read: Callable[[], None] | None = None
+        self._record_read_count = 0
+        stem = _distribution_stem(name)
+        self.dist_info = f"{stem}-{version}.dist-info"
+        roots = (stem,) if import_roots is None else import_roots
+        root_files = {
+            (
+                f"{root}.py"
+                if root in MODULE_IMPORT_ROOTS
+                else f"{root}/__init__.py"
+            ): f"# installed {name} {version}\nVALUE = {name!r}\n".encode("utf-8")
+            for root in roots
+        }
+        default_files = {
+            **root_files,
+            f"{self.dist_info}/METADATA": (
+                f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n\n"
+            ).encode("utf-8"),
+            f"{self.dist_info}/INSTALLER": b"pip\n",
+            f"{self.dist_info}/direct_url.json": direct_url_bytes,
+            f"{self.dist_info}/REQUESTED": b"",
+            "../../../bin/" + stem: b"#!/bin/sh\n",
+        }
+        if payload_files:
+            default_files.update(payload_files)
+        self._rows: list[list[str]] = []
+        for relative_path, data in default_files.items():
+            self._write_path(relative_path, data)
+            self._rows.append(
+                [relative_path, record_hash(data), str(len(data))]
+            )
+        self._rows.append([f"{self.dist_info}/RECORD", "", ""])
+        self._write_record()
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    @property
+    def metadata(self) -> Message:
+        metadata = Message()
+        metadata["Name"] = self._name
+        metadata["Version"] = self._version
+        return metadata
+
+    @property
+    def record_read_count(self) -> int:
+        return self._record_read_count
+
+    def set_record_read_callback(self, callback: Callable[[], None] | None) -> None:
+        self._on_record_read = callback
+
+    def set_name(self, name: str) -> None:
+        self._name = name
+
+    def set_version(self, version: str) -> None:
+        self._version = version
+
+    def locate_file(self, path: str | PurePosixPath) -> Path:
+        return self.root.joinpath(*PurePosixPath(str(path)).parts)
+
+    def read_text(self, filename: str) -> str | None:
+        target = self.locate_file(PurePosixPath(self.dist_info) / filename)
+        if not target.is_file():
+            return None
+        value = target.read_text(encoding="utf-8")
+        if filename == "RECORD":
+            self._record_read_count += 1
+            callback = self._on_record_read
+            if callback is not None:
+                self._on_record_read = None
+                callback()
+        return value
+
+    def rows(self) -> list[list[str]]:
+        return copy.deepcopy(self._rows)
+
+    def replace_rows(self, rows: Iterable[Iterable[str]]) -> None:
+        self._rows = [list(row) for row in rows]
+        self._write_record()
+
+    def add_row(self, path: str, hash_value: str, size: str) -> None:
+        self._rows.insert(-1, [path, hash_value, size])
+        self._write_record()
+
+    def remove_record_path(self, path: str, *, unlink: bool = False) -> None:
+        self._rows = [row for row in self._rows if row[0] != path]
+        if unlink:
+            target = self.locate_file(path)
+            if target.exists() or target.is_symlink():
+                target.unlink()
+        self._write_record()
+
+    def replace_file(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        refresh_record: bool = True,
+    ) -> None:
+        self._write_path(path, data)
+        if refresh_record:
+            matched = False
+            for row in self._rows:
+                if row[0] == path:
+                    row[1:] = [record_hash(data), str(len(data))]
+                    matched = True
+            if not matched:
+                self._rows.insert(-1, [path, record_hash(data), str(len(data))])
+            self._write_record()
+
+    def make_symlink(self, path: str, target: Path) -> None:
+        link = self.locate_file(path)
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+
+    def remove_record_file(self) -> None:
+        self.locate_file(PurePosixPath(self.dist_info) / "RECORD").unlink()
+
+    def _write_path(self, path: str, data: bytes) -> None:
+        target = self.locate_file(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    def _write_record(self) -> None:
+        target = self.locate_file(PurePosixPath(self.dist_info) / "RECORD")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerows(self._rows)
+        target.write_text(buffer.getvalue(), encoding="utf-8", newline="")
+
+
+def _tree_excluded(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    if ".." in parts:
+        return True
+    if "__pycache__" in parts or path.endswith(".pyc"):
+        return True
+    if len(parts) >= 2 and parts[-2].endswith(".dist-info"):
+        return parts[-1] in {
+            "RECORD",
+            "INSTALLER",
+            "direct_url.json",
+            "REQUESTED",
+        }
+    return False
+
+
+def independent_tree_preimage(distribution: FakeDistribution) -> bytes:
+    """Compute the fixture oracle without calling production tree code."""
+    lines: list[tuple[bytes, bytes]] = []
+    for path, _record_digest, _record_size in distribution.rows():
+        if _tree_excluded(path):
+            continue
+        target = distribution.locate_file(path)
+        if not target.is_file():
+            continue
+        relative = path.encode("utf-8")
+        line = (
+            relative
+            + b"=sha256:"
+            + hashlib.sha256(target.read_bytes()).hexdigest().encode("ascii")
+            + b"\n"
+        )
+        lines.append((relative, line))
+    return b"".join(line for _path, line in sorted(lines, key=lambda item: item[0]))
+
+
+def independent_installed_code_tree(distribution: FakeDistribution) -> str:
+    return sha256_uri(independent_tree_preimage(distribution))
+
+
+@dataclass
+class RuntimeFixture:
+    root: Path
+    manifest_path: Path
+    manifest: dict[str, object]
+    environment: RuntimeEnvironment
+    distributions: dict[str, FakeDistribution]
+    provenance: dict[str, object]
+
+    def write_manifest(self) -> bytes:
+        payload = canonical_json_bytes(self.manifest)
+        self.manifest_path.write_bytes(payload)
+        return payload
+
+    def set_manifest_bytes(self, payload: bytes) -> None:
+        self.manifest_path.write_bytes(payload)
+
+    def replace_environment(self, **changes: object) -> RuntimeEnvironment:
+        self.environment = replace(self.environment, **changes)
+        return self.environment
+
+    def refresh_tree(self, distribution_name: str) -> str:
+        distribution = self.distributions[distribution_name]
+        digest = independent_installed_code_tree(distribution)
+        if distribution_name == PRODUCER_NAME:
+            producer = self.manifest["producer"]
+            assert isinstance(producer, dict)
+            producer["installedCodeTreeSha256"] = digest
+        else:
+            packages = self.manifest["packages"]
+            assert isinstance(packages, list)
+            for package in packages:
+                assert isinstance(package, dict)
+                if package["name"] == distribution_name:
+                    package["installedCodeTreeSha256"] = digest
+                    break
+        self.write_manifest()
+        return digest
+
+    def write_provenance(self, value: object) -> bytes:
+        payload = canonical_json_bytes(value)
+        producer = self.distributions[PRODUCER_NAME]
+        producer.replace_file(PROVENANCE_PATH, payload)
+        self.refresh_tree(PRODUCER_NAME)
+        return payload
+
+
+def _wheel_sha(name: str) -> str:
+    return sha256_uri(("wheel:" + name).encode("utf-8"))
+
+
+def _lock_sha(name: str) -> str:
+    return sha256_uri(("lock:" + name).encode("utf-8"))
+
+
+def build_runtime_fixture(
+    root: Path,
+    *,
+    direct_url_bytes: bytes = b'{"url":"file:///build/source"}\n',
+) -> RuntimeFixture:
+    runtime_root = root / "runtime"
+    executable = runtime_root / "bin/python"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"SFEP CPython 3.12.10 fixture\n")
+
+    requirements_sha = _lock_sha("requirements")
+    source_sha = sha256_uri(b"producer source tree")
+    provenance: dict[str, object] = {
+        "schemaVersion": "sfep-producer-provenance/v1",
+        "producerName": "equipment-quality",
+        "distributionName": PRODUCER_NAME,
+        "version": PRODUCER_VERSION,
+        "sourceSha256": source_sha,
+        "sourceDateEpoch": SOURCE_DATE_EPOCH,
+        "requirementsLockSha256": requirements_sha,
+    }
+
+    distributions: dict[str, FakeDistribution] = {}
+    for name, version, _direct in PACKAGE_SPECS:
+        payload_files = None
+        if name == "numpy":
+            payload_files = {
+                "numpy/_core/__init__.py": b"# installed numpy core\n",
+                "numpy/_core/_multiarray_umath.cpython-312-darwin.so": (
+                    b"fixture extension module"
+                ),
+            }
+        distributions[name] = FakeDistribution(
+            runtime_root / "distributions" / _distribution_stem(name)
+            / "lib/python3.12/site-packages",
+            name,
+            version,
+            payload_files=payload_files,
+            direct_url_bytes=direct_url_bytes,
+            import_roots=IMPORT_ROOTS[name],
+        )
+    distributions["pip"] = FakeDistribution(
+        runtime_root / "distributions/pip/lib/python3.12/site-packages",
+        "pip",
+        PIP_VERSION,
+        direct_url_bytes=direct_url_bytes,
+    )
+    distributions[PRODUCER_NAME] = FakeDistribution(
+        runtime_root / "distributions/producer/lib/python3.12/site-packages",
+        PRODUCER_NAME,
+        PRODUCER_VERSION,
+        payload_files={
+            "equipment_quality/__init__.py": b'__version__ = "1.1.0"\n',
+            PROVENANCE_PATH: canonical_json_bytes(provenance),
+        },
+        direct_url_bytes=direct_url_bytes,
+        import_roots=IMPORT_ROOTS[PRODUCER_NAME],
+    )
+
+    packages: list[dict[str, object]] = []
+    for name, version, direct in PACKAGE_SPECS:
+        packages.append({
+            "name": name,
+            "version": version,
+            "direct": direct,
+            "wheelFilename": f"{_distribution_stem(name)}-{version}-py3-none-any.whl",
+            "wheelTag": "py3-none-any",
+            "wheelSha256": _wheel_sha(name),
+            "installedCodeTreeSha256": independent_installed_code_tree(
+                distributions[name]
+            ),
+        })
+
+    producer_distribution = distributions[PRODUCER_NAME]
+    manifest: dict[str, object] = {
+        "schemaVersion": "sfep-producer-runtime/v1",
+        "platform": {
+            "system": "Darwin",
+            "machine": "arm64",
+            "macosProductVersion": "15.6.1",
+            "sysconfigPlatform": "macosx-11.0-arm64",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.10",
+            "build": "main Apr 10 2025 22:19:24",
+            "cacheTag": "cpython-312",
+            "soabi": "cpython-312-darwin",
+            "executableSha256": sha256_uri(executable.read_bytes()),
+        },
+        "pipVersion": PIP_VERSION,
+        "locks": {
+            "pyproject": _lock_sha("pyproject"),
+            "bootstrap": _lock_sha("bootstrap"),
+            "buildRequirements": _lock_sha("build-requirements"),
+            "requirements": requirements_sha,
+            "wheelhouse": _lock_sha("wheelhouse"),
+            "producer": _lock_sha("producer"),
+        },
+        "packages": packages,
+        "producer": {
+            "name": "equipment-quality",
+            "version": PRODUCER_VERSION,
+            "wheelFilename": (
+                "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+            ),
+            "wheelSha256": _wheel_sha(PRODUCER_NAME),
+            "installedCodeTreeSha256": independent_installed_code_tree(
+                producer_distribution
+            ),
+            "sourceSha256": source_sha,
+        },
+        "environmentPolicy": {
+            "pythonHashSeed": "0",
+            "timezone": "Asia/Seoul",
+            "localeIndependentParsing": True,
+            "floatPolicy": "IEEE754_BINARY64_FINITE",
+        },
+    }
+    resolved_imports: list[RuntimeImportOrigin] = []
+    loaded_imports: list[RuntimeImportOrigin] = []
+    for distribution_name, roots in IMPORT_ROOTS.items():
+        distribution = distributions[distribution_name]
+        for root_name in roots:
+            is_module = root_name in MODULE_IMPORT_ROOTS
+            origin = distribution.locate_file(
+                f"{root_name}.py" if is_module else f"{root_name}/__init__.py"
+            )
+            package_locations = (
+                () if is_module else (distribution.locate_file(root_name),)
+            )
+            resolved_imports.append(RuntimeImportOrigin(
+                name=root_name,
+                origin=origin,
+                module_file=None,
+                package_locations=package_locations,
+                module_package_locations=(),
+                loader_module="_frozen_importlib_external",
+            ))
+            loaded_imports.append(RuntimeImportOrigin(
+                name=root_name,
+                origin=origin,
+                module_file=origin,
+                package_locations=package_locations,
+                module_package_locations=package_locations,
+                loader_module="_frozen_importlib_external",
+            ))
+    numpy_distribution = distributions["numpy"]
+    numpy_extension = numpy_distribution.locate_file(
+        "numpy/_core/_multiarray_umath.cpython-312-darwin.so"
+    )
+    loaded_imports.extend((
+        RuntimeImportOrigin(
+            name="numpy._core._multiarray_umath",
+            origin=numpy_extension,
+            module_file=numpy_extension,
+            package_locations=(),
+            module_package_locations=(),
+            loader_module="_frozen_importlib_external",
+        ),
+        RuntimeImportOrigin(
+            name="six.moves",
+            origin=None,
+            module_file=None,
+            package_locations=(),
+            module_package_locations=(),
+            loader_module="six",
+        ),
+    ))
+    environment = RuntimeEnvironment(
+        executable=executable,
+        platform_system="Darwin",
+        platform_machine="arm64",
+        macos_product_version="15.6.1",
+        sysconfig_platform="macosx-11.0-arm64",
+        python_implementation="CPython",
+        python_version="3.12.10",
+        python_build="main Apr 10 2025 22:19:24",
+        python_cache_tag="cpython-312",
+        python_soabi="cpython-312-darwin",
+        python_hash_seed="0",
+        timezone="Asia/Seoul",
+        python_dont_write_bytecode=True,
+        distributions=tuple(reversed(tuple(distributions.values()))),
+        python_hash_probes=HASH_SEED_PROBES,
+        resolved_imports=tuple(sorted(resolved_imports, key=lambda item: item.name)),
+        loaded_imports=tuple(sorted(loaded_imports, key=lambda item: item.name)),
+    )
+    manifest_path = root / "producer_runtime.json"
+    fixture = RuntimeFixture(
+        root=root,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        environment=environment,
+        distributions=distributions,
+        provenance=provenance,
+    )
+    fixture.write_manifest()
+    return fixture
+
+
+def source_tree_bytes(source_root: Path) -> dict[str, bytes]:
+    """Snapshot the producer inputs with a test-side inventory implementation."""
+    paths = [source_root / "pyproject.toml"]
+    paths.extend((source_root / "equipment_quality").rglob("*"))
+    snapshot: dict[str, bytes] = {}
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source_root).as_posix()
+        parts = PurePosixPath(relative).parts
+        if "__pycache__" in parts:
+            continue
+        if relative.endswith((".pyc", ".pyo")):
+            continue
+        snapshot[relative] = path.read_bytes()
+    return snapshot
+
+
+def independent_source_preimage(source_root: Path) -> bytes:
+    """Build the frozen source preimage without production helper code."""
+    lines = [b"sfep-source-lines/v1\n"]
+    included = {
+        relative: payload
+        for relative, payload in source_tree_bytes(source_root).items()
+        if relative != PROVENANCE_PATH
+    }
+    for relative, payload in sorted(
+        included.items(),
+        key=lambda item: item[0].encode("utf-8"),
+    ):
+        lines.append(
+            relative.encode("utf-8")
+            + b"=sha256:"
+            + hashlib.sha256(payload).hexdigest().encode("ascii")
+            + b"\n"
+        )
+    return b"".join(lines)
+
+
+def independent_source_digest(source_root: Path) -> str:
+    return sha256_uri(independent_source_preimage(source_root))
+
+
+def independently_expected_provenance(source_root: Path) -> bytes:
+    """Render the seven-field provenance using only test-side primitives."""
+    value = {
+        "schemaVersion": "sfep-producer-provenance/v1",
+        "producerName": "equipment-quality",
+        "distributionName": PRODUCER_NAME,
+        "version": PRODUCER_VERSION,
+        "sourceSha256": independent_source_digest(source_root),
+        "sourceDateEpoch": SOURCE_DATE_EPOCH,
+        "requirementsLockSha256": sha256_uri(
+            (source_root / "requirements.lock").read_bytes()
+        ),
+    }
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def wheel_resource(wheel: Path, member: str) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(wheel.read_bytes())) as archive:
+        matches = [info for info in archive.infolist() if info.orig_filename == member]
+        if len(matches) != 1:
+            raise AssertionError(f"expected one {member!r}, found {len(matches)}")
+        return archive.read(matches[0])
+
+
+def prepare_producer_work_root(work_root: Path) -> Path:
+    """Provision the caller-owned directory layout required by the producer."""
+    work_root.mkdir()
+    (work_root / "wheel-a").mkdir()
+    (work_root / "wheel-b").mkdir()
+    return work_root
+
+
+def run_producer_build(
+    source_root: Path,
+    build_python: Path,
+    work_root: Path,
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    tool = source_root / "tools/build_producer.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--source-root",
+            str(source_root),
+            "--build-python",
+            str(build_python),
+            "--work-root",
+            str(work_root),
+        ],
+        cwd=cwd,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_build_seal(
+    source_root: Path,
+    wheel_dir_a: Path,
+    wheel_dir_b: Path,
+    wheelhouse: Path,
+    producer_lock: Path,
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    tool = source_root / "tools/seal_producer_build.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--source-root",
+            str(source_root),
+            "--wheel-dir-a",
+            str(wheel_dir_a),
+            "--wheel-dir-b",
+            str(wheel_dir_b),
+            "--wheelhouse",
+            str(wheelhouse),
+            "--producer-lock",
+            str(producer_lock),
+        ],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def two_wheels(
+    root: Path,
+    first_payload: bytes,
+    second_payload: bytes | None = None,
+) -> tuple[Path, Path]:
+    filename = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+    wheel_a = root / "wheel-a" / filename
+    wheel_b = root / "wheel-b" / filename
+    wheel_a.parent.mkdir(parents=True)
+    wheel_b.parent.mkdir(parents=True)
+    wheel_a.write_bytes(first_payload)
+    wheel_b.write_bytes(first_payload if second_payload is None else second_payload)
+    return wheel_a, wheel_b
