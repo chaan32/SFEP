@@ -13,6 +13,15 @@ import pandas as pd
 from equipment_quality.bundle_contract import BundleContract, V1_CONTRACT
 
 
+MODEL_ID_NAMESPACE = "sfep-quality-model-id/v1"
+MODEL_BUNDLE_ID_FIELDS = frozenset({
+    "model_id",
+    "quality_model_sha256",
+    "quality_model_metadata_sha256",
+    "schema.quality_model_metadata.sha256",
+})
+
+
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
@@ -119,6 +128,7 @@ class Identity:
         if type(self.version) is not str or self.version not in {
             "sfep-criteria-id/v1",
             "sfep-bundle-id/v1",
+            MODEL_ID_NAMESPACE,
         }:
             raise ValueError("identity version must be a supported built-in string")
         items = _mapping_items(self.fields, "identity fields")
@@ -160,13 +170,16 @@ class Identity:
             "source.sm_cc.sha256",
             "source.sm_cc.size_bytes",
         }
-        expected_keys = (
-            criteria_keys if self.version == "sfep-criteria-id/v1" else bundle_keys
-        )
-        if set(fields) != expected_keys:
+        if self.version == MODEL_ID_NAMESPACE:
+            allowed_keys = ({"metadata_sha256"},)
+        elif self.version == "sfep-criteria-id/v1":
+            allowed_keys = (criteria_keys,)
+        else:
+            allowed_keys = (bundle_keys, bundle_keys | MODEL_BUNDLE_ID_FIELDS)
+        if set(fields) not in allowed_keys:
             raise ValueError("identity fields do not match the version contract")
         for key, field_value in fields.items():
-            if key.endswith("_sha256") or key.endswith(".sha256") or key == "criteria_id":
+            if key.endswith(("_sha256", ".sha256")) or key in {"criteria_id", "model_id"}:
                 _validate_sha256_uri(field_value, f"identity field {key}")
         if self.version == "sfep-criteria-id/v1":
             try:
@@ -175,7 +188,7 @@ class Identity:
                 raise ValueError("identity as_of must be an exact date") from error
             if parsed_as_of.isoformat() != fields["as_of"]:
                 raise ValueError("identity as_of must be an exact date")
-        else:
+        elif self.version == "sfep-bundle-id/v1":
             fixed_names = {
                 "source.sm_cc.name": "sts_1sm_cc_1.csv",
                 "source.fur_hr.name": "sts_2fur_hr_2.csv",
@@ -711,11 +724,14 @@ def resolve_bootstrap_seed(
             _validate_sha256_uri(criteria_id, "criteria_id"),
             ("identity.criteria_id",),
         )
-    if version_pair == ("sfep-analysis-config/v2", "quality-analysis-v2"):
+    if version_pair in {
+        ("sfep-analysis-config/v2", "quality-analysis-v2"),
+        ("sfep-analysis-config/v3", "quality-analysis-v3"),
+    }:
         protocol = config.bootstrap.get("seedProtocol")
         material = config.bootstrap.get("seedMaterial")
         if protocol != "LEGACY_CRITERIA_ID_UTF8_V1":
-            raise ValueError("v2 bootstrap seed protocol is not supported")
+            raise ValueError("configured bootstrap seed protocol is not supported")
         return BootstrapSeed(
             protocol,
             _validate_sha256_uri(material, "config.bootstrap.seedMaterial"),
@@ -842,17 +858,8 @@ class SummaryBuildRequest:
                 "analysis_config bytes do not match the frozen AnalysisConfig"
             )
         schema_items = _mapping_items(self.schema_digests, "summary schema digests")
-        expected_schema_roles = {
-            "bundle_manifest",
-            "analysis_config",
-            "producer_runtime",
-            "equipment_operating_ranges",
-            "quality_risk_intervals",
-            "analysis_summary",
-            "replay_events",
-        }
-        if {key for key, _ in schema_items} != expected_schema_roles:
-            raise ValueError("summary schema roles must be the exact seven roles")
+        if {key for key, _ in schema_items} != self.contract.schema_resources.keys():
+            raise ValueError("summary schema roles must match the contract")
         schemas: dict[str, str] = {}
         for key, value in schema_items:
             schemas[key] = _validate_sha256_uri(value, f"summary schema digest {key}")
@@ -999,6 +1006,8 @@ class BundleWriteRequest:
     label_maturity_days: int
     manifest_version: str = "sfep-equipment-bundle/v1"
     contract: BundleContract = V1_CONTRACT
+    quality_model: bytes | None = None
+    quality_model_metadata: bytes | None = None
 
     def __post_init__(self) -> None:
         from equipment_quality.deterministic import id_lines, sha256_uri
@@ -1010,6 +1019,14 @@ class BundleWriteRequest:
             raise TypeError("manifest version must be a built-in string")
         if self.manifest_version != self.contract.manifest_version:
             raise ValueError("manifest version does not match the contract")
+        has_model = "quality_model" in self.contract.artifact_versions
+        if has_model:
+            if any(type(blob) is not bytes or not blob for blob in (
+                self.quality_model, self.quality_model_metadata,
+            )):
+                raise ValueError("v3 requires both model artifacts as non-empty bytes")
+        elif self.quality_model is not None or self.quality_model_metadata is not None:
+            raise ValueError("this bundle contract does not allow model artifacts")
 
         if not isinstance(self.output_root, Path):
             raise TypeError("output_root must be a pathlib Path")
@@ -1064,17 +1081,8 @@ class BundleWriteRequest:
             raise TypeError("source descriptors must use exact built-in field types")
 
         schema_items = _mapping_items(self.schema_digests, "bundle schema digests")
-        expected_schema_roles = {
-            "bundle_manifest",
-            "analysis_config",
-            "producer_runtime",
-            "equipment_operating_ranges",
-            "quality_risk_intervals",
-            "analysis_summary",
-            "replay_events",
-        }
-        if {key for key, _ in schema_items} != expected_schema_roles:
-            raise ValueError("bundle schema digests must use the exact seven roles")
+        if {key for key, _ in schema_items} != self.contract.schema_resources.keys():
+            raise ValueError("bundle schema digests must match the contract")
         schemas = {
             key: _validate_sha256_uri(value, f"bundle schema digest {key}")
             for key, value in schema_items
@@ -1082,8 +1090,13 @@ class BundleWriteRequest:
 
         criteria_fields = dict(self.criteria_identity.fields)
         bundle_fields = dict(self.bundle_identity.fields)
-        if len(criteria_fields) != 8 or len(bundle_fields) != 19:
+        if len(criteria_fields) != 8 or len(bundle_fields) != (23 if has_model else 19):
             raise ValueError("bundle request identities have invalid field cardinality")
+        if has_model and (
+            bundle_fields["quality_model_sha256"] != sha256_uri(self.quality_model)
+            or bundle_fields["quality_model_metadata_sha256"] != sha256_uri(self.quality_model_metadata)
+        ):
+            raise ValueError("model artifact bytes do not match bundle identity")
         if criteria_fields.get("as_of") != self.as_of.isoformat():
             raise ValueError("criteria identity as_of does not match request")
         if bundle_fields.get("criteria_id") != self.criteria_identity.value:

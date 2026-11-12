@@ -3,13 +3,13 @@ package com.sfep.equipmentmonitor.bundle;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 record UntrustedManifestClaims(
-        String schemaVersion,
         String bundleId,
         String criteriaId,
         String asOf,
@@ -48,26 +48,34 @@ record UntrustedManifestClaims(
     private static final Set<String> ARTIFACT_KEYS = Set.of(
             "role", "sizeBytes", "sha256", "schemaVersion");
 
-    static UntrustedManifestClaims extract(JsonNode root) {
+    static String schemaVersion(JsonNode root) {
         if (!root.isObject()) {
             throw invalid("manifest must be an object");
         }
+        return requiredText(root, "schemaVersion");
+    }
+
+    static UntrustedManifestClaims extract(JsonNode root, BundleContract contract) {
+        Set<String> identityKeys = new HashSet<>(IDENTITY_KEYS);
+        if (contract.artifactVersions().containsKey(ArtifactRole.QUALITY_MODEL)) {
+            identityKeys.addAll(Set.of("model_id", "quality_model_sha256",
+                    "quality_model_metadata_sha256", SchemaRole.QUALITY_MODEL_METADATA.manifestIdentityKey()));
+        }
         return new UntrustedManifestClaims(
-                requiredText(root, "schemaVersion"),
                 requiredText(root, "bundleId"),
                 requiredText(root, "criteriaId"),
                 requiredText(root, "asOf"),
-                stringMap(root.path("identity"), "identity", IDENTITY_KEYS),
+                stringMap(root.path("identity"), "identity", identityKeys),
                 stringMap(
                         root.path("criteriaIdentity"),
                         "criteriaIdentity",
                         CRITERIA_IDENTITY_KEYS),
-                artifacts(root.path("artifacts")));
+                artifacts(root.path("artifacts"), contract.artifactVersions().size()));
     }
 
-    private static List<ArtifactDescriptor> artifacts(JsonNode value) {
-        if (!value.isArray() || value.size() != ArtifactRole.values().length) {
-            throw invalid("artifacts must contain exactly six claims");
+    private static List<ArtifactDescriptor> artifacts(JsonNode value, int expectedCount) {
+        if (!value.isArray() || value.size() != expectedCount) {
+            throw invalid("artifacts must contain exactly " + expectedCount + " claims");
         }
         List<ArtifactDescriptor> result = new ArrayList<>();
         for (int index = 0; index < value.size(); index++) {
@@ -108,7 +116,7 @@ record UntrustedManifestClaims(
     }
 
     private static void requireExactKeys(JsonNode object, String label, Set<String> expectedKeys) {
-        Set<String> actualKeys = new java.util.HashSet<>();
+        Set<String> actualKeys = new HashSet<>();
         object.fieldNames().forEachRemaining(actualKeys::add);
         if (!actualKeys.equals(expectedKeys)) {
             throw invalid(label + " has unexpected or missing claims");

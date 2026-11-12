@@ -14,7 +14,6 @@ from equipment_quality.artifacts import (
     compute_criteria_identity,
     write_bundle,
 )
-from equipment_quality.bundle_contract import SCHEMA_ROLES
 from equipment_quality.criteria_projection import build_criteria_projection
 from equipment_quality.deterministic import sha256_uri
 from equipment_quality.event_builder import build_replay_events
@@ -37,7 +36,6 @@ from equipment_quality.summary import build_summary
 from equipment_quality.time_split import build_time_split
 
 
-_SCHEMA_ROLES = tuple(sorted(SCHEMA_ROLES, key=str.encode))
 _CRITERIA_SCHEMA_ROLES = (
     "analysis_config",
     "equipment_operating_ranges",
@@ -182,7 +180,7 @@ def run_analysis(
 
     schema_digests = {
         role: sha256_uri(contract_schema_bytes(contract, role))
-        for role in _SCHEMA_ROLES
+        for role in sorted(contract.schema_resources, key=str.encode)
     }
     projection = build_criteria_projection(split, configured_definitions)
     criteria_identity = compute_criteria_identity(

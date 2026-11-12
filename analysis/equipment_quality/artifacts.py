@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 from datetime import date
 import errno
@@ -16,10 +17,10 @@ import stat
 import tempfile
 from types import MappingProxyType
 
-from equipment_quality.bundle_contract import BundleContract
+from equipment_quality.bundle_contract import BundleContract, V3_CONTRACT
 from equipment_quality.deterministic import canonical_json_bytes, id_lines, sha256_uri
 from equipment_quality.event_builder import serialize_replay_events
-from equipment_quality.models import BundleWriteRequest, Identity, SourceFile
+from equipment_quality.models import BundleWriteRequest, Identity, MODEL_ID_NAMESPACE, SourceFile
 from equipment_quality.schema import (
     contract_schema_bytes,
     validate_contract_instance,
@@ -66,6 +67,11 @@ FIXED_ARTIFACT_FILENAMES = MappingProxyType(
         "analysis_summary": "analysis_summary.json",
     }
 )
+_ARTIFACT_FILENAMES = {
+    **FIXED_ARTIFACT_FILENAMES,
+    "quality_model": "quality_model.onnx",
+    "quality_model_metadata": "quality_model.json",
+}
 _LOCK_NAME = ".sfep-equipment-quality.lock"
 _TEMP_PREFIX = ".sfep-bundle-tmp-"
 _DIRECTORY_MODE = 0o700
@@ -187,18 +193,36 @@ def compute_criteria_identity(
     return _identity("sfep-criteria-id/v1", fields)
 
 
+def compute_model_identity(metadata: Mapping[str, object]) -> Identity:
+    """Identify canonical model metadata before its modelId field is attached."""
+    plain = _plain_json(dict(_mapping_snapshot(metadata, "model metadata")))
+    if "modelId" in plain:
+        raise ValueError("modelId must be omitted when computing the model identity")
+    return _identity(MODEL_ID_NAMESPACE, {
+        "metadata_sha256": sha256_uri(canonical_json_bytes(plain)),
+    })
+
+
 def compute_bundle_identity(
     criteria_id: str,
     analysis_config: bytes,
     producer_runtime: bytes,
     sources: Sequence[SourceFile],
     schema_digests: Mapping[str, str],
+    *,
+    quality_model: bytes | None = None,
+    quality_model_metadata: bytes | None = None,
 ) -> Identity:
-    """Compute the exact nineteen-field bundle identity."""
+    """Compute the bundle identity, adding model bindings only for v3."""
     criteria = _sha256_value(criteria_id, "criteria_id")
     config = _exact_bytes(analysis_config, "analysis_config")
     runtime = _exact_bytes(producer_runtime, "producer_runtime")
-    schemas = _schema_snapshot(schema_digests, _BUNDLE_SCHEMA_ROLES)
+    model_fields = _model_bundle_fields(quality_model, quality_model_metadata)
+    schema_roles = (
+        (*_BUNDLE_SCHEMA_ROLES, "quality_model_metadata")
+        if model_fields else _BUNDLE_SCHEMA_ROLES
+    )
+    schemas = _schema_snapshot(schema_digests, schema_roles)
     if type(sources) is str:
         raise TypeError("sources must be a sequence")
     try:
@@ -230,14 +254,13 @@ def compute_bundle_identity(
         "criteria_id": criteria,
         "analysis_config_sha256": sha256_uri(config),
         "producer_runtime_sha256": sha256_uri(runtime),
+        **model_fields,
         **source_fields,
         **{
             f"schema.{role}.sha256": schemas[role]
-            for role in _BUNDLE_SCHEMA_ROLES
+            for role in schema_roles
         },
     }
-    if len(fields) != 19:
-        raise RuntimeError("bundle identity must contain exactly nineteen fields")
     return _identity("sfep-bundle-id/v1", fields)
 
 
@@ -277,6 +300,31 @@ def _validate_exact_json_bytes(
         raise ValueError(f"{schema_name} bytes must use canonical JSON")
     validate_contract_instance(contract, role, value)
     return value
+
+
+def _model_bundle_fields(
+    model: bytes | None, metadata: bytes | None,
+) -> dict[str, str]:
+    if model is None and metadata is None:
+        return {}
+    if type(model) is not bytes or not model or type(metadata) is not bytes or not metadata:
+        raise ValueError("v3 requires both model artifacts as non-empty bytes")
+    value = _validate_exact_json_bytes(metadata, V3_CONTRACT, "quality_model_metadata")
+    model_id = compute_model_identity({
+        key: item for key, item in value.items() if key != "modelId"
+    }).value
+    digest = sha256_uri(model)
+    if (
+        value["onnxSha256"] != digest
+        or value["featureSha256"] != sha256_uri(canonical_json_bytes(value["features"]))
+        or value["modelId"] != model_id
+    ):
+        raise ValueError("model metadata does not bind its model, features, or model ID")
+    return {
+        "model_id": model_id,
+        "quality_model_sha256": digest,
+        "quality_model_metadata_sha256": sha256_uri(metadata),
+    }
 
 
 def _validate_schema_descriptors(request: BundleWriteRequest) -> None:
@@ -323,6 +371,12 @@ def _prepare_bundle(request: BundleWriteRequest) -> _PreparedBundle:
         "replay_events": replay,
         "analysis_summary": summary,
     }
+    if "quality_model" in contract.artifact_versions:
+        model_fields = _model_bundle_fields(request.quality_model, request.quality_model_metadata)
+        if any(request.bundle_identity.fields[key] != value for key, value in model_fields.items()):
+            raise ValueError("bundle identity does not bind the model artifacts")
+        artifact_bytes["quality_model"] = request.quality_model
+        artifact_bytes["quality_model_metadata"] = request.quality_model_metadata
     metadata = [
         {
             "role": role,
@@ -330,7 +384,7 @@ def _prepare_bundle(request: BundleWriteRequest) -> _PreparedBundle:
             "sha256": sha256_uri(artifact_bytes[role]),
             "sizeBytes": len(artifact_bytes[role]),
         }
-        for role in FIXED_ARTIFACT_ROLES
+        for role in artifact_bytes
     ]
     manifest = {
         "artifacts": metadata,
@@ -422,8 +476,26 @@ def fsync_directory(path: Path) -> None:
 
 
 def atomic_rename(source: Path, target: Path) -> None:
-    """Perform the same-filesystem visibility transition."""
-    os.rename(source, target)
+    """Publish the staged directory atomically, without replacing a target."""
+    if source.parent != target.parent:
+        raise ValueError("atomic publication requires a common parent directory")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if hasattr(libc, "renameatx_np"):
+        rename, no_replace = libc.renameatx_np, 0x04
+    elif hasattr(libc, "renameat2"):
+        rename, no_replace = libc.renameat2, 0x01
+    else:
+        raise OSError(errno.ENOTSUP, "atomic directory no-replace is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent = os.open(source.parent, flags)
+    try:
+        if rename(parent, os.fsencode(source.name), parent, os.fsencode(target.name), no_replace) != 0:
+            number = ctypes.get_errno()
+            raise OSError(number, os.strerror(number), target)
+    finally:
+        os.close(parent)
 
 
 def _write_artifact_file(path: Path, payload: bytes, phase: str) -> None:
@@ -499,7 +571,7 @@ def _verify_against_prepared(
     if require_identity_name and bundle_root.name != request.bundle_identity.value:
         raise _BundleVerificationError("bundle path does not match request bundle ID")
     expected_names = {
-        *FIXED_ARTIFACT_FILENAMES.values(),
+        *(_ARTIFACT_FILENAMES[role] for role in prepared.artifact_bytes),
         "bundle_manifest.json",
     }
     actual_names = {entry.name for entry in os.scandir(bundle_root)}
@@ -507,9 +579,9 @@ def _verify_against_prepared(
         raise _BundleVerificationError("bundle has missing or unexpected files")
 
     actual: dict[str, bytes] = {}
-    for role in FIXED_ARTIFACT_ROLES:
+    for role in prepared.artifact_bytes:
         actual[role] = _read_regular_file(
-            bundle_root / FIXED_ARTIFACT_FILENAMES[role]
+            bundle_root / _ARTIFACT_FILENAMES[role]
         )
         if actual[role] != prepared.artifact_bytes[role]:
             raise _BundleVerificationError("bundle artifact bytes differ")
@@ -541,7 +613,7 @@ def _verify_against_prepared(
     )
     if manifest["bundleId"] != request.bundle_identity.value:
         raise _BundleVerificationError("manifest bundle ID differs from request")
-    for metadata, role in zip(manifest["artifacts"], FIXED_ARTIFACT_ROLES, strict=True):
+    for metadata, role in zip(manifest["artifacts"], prepared.artifact_bytes, strict=True):
         if (
             metadata["role"] != role
             or metadata["sizeBytes"] != len(actual[role])
@@ -638,8 +710,8 @@ def _write_bundle(
             raise ValueError("temporary bundle must be a direct output-root child")
         os.chmod(temp, _DIRECTORY_MODE)
         try:
-            for role in FIXED_ARTIFACT_ROLES:
-                artifact_path = temp / FIXED_ARTIFACT_FILENAMES[role]
+            for role in prepared.artifact_bytes:
+                artifact_path = temp / _ARTIFACT_FILENAMES[role]
                 _write_artifact_file(
                     artifact_path,
                     prepared.artifact_bytes[role],
@@ -673,7 +745,12 @@ def _write_bundle(
                     prepared,
                     require_identity_name=False,
                 )
-            atomic_rename(temp, final)
+            try:
+                atomic_rename(temp, final)
+            except FileExistsError as error:
+                raise NonDeterministicBundleError(
+                    "NON_DETERMINISTIC_BUNDLE: target appeared during publication"
+                ) from error
             temp = None
         except BaseException:
             _remove_temp_directory(temp)

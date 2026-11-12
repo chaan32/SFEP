@@ -8,6 +8,7 @@ import java.util.Map;
 public final class BundleContracts {
     private static final String V1 = "sfep-equipment-bundle/v1";
     private static final String V2 = "sfep-equipment-bundle/v2";
+    static final String V3 = "sfep-equipment-bundle/v3";
     private static final String CRITERIA_NAMESPACE = "sfep-criteria-id/v1";
     private static final String BUNDLE_NAMESPACE = "sfep-bundle-id/v1";
     private static final Map<String, BundleContract> CONTRACTS = loadContracts();
@@ -86,9 +87,27 @@ public final class BundleContracts {
                 versions("sfep-analysis-config/v2", "sfep-analysis-summary/v2"),
                 v2Schemas);
 
+        EnumMap<SchemaRole, SchemaDocument> v3Schemas = new EnumMap<>(v2Schemas);
+        v3Schemas.put(SchemaRole.BUNDLE_MANIFEST, document(
+                "v3/bundle_manifest.schema.json",
+                "sha256:278fa2b47fdbd9a0ba01eb7405f5ab1edb49976176a04b9f5a7f2f34bf851283"));
+        v3Schemas.put(SchemaRole.ANALYSIS_CONFIG, document(
+                "v3/analysis_config.schema.json",
+                "sha256:94a4b342eb22a96265417610cc50ea08f6f34b7419d9794024019926806c9dcc"));
+        v3Schemas.put(SchemaRole.QUALITY_MODEL_METADATA, document(
+                "v3/quality_model.schema.json",
+                "sha256:b1134f71bab4edd98d9b68c259d211cbd657559e21b364fd0e1b63ff691a0e2b"));
+        EnumMap<ArtifactRole, String> v3Versions =
+                versions("sfep-analysis-config/v3", "sfep-analysis-summary/v2");
+        v3Versions.put(ArtifactRole.QUALITY_MODEL, "sfep-quality-model-onnx/v1");
+        v3Versions.put(ArtifactRole.QUALITY_MODEL_METADATA, "sfep-quality-model-metadata/v1");
+        BundleContract v3 = new BundleContract(
+                V3, CRITERIA_NAMESPACE, BUNDLE_NAMESPACE, v3Versions, v3Schemas);
+
         LinkedHashMap<String, BundleContract> profiles = new LinkedHashMap<>();
         profiles.put(v1.manifestVersion(), v1);
         profiles.put(v2.manifestVersion(), v2);
+        profiles.put(v3.manifestVersion(), v3);
         return Collections.unmodifiableMap(profiles);
     }
 

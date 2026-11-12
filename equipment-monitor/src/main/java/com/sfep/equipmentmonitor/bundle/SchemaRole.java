@@ -7,7 +7,8 @@ public enum SchemaRole {
     EQUIPMENT_OPERATING_RANGES("equipment_operating_ranges"),
     QUALITY_RISK_INTERVALS("quality_risk_intervals"),
     REPLAY_EVENTS("replay_events"),
-    ANALYSIS_SUMMARY("analysis_summary");
+    ANALYSIS_SUMMARY("analysis_summary"),
+    QUALITY_MODEL_METADATA("quality_model_metadata");
 
     private final String identityRole;
 

@@ -21,8 +21,9 @@ public final class BundleLoader {
                 layout.file("bundle_manifest.json").readAllBytes("MANIFEST_READ_FAILED"),
                 "MANIFEST_JSON_INVALID",
                 "bundle_manifest.json");
-        UntrustedManifestClaims claims = UntrustedManifestClaims.extract(manifestNode);
-        BundleContract contract = BundleContracts.require(claims.schemaVersion());
+        BundleContract contract = BundleContracts.require(UntrustedManifestClaims.schemaVersion(manifestNode));
+        BundleLayout.requireContract(layout, contract);
+        UntrustedManifestClaims claims = UntrustedManifestClaims.extract(manifestNode, contract);
         verifySchemaDigests(contract, claims);
         EnumMap<ArtifactRole, ArtifactDescriptor> descriptors = descriptors(contract, claims.artifacts());
         verifyIds(contract, claims);
@@ -32,6 +33,9 @@ public final class BundleLoader {
         contract.validate(SchemaRole.BUNDLE_MANIFEST, manifestNode, "MANIFEST_SCHEMA_INVALID");
         EnumMap<ArtifactRole, JsonNode> jsonArtifacts = readAndValidateJsonArtifacts(
                 contract, layout, descriptors);
+        if (descriptors.containsKey(ArtifactRole.QUALITY_MODEL)) {
+            throw new BundleLoadException("BUNDLE_MODEL_UNSUPPORTED", contract.manifestVersion());
+        }
 
         SafeFile replayFile = layout.file(ArtifactRole.REPLAY_EVENTS.fileName());
         ArtifactDescriptor replayDescriptor = descriptors.get(ArtifactRole.REPLAY_EVENTS);
@@ -105,13 +109,7 @@ public final class BundleLoader {
         }
 
         EnumMap<ArtifactRole, String> artifactHashes = new EnumMap<>(ArtifactRole.class);
-        for (ArtifactRole role : ArtifactRole.values()) {
-            ArtifactDescriptor descriptor = descriptors.get(role);
-            if (descriptor == null) {
-                throw new BundleLoadException("MANAGEMENT_PROJECTION_INVALID", role.manifestRole());
-            }
-            artifactHashes.put(role, descriptor.sha256());
-        }
+        descriptors.forEach((role, descriptor) -> artifactHashes.put(role, descriptor.sha256()));
 
         EnumMap<LoadedBundle.QuarantineReason, Long> quarantineCounts = enumCounts(
                 summary.quarantineCounts(),
@@ -176,7 +174,7 @@ public final class BundleLoader {
     private static void verifySchemaDigests(
             BundleContract contract,
             UntrustedManifestClaims manifest) {
-        for (SchemaRole role : SchemaRole.values()) {
+        for (SchemaRole role : contract.schemas().keySet()) {
             String claimed = manifest.identity().get(role.manifestIdentityKey());
             String embedded = contract.schema(role).sha256();
             if (!embedded.equals(claimed)) {
@@ -222,8 +220,9 @@ public final class BundleLoader {
             BundleContract contract,
             List<ArtifactDescriptor> artifacts) {
         EnumMap<ArtifactRole, ArtifactDescriptor> result = new EnumMap<>(ArtifactRole.class);
-        for (int index = 0; index < ArtifactRole.values().length; index++) {
-            ArtifactRole role = ArtifactRole.values()[index];
+        List<ArtifactRole> roles = contract.artifactRoles();
+        for (int index = 0; index < roles.size(); index++) {
+            ArtifactRole role = roles.get(index);
             ArtifactDescriptor descriptor = artifacts.get(index);
             if (!role.manifestRole().equals(descriptor.role())
                     || !contract.artifactVersion(role).equals(descriptor.schemaVersion())
@@ -246,19 +245,26 @@ public final class BundleLoader {
                 || !manifest.asOf().equals(manifest.criteriaIdentity().get("as_of"))) {
             throw new BundleLoadException("IDENTITY_BINDING_MISMATCH", "manifest identity maps");
         }
+        if (descriptors.containsKey(ArtifactRole.QUALITY_MODEL)
+                && (!descriptors.get(ArtifactRole.QUALITY_MODEL).sha256()
+                        .equals(manifest.identity().get("quality_model_sha256"))
+                    || !descriptors.get(ArtifactRole.QUALITY_MODEL_METADATA).sha256()
+                        .equals(manifest.identity().get("quality_model_metadata_sha256")))) {
+            throw new BundleLoadException("IDENTITY_BINDING_MISMATCH", "quality model artifact hashes");
+        }
     }
 
     private static void verifyArtifactAttestations(
             SafeBundleLayout layout,
             Map<ArtifactRole, ArtifactDescriptor> descriptors) {
-        for (ArtifactRole role : ArtifactRole.values()) {
+        for (ArtifactRole role : descriptors.keySet()) {
             SafeFile file = layout.file(role.fileName());
             ArtifactDescriptor descriptor = descriptors.get(role);
             if (file.size() != descriptor.sizeBytes()) {
                 throw new BundleLoadException("ARTIFACT_SIZE_MISMATCH", role.manifestRole());
             }
         }
-        for (ArtifactRole role : ArtifactRole.values()) {
+        for (ArtifactRole role : descriptors.keySet()) {
             SafeFile file = layout.file(role.fileName());
             ArtifactDescriptor descriptor = descriptors.get(role);
             file.assertUnchanged("ARTIFACT_FILE_CHANGED");
@@ -275,8 +281,8 @@ public final class BundleLoader {
             SafeBundleLayout layout,
             Map<ArtifactRole, ArtifactDescriptor> descriptors) {
         EnumMap<ArtifactRole, JsonNode> result = new EnumMap<>(ArtifactRole.class);
-        for (ArtifactRole role : ArtifactRole.values()) {
-            if (role == ArtifactRole.REPLAY_EVENTS) {
+        for (ArtifactRole role : descriptors.keySet()) {
+            if (role == ArtifactRole.REPLAY_EVENTS || role == ArtifactRole.QUALITY_MODEL) {
                 continue;
             }
             ArtifactDescriptor descriptor = descriptors.get(role);

@@ -101,7 +101,7 @@ def test_v2_config_strictly_selects_one_closed_contract_and_profile() -> None:
 @pytest.mark.parametrize(
     "payload",
     (
-        b'{"schemaVersion":"sfep-analysis-config/v3"}\n',
+        b'{"schemaVersion":"sfep-analysis-config/v4"}\n',
         b'{"schemaVersion":7}\n',
         b'{"schemaVersion":"sfep-analysis-config/v2","schemaVersion":"sfep-analysis-config/v1"}\n',
     ),

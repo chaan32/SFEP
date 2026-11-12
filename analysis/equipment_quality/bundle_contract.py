@@ -19,6 +19,8 @@ SCHEMA_ROLES = frozenset(
     }
 )
 ARTIFACT_ROLES = frozenset(SCHEMA_ROLES - {"bundle_manifest"})
+MODEL_ARTIFACT_ROLES = ("quality_model", "quality_model_metadata")
+V3_MANIFEST_VERSION = "sfep-equipment-bundle/v3"
 
 
 @dataclass(frozen=True)
@@ -73,17 +75,20 @@ class BundleContract:
             raise ValueError("bundle ID namespace must remain sfep-bundle-id/v1")
 
         artifact_versions = dict(self.artifact_versions)
-        if set(artifact_versions) != ARTIFACT_ROLES or any(
+        has_model = self.manifest_version == V3_MANIFEST_VERSION
+        expected_artifacts = ARTIFACT_ROLES | (set(MODEL_ARTIFACT_ROLES) if has_model else set())
+        if set(artifact_versions) != expected_artifacts or any(
             type(version) is not str or not version
             for version in artifact_versions.values()
         ):
-            raise ValueError("artifact versions must own the exact six artifact roles")
+            raise ValueError("artifact versions must own the exact profile artifact roles")
         schema_resources = dict(self.schema_resources)
-        if set(schema_resources) != SCHEMA_ROLES or any(
+        expected_schemas = SCHEMA_ROLES | ({"quality_model_metadata"} if has_model else set())
+        if set(schema_resources) != expected_schemas or any(
             type(resource) is not SchemaResource
             for resource in schema_resources.values()
         ):
-            raise ValueError("schema resources must own the exact seven schema roles")
+            raise ValueError("schema resources must own the exact profile schema roles")
         if artifact_versions["analysis_config"] != self.config_version:
             raise ValueError("config artifact version must match the contract")
         if artifact_versions["analysis_summary"] != self.summary_version:
@@ -196,16 +201,45 @@ V2_CONTRACT = BundleContract(
     },
 )
 
+V3_CONTRACT = BundleContract(
+    manifest_version=V3_MANIFEST_VERSION,
+    config_version="sfep-analysis-config/v3",
+    summary_version=V2_CONTRACT.summary_version,
+    artifact_versions={
+        **V2_CONTRACT.artifact_versions,
+        "analysis_config": "sfep-analysis-config/v3",
+        "quality_model": "sfep-quality-model-onnx/v1",
+        "quality_model_metadata": "sfep-quality-model-metadata/v1",
+    },
+    schema_resources={
+        **V2_CONTRACT.schema_resources,
+        "analysis_config": _resource(
+            "v3", "analysis_config.schema.json",
+            "94a4b342eb22a96265417610cc50ea08f6f34b7419d9794024019926806c9dcc",
+        ),
+        "bundle_manifest": _resource(
+            "v3", "bundle_manifest.schema.json",
+            "278fa2b47fdbd9a0ba01eb7405f5ab1edb49976176a04b9f5a7f2f34bf851283",
+        ),
+        "quality_model_metadata": _resource(
+            "v3", "quality_model.schema.json",
+            "b1134f71bab4edd98d9b68c259d211cbd657559e21b364fd0e1b63ff691a0e2b",
+        ),
+    },
+)
+
 _BY_MANIFEST_VERSION = MappingProxyType(
     {
         V1_CONTRACT.manifest_version: V1_CONTRACT,
         V2_CONTRACT.manifest_version: V2_CONTRACT,
+        V3_CONTRACT.manifest_version: V3_CONTRACT,
     }
 )
 _BY_CONFIG_VERSION = MappingProxyType(
     {
         V1_CONTRACT.config_version: V1_CONTRACT,
         V2_CONTRACT.config_version: V2_CONTRACT,
+        V3_CONTRACT.config_version: V3_CONTRACT,
     }
 )
 

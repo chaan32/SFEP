@@ -11,7 +11,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EmbeddedSchemasTest {
     @Test
-    void embedsExactlyTwoClosedSevenRoleProfilesFromTheNormativeRoots() throws Exception {
+    void embedsExactSchemaRolesForEachProfileFromTheNormativeRoots() throws Exception {
         Path contractRoot = Path.of(System.getProperty("sfep.repo-root"))
                 .resolve("contracts/equipment-monitor");
         Map<SchemaRole, String> fileNames = Map.of(
@@ -21,21 +21,23 @@ class EmbeddedSchemasTest {
                 SchemaRole.EQUIPMENT_OPERATING_RANGES, "equipment_operating_ranges.schema.json",
                 SchemaRole.QUALITY_RISK_INTERVALS, "quality_risk_intervals.schema.json",
                 SchemaRole.REPLAY_EVENTS, "replay_event_row.schema.json",
-                SchemaRole.ANALYSIS_SUMMARY, "analysis_summary.schema.json");
+                SchemaRole.ANALYSIS_SUMMARY, "analysis_summary.schema.json",
+                SchemaRole.QUALITY_MODEL_METADATA, "quality_model.schema.json");
 
         assertThat(BundleContracts.all()).containsOnlyKeys(
-                "sfep-equipment-bundle/v1", "sfep-equipment-bundle/v2");
+                "sfep-equipment-bundle/v1", "sfep-equipment-bundle/v2",
+                "sfep-equipment-bundle/v3");
         for (String manifestVersion : BundleContracts.all().keySet()) {
             BundleContract contract = BundleContracts.require(manifestVersion);
-            String profile = manifestVersion.endsWith("/v1") ? "v1" : "v2";
-            assertThat(contract.schemas()).hasSize(7);
-            assertThat(contract.schemas().keySet()).containsExactlyInAnyOrder(SchemaRole.values());
-            for (SchemaRole role : SchemaRole.values()) {
-                String normativeProfile = profile.equals("v2") && switch (role) {
+            String profile = manifestVersion.substring(manifestVersion.lastIndexOf('/') + 1);
+            assertThat(contract.schemas()).hasSize(profile.equals("v3") ? 8 : 7);
+            for (SchemaRole role : contract.schemas().keySet()) {
+                String normativeProfile = switch (role) {
                     case PRODUCER_RUNTIME, EQUIPMENT_OPERATING_RANGES,
-                            QUALITY_RISK_INTERVALS, REPLAY_EVENTS -> true;
-                    default -> false;
-                } ? "v1" : profile;
+                            QUALITY_RISK_INTERVALS, REPLAY_EVENTS -> "v1";
+                    case ANALYSIS_SUMMARY -> profile.equals("v1") ? "v1" : "v2";
+                    default -> profile;
+                };
                 byte[] normative = Files.readAllBytes(
                         contractRoot.resolve(normativeProfile).resolve(fileNames.get(role)));
                 SchemaDocument embedded = contract.schema(role);
@@ -86,7 +88,12 @@ class EmbeddedSchemasTest {
         assertThat(v2.criteriaIdNamespace()).isEqualTo("sfep-criteria-id/v1");
         assertThat(v1.bundleIdNamespace()).isEqualTo("sfep-bundle-id/v1");
         assertThat(v2.bundleIdNamespace()).isEqualTo("sfep-bundle-id/v1");
-        assertThatThrownBy(() -> BundleContracts.require("sfep-equipment-bundle/v3"))
+        BundleContract v3 = BundleContracts.require("sfep-equipment-bundle/v3");
+        assertThat(v3.artifactVersions()).hasSize(8);
+        assertThat(v3.artifactVersion(ArtifactRole.ANALYSIS_CONFIG)).isEqualTo("sfep-analysis-config/v3");
+        assertThat(v3.artifactVersion(ArtifactRole.QUALITY_MODEL)).isEqualTo("sfep-quality-model-onnx/v1");
+        assertThat(v3.artifactVersion(ArtifactRole.QUALITY_MODEL_METADATA)).isEqualTo("sfep-quality-model-metadata/v1");
+        assertThatThrownBy(() -> BundleContracts.require("sfep-equipment-bundle/v4"))
                 .isInstanceOf(BundleLoadException.class)
                 .hasMessageStartingWith("BUNDLE_CONTRACT_UNSUPPORTED:");
     }

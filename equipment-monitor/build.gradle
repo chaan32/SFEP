@@ -47,6 +47,11 @@ def normativeSchemas = [
                 'analysis_config.schema.json',
                 'analysis_summary.schema.json',
                 'bundle_manifest.schema.json'
+        ],
+        v3: [
+                'analysis_config.schema.json',
+                'bundle_manifest.schema.json',
+                'quality_model.schema.json'
         ]
 ]
 

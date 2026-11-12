@@ -6,20 +6,15 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
 public final class BundleLayout {
-    public static final List<String> REQUIRED_FILES = List.of(
-            "bundle_manifest.json",
-            "analysis_config.json",
-            "producer_runtime.json",
-            "equipment_operating_ranges.json",
-            "quality_risk_intervals.json",
-            "replay_events.csv",
-            "analysis_summary.json");
+    public static final List<String> REQUIRED_FILES = requiredFiles(ArtifactRole.LEGACY_ROLES);
+    private static final List<String> V3_REQUIRED_FILES = requiredFiles(ArtifactRole.ALL_ROLES);
 
     private BundleLayout() {
     }
@@ -52,15 +47,19 @@ public final class BundleLayout {
                     actual.add(child.getFileName().toString());
                 }
             }
-            Set<String> required = new LinkedHashSet<>(REQUIRED_FILES);
-            if (!actual.equals(required)) {
+            List<String> required;
+            if (actual.equals(Set.copyOf(REQUIRED_FILES))) {
+                required = REQUIRED_FILES;
+            } else if (actual.equals(Set.copyOf(V3_REQUIRED_FILES))) {
+                required = V3_REQUIRED_FILES;
+            } else {
                 throw new BundleLoadException(
                         "BUNDLE_INVENTORY_MISMATCH",
-                        "expected " + required + " but found " + actual);
+                        "inventory does not match a supported profile: " + actual);
             }
 
             LinkedHashMap<String, SafeFile> files = new LinkedHashMap<>();
-            for (String name : REQUIRED_FILES) {
+            for (String name : required) {
                 Path child = root.resolve(name).normalize();
                 if (!child.getParent().equals(root)) {
                     throw new BundleLoadException("BUNDLE_CHILD_UNSAFE", name + " escapes bundle root");
@@ -83,6 +82,19 @@ public final class BundleLayout {
         } catch (IOException error) {
             throw new BundleLoadException("BUNDLE_ROOT_UNSAFE", root.toString(), error);
         }
+    }
+
+    static void requireContract(SafeBundleLayout layout, BundleContract contract) {
+        if (!layout.files().keySet().equals(Set.copyOf(requiredFiles(contract.artifactRoles())))) {
+            throw new BundleLoadException("BUNDLE_INVENTORY_MISMATCH", contract.manifestVersion());
+        }
+    }
+
+    private static List<String> requiredFiles(List<ArtifactRole> roles) {
+        List<String> names = new ArrayList<>();
+        names.add("bundle_manifest.json");
+        roles.forEach(role -> names.add(role.fileName()));
+        return List.copyOf(names);
     }
 
     static void rejectSymlinkComponents(Path absolute, String code) {

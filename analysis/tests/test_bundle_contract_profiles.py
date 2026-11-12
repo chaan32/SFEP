@@ -157,7 +157,7 @@ def test_contract_profiles_and_nested_maps_are_immutable() -> None:
 )
 def test_contract_lookup_is_a_closed_allowlist(lookup, version, expected) -> None:
     assert lookup(version) is expected
-    for unknown in ("", version + "/fallback", "v2", "sfep-equipment-bundle/v3"):
+    for unknown in ("", version + "/fallback", "v2", "sfep-equipment-bundle/v4"):
         with pytest.raises(ValueError, match="unsupported"):
             lookup(unknown)
     for invalid in (None, b"sfep-equipment-bundle/v1", True):
@@ -245,3 +245,21 @@ def test_default_v1_prepared_bytes_remain_frozen(tmp_path) -> None:
         ),
     }
     assert actual == LITERAL_GOLDEN_ARTIFACT_SNAPSHOT
+
+
+def test_v3_config_selects_the_only_profile_with_model_artifacts() -> None:
+    contract = contract_for_manifest_version("sfep-equipment-bundle/v3")
+    assert contract_for_config_version("sfep-analysis-config/v3") is contract
+    assert dict(contract.artifact_versions) == {
+        **V2_ARTIFACT_VERSIONS,
+        "analysis_config": "sfep-analysis-config/v3",
+        "quality_model": "sfep-quality-model-onnx/v1",
+        "quality_model_metadata": "sfep-quality-model-metadata/v1",
+    }
+    assert set(contract.schema_resources) == ROLES | {"quality_model_metadata"}
+    config = json.loads((Path(__file__).parents[1] / "analysis_config_v3.json").read_bytes())
+    validate_contract_instance(contract, "analysis_config", config)
+    for role in ("analysis_config", "bundle_manifest", "quality_model_metadata"):
+        name = contract.schema_resources[role].resource_path.rsplit("/", 1)[-1]
+        normative = Path(__file__).parents[2] / "contracts/equipment-monitor/v3" / name
+        assert contract_schema_bytes(contract, role) == normative.read_bytes()

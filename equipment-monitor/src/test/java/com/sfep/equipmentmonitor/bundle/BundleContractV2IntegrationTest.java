@@ -41,7 +41,7 @@ class BundleContractV2IntegrationTest {
     void rejectsUnknownProfileBeforeReadingMalformedArtifacts() throws Exception {
         Path bundle = copyGolden("v2", "unknown-profile");
         ObjectNode manifest = readManifest(bundle);
-        manifest.put("schemaVersion", "sfep-equipment-bundle/v3");
+        manifest.put("schemaVersion", "sfep-equipment-bundle/v4");
         writeManifest(bundle, manifest);
         Files.writeString(bundle.resolve("analysis_summary.json"), "{not-json");
 
@@ -56,6 +56,20 @@ class BundleContractV2IntegrationTest {
         writeManifest(bundle, manifest);
 
         assertCode("SCHEMA_DIGEST_MISMATCH", () -> new BundleLoader().load(bundle));
+    }
+
+    @Test
+    void requiresTheFileInventoryToMatchTheClaimedProfile() throws Exception {
+        Path legacy = copyGolden("v2", "legacy-with-model");
+        Files.write(legacy.resolve("quality_model.onnx"), new byte[] {1});
+        Files.writeString(legacy.resolve("quality_model.json"), "{}");
+        assertCode("BUNDLE_INVENTORY_MISMATCH", () -> new BundleLoader().load(legacy));
+
+        Path missingModels = copyGolden("v2", "v3-without-model");
+        ObjectNode manifest = readManifest(missingModels);
+        manifest.put("schemaVersion", "sfep-equipment-bundle/v3");
+        writeManifest(missingModels, manifest);
+        assertCode("BUNDLE_INVENTORY_MISMATCH", () -> new BundleLoader().load(missingModels));
     }
 
     @Test

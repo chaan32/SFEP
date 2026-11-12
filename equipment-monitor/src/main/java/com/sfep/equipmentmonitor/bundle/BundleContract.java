@@ -5,9 +5,11 @@ import com.networknt.schema.Error;
 
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 public record BundleContract(
         String manifestVersion,
@@ -25,11 +27,21 @@ public record BundleContract(
         if (!"sfep-bundle-id/v1".equals(bundleIdNamespace)) {
             throw new IllegalArgumentException("bundleIdNamespace must remain sfep-bundle-id/v1");
         }
+        boolean hasModel = BundleContracts.V3.equals(manifestVersion);
         artifactVersions = immutableCompleteMap(
-                ArtifactRole.class, artifactVersions, "artifactVersions");
-        schemas = immutableCompleteMap(SchemaRole.class, schemas, "schemas");
+                ArtifactRole.class, artifactVersions,
+                EnumSet.copyOf(hasModel ? ArtifactRole.ALL_ROLES : ArtifactRole.LEGACY_ROLES));
+        EnumSet<SchemaRole> schemaRoles = EnumSet.allOf(SchemaRole.class);
+        if (!hasModel) {
+            schemaRoles.remove(SchemaRole.QUALITY_MODEL_METADATA);
+        }
+        schemas = immutableCompleteMap(SchemaRole.class, schemas, schemaRoles);
         artifactVersions.values().forEach(version -> requireText(version, "artifactVersion"));
         schemas.values().forEach(schema -> Objects.requireNonNull(schema, "schema"));
+    }
+
+    public List<ArtifactRole> artifactRoles() {
+        return List.copyOf(artifactVersions.keySet());
     }
 
     public String artifactVersion(ArtifactRole role) {
@@ -64,13 +76,12 @@ public record BundleContract(
     private static <E extends Enum<E>, V> Map<E, V> immutableCompleteMap(
             Class<E> keyType,
             Map<E, V> source,
-            String label) {
-        Objects.requireNonNull(source, label);
+            Set<E> expected) {
+        Objects.requireNonNull(source);
         EnumMap<E, V> copy = new EnumMap<>(keyType);
         copy.putAll(source);
-        if (copy.size() != keyType.getEnumConstants().length
-                || !copy.keySet().containsAll(List.of(keyType.getEnumConstants()))) {
-            throw new IllegalArgumentException(label + " must contain every " + keyType.getSimpleName());
+        if (!copy.keySet().equals(expected)) {
+            throw new IllegalArgumentException(keyType.getSimpleName() + " inventory must match the profile");
         }
         return Collections.unmodifiableMap(copy);
     }
