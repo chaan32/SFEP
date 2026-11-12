@@ -44,10 +44,10 @@ TOOLS_ROOT = ANALYSIS_ROOT / "tools"
 WHEELHOUSE = ANALYSIS_ROOT / ".wheelhouse"
 PRODUCER_FILENAME = "sfep_equipment_quality-1.2.0-py3-none-any.whl"
 EXPECTED_SOURCE_DIGEST = (
-    "sha256:106a414e13520d44aa0bc3944e9e574b5df2ada99ce8fc5abcee6d757b1ad58c"
+    "sha256:d79bf6365c0a4cbd3ed7a9d7104ccc6e3b52ae740cc17f8d762a8c1ecb6996b0"
 )
 EXPECTED_PROVENANCE_DIGEST = (
-    "sha256:b294333d0dc955f40033184e90513e93e35816a4f573fe8572d49916e880e5c7"
+    "sha256:9916f85ea0cd46b9d23dbf29c8cbe93cf49370a580e8de756b368efe24261f05"
 )
 
 THIRD_PARTY_WHEELS = (
@@ -554,7 +554,7 @@ def test_source_preimage_and_provenance_match_independent_literals() -> None:
     preimage = independent_source_preimage(ANALYSIS_ROOT)
     provenance = independently_expected_provenance(ANALYSIS_ROOT)
 
-    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 35
+    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 38
     assert preimage.startswith(b"sfep-source-lines/v1\n")
     assert independent_source_digest(ANALYSIS_ROOT) == EXPECTED_SOURCE_DIGEST
     assert _sha256_uri(provenance) == EXPECTED_PROVENANCE_DIGEST
