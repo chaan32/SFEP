@@ -23,6 +23,7 @@ class OnnxQualityPredictorParityTest {
         assertTrue(raw.isArray() && !raw.isEmpty() && probabilities.isArray());
         assertEquals(raw.size(), probabilities.size());
         double maxDelta = 0.0;
+        boolean aboveThreshold = false;
         try (OnnxQualityPredictor predictor = OnnxQualityPredictor.open(artifacts.model(), artifacts.metadata())) {
             assertEquals(artifacts.report().path("qualification").textValue(), predictor.metadata().qualification());
             for (int index = 0; index < raw.size(); index++) {
@@ -32,8 +33,15 @@ class OnnxQualityPredictorParityTest {
                 JsonNode expected = probabilities.get(index);
                 assertTrue(expected.isNumber() && Double.isFinite(expected.doubleValue()));
                 maxDelta = Math.max(maxDelta, Math.abs(expected.doubleValue() - prediction.probability()));
+                if (prediction.probability() >= prediction.threshold()) {
+                    aboveThreshold = true;
+                    if ("RESEARCH_ONLY".equals(prediction.qualification())) {
+                        assertFalse(prediction.shouldAlert());
+                    }
+                }
             }
         }
+        assertTrue(aboveThreshold, "Test vectors must exercise threshold crossing");
         assertTrue(maxDelta <= 1e-5, "Max Python ONNX to Java ONNX probability delta " + maxDelta);
         artifacts.writeReport("java_onnx_parity.json", Map.of(
                 "pythonJavaOnnxMaxDifference", maxDelta, "absoluteTolerance", 1e-5, "vectors", raw.size()));
