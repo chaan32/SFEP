@@ -26,6 +26,7 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'org.apache.commons:commons-csv:1.14.1'
     implementation 'com.networknt:json-schema-validator:2.0.4'
+    implementation 'com.microsoft.onnxruntime:onnxruntime:1.31.1'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
@@ -116,6 +117,13 @@ tasks.named('test') {
     useJUnitPlatform()
     dependsOn tasks.named('verifyNormativeSchemas'), tasks.named('verifyRuntimeShape')
     systemProperty 'sfep.repo-root', repositoryRoot.asFile.absolutePath
+    def modelDevDirectory = providers.systemProperty('sfep.model-dev-dir').orNull
+    if (modelDevDirectory != null) {
+        systemProperty 'sfep.model-dev-dir', modelDevDirectory
+        // Local artifact changes and latency measurements require a fresh run.
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
+    }
 }
 
 def configureCustomTestTask = { Test task ->
