@@ -46,8 +46,12 @@ public final class OnnxQualityPredictor implements QualityPredictor, AutoCloseab
         } catch (IOException error) {
             throw new BundleLoadException("ONNX_READ_FAILED", modelPath.toString(), error);
         }
+        return open(model, metadata);
+    }
+
+    public static OnnxQualityPredictor open(byte[] model, QualityModelMetadata metadata) {
         if (!metadata.onnxSha256().equals(Digests.sha256Uri(model))) {
-            throw new BundleLoadException("ONNX_DIGEST_MISMATCH", modelPath.toString());
+            throw new BundleLoadException("ONNX_DIGEST_MISMATCH", metadata.modelId());
         }
 
         // ONNX Runtime owns its process-wide environment and closes it at JVM shutdown.
@@ -57,7 +61,7 @@ public final class OnnxQualityPredictor implements QualityPredictor, AutoCloseab
             options.setInterOpNumThreads(1);
             OrtSession session = environment.createSession(model, options);
             try {
-                validateIo(session, metadata.encoder().width());
+                validateIo(session, metadata.inputWidth());
                 return new OnnxQualityPredictor(metadata, environment, session);
             } catch (OrtException | RuntimeException error) {
                 try {
@@ -68,7 +72,7 @@ public final class OnnxQualityPredictor implements QualityPredictor, AutoCloseab
                 throw error;
             }
         } catch (OrtException error) {
-            throw new BundleLoadException("ONNX_OPEN_FAILED", modelPath.toString(), error);
+            throw new BundleLoadException("ONNX_OPEN_FAILED", metadata.modelId(), error);
         }
     }
 

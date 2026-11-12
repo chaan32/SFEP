@@ -18,6 +18,13 @@ public record QualityModelMetadata(String modelId, String model, String onnxSha2
         } catch (IOException error) {
             throw new BundleLoadException("MODEL_METADATA_READ_FAILED", path.toString(), error);
         }
+        if (metadata.size() != 7 || !"sfep-quality-model-dev/v1".equals(metadata.path("schemaVersion").textValue())) {
+            throw new BundleLoadException("INVALID_MODEL_METADATA", path.toString());
+        }
+        return parse(metadata, DigestIds.canonicalSha256Uri(metadata));
+    }
+
+    public static QualityModelMetadata parse(JsonNode metadata, String modelId) {
         String model = metadata.path("model").textValue();
         String qualification = metadata.path("qualification").textValue();
         JsonNode threshold = metadata.path("threshold");
@@ -25,18 +32,20 @@ public record QualityModelMetadata(String modelId, String model, String onnxSha2
         String featureSha256 = metadata.path("featureSha256").textValue();
         JsonNode features = metadata.path("features");
 
-        if (metadata.size() != 7 || !"sfep-quality-model-dev/v1".equals(metadata.path("schemaVersion").textValue())
-                || model == null || model.isBlank() || !validDigest(onnxSha256) || !validDigest(featureSha256)
+        if (model == null || model.isBlank() || !validDigest(onnxSha256) || !validDigest(featureSha256)
                 || !threshold.isNumber() || !validProbability(threshold.doubleValue()) || !features.isObject()
                 || !("QUALIFIED".equals(qualification) || "RESEARCH_ONLY".equals(qualification))) {
-            throw new BundleLoadException("INVALID_MODEL_METADATA", path.toString());
+            throw new BundleLoadException("INVALID_MODEL_METADATA", modelId);
         }
         FeatureEncoder encoder = FeatureEncoder.fromContract(features);
         if (!featureSha256.equals(DigestIds.canonicalSha256Uri(features))) {
-            throw new BundleLoadException("FEATURE_DIGEST_MISMATCH", path.toString());
+            throw new BundleLoadException("FEATURE_DIGEST_MISMATCH", modelId);
         }
-        return new QualityModelMetadata(DigestIds.canonicalSha256Uri(metadata), model, onnxSha256, qualification,
-                threshold.doubleValue(), encoder);
+        return new QualityModelMetadata(modelId, model, onnxSha256, qualification, threshold.doubleValue(), encoder);
+    }
+
+    public int inputWidth() {
+        return encoder.width();
     }
 
     private static boolean validDigest(String value) {

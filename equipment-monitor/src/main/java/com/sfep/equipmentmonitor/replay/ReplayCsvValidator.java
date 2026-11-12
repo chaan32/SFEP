@@ -10,6 +10,7 @@ import com.sfep.equipmentmonitor.bundle.IdValue;
 import com.sfep.equipmentmonitor.bundle.JsonSupport;
 import com.sfep.equipmentmonitor.bundle.SafeFile;
 import com.sfep.equipmentmonitor.bundle.SchemaRole;
+import com.sfep.equipmentmonitor.risk.ProcessStage;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
@@ -24,6 +25,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.Channels;
 import java.nio.file.Path;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -36,6 +38,8 @@ public final class ReplayCsvValidator {
             "replay_hour", "batch_kind", "batch_id", "equipment_batch_id", "batch_step",
             "time_precision", "material_key", "equipment_type", "equipment_id", "charge_id",
             "slab_no", "hr_coil_id", "ap_prod_id", "values_json");
+    private static final Set<ProcessStage> MODEL_STAGES = Set.copyOf(EnumSet.range(
+            ProcessStage.CAST_RECORDED, ProcessStage.FURNACE_EXTRACTED));
 
     private final EmbeddedSchemas schemas;
 
@@ -73,6 +77,16 @@ public final class ReplayCsvValidator {
             String expectedCriteriaId,
             long expectedSize,
             String expectedSha256) {
+        return validate(file, expectedBundleId, expectedCriteriaId, expectedSize, expectedSha256, false);
+    }
+
+    public ReplayMetadata validate(
+            SafeFile file,
+            String expectedBundleId,
+            String expectedCriteriaId,
+            long expectedSize,
+            String expectedSha256,
+            boolean requireModelStages) {
         var decoder = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
@@ -87,6 +101,7 @@ public final class ReplayCsvValidator {
         ReplaySortKey previous = null;
         Set<String> eventIds = new HashSet<>();
         Map<String, String> idPreimages = new HashMap<>();
+        Map<String, EnumSet<ProcessStage>> modelStages = new HashMap<>();
 
         try (AuthenticatedReplaySnapshot snapshot = AuthenticatedReplaySnapshot.capture(
                      file, expectedSize, expectedSha256);
@@ -123,6 +138,9 @@ public final class ReplayCsvValidator {
                     throw new BundleLoadException("REPLAY_SORT_INVALID", event.eventId());
                 }
                 previous = current;
+                if (requireModelStages) {
+                    verifyModelStage(row, event, modelStages);
+                }
                 if (firstEvent == null) {
                     firstEvent = event.eventId();
                 }
@@ -147,7 +165,33 @@ public final class ReplayCsvValidator {
         if (count == 0) {
             throw new BundleLoadException("REPLAY_EMPTY", file.path().toString());
         }
+        modelStages.forEach((material, stages) -> {
+            if (!stages.contains(ProcessStage.FURNACE_EXTRACTED)) {
+                throw new BundleLoadException("REPLAY_MODEL_TRIGGER_MISSING", material);
+            }
+        });
         return new ReplayMetadata(count, firstEvent, lastEvent);
+    }
+
+    private static void verifyModelStage(JsonNode row, ReplayEvent event,
+            Map<String, EnumSet<ProcessStage>> materialStages) {
+        ProcessStage stage = ProcessStage.valueOf(event.batchStep());
+        EnumSet<ProcessStage> observed = materialStages.computeIfAbsent(
+                event.materialKey(), ignored -> EnumSet.noneOf(ProcessStage.class));
+        if (!MODEL_STAGES.contains(stage)) {
+            return;
+        }
+        if (!observed.add(stage)) {
+            throw new BundleLoadException("REPLAY_MODEL_STAGE_DUPLICATE", event.eventId());
+        }
+        if (stage == ProcessStage.FURNACE_EXTRACTED && !observed.equals(MODEL_STAGES)) {
+            throw new BundleLoadException("REPLAY_MODEL_STAGE_MISSING", event.eventId());
+        }
+        row.path("values_json").properties().forEach(field -> {
+            if (field.getValue().isNumber() && Math.abs(field.getValue().doubleValue()) > Float.MAX_VALUE) {
+                throw new BundleLoadException("REPLAY_MODEL_VALUE_INVALID", field.getKey());
+            }
+        });
     }
 
     static ObjectNode rowNode(CSVRecord record) {

@@ -8,6 +8,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 public record LoadedBundle(
         String bundleId,
@@ -16,10 +17,12 @@ public record LoadedBundle(
         ManagementProjection management,
         List<JsonNode> ranges,
         List<JsonNode> rules,
-        ReplaySource replay) {
+        ReplaySource replay,
+        Optional<QualityModelArtifact> qualityModel) {
     public LoadedBundle {
         ranges = List.copyOf(ranges);
         rules = List.copyOf(rules);
+        qualityModel = Objects.requireNonNull(qualityModel, "qualityModel");
     }
 
     public record ManagementProjection(

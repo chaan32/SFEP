@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 public final class BundleLoader {
     public BundleLoader() {
@@ -33,8 +34,13 @@ public final class BundleLoader {
         contract.validate(SchemaRole.BUNDLE_MANIFEST, manifestNode, "MANIFEST_SCHEMA_INVALID");
         EnumMap<ArtifactRole, JsonNode> jsonArtifacts = readAndValidateJsonArtifacts(
                 contract, layout, descriptors);
+        Optional<QualityModelArtifact> model = Optional.empty();
         if (descriptors.containsKey(ArtifactRole.QUALITY_MODEL)) {
-            throw new BundleLoadException("BUNDLE_MODEL_UNSUPPORTED", contract.manifestVersion());
+            ArtifactRole role = ArtifactRole.QUALITY_MODEL;
+            byte[] onnx = ArtifactBytes.verify(role, descriptors.get(role),
+                    layout.file(role.fileName()).readAllBytes("ARTIFACT_READ_FAILED"));
+            model = Optional.of(QualityModelArtifact.verify(onnx,
+                    jsonArtifacts.get(ArtifactRole.QUALITY_MODEL_METADATA), claims.identity().get("model_id")));
         }
 
         SafeFile replayFile = layout.file(ArtifactRole.REPLAY_EVENTS.fileName());
@@ -45,7 +51,8 @@ public final class BundleLoader {
                         claims.bundleId(),
                         claims.criteriaId(),
                         replayDescriptor.sizeBytes(),
-                        replayDescriptor.sha256());
+                        replayDescriptor.sha256(),
+                        model.isPresent());
 
         BundleManifest manifest = JsonSupport.bind(
                 manifestNode, BundleManifest.class, "MANIFEST_DTO_INVALID");
@@ -91,7 +98,8 @@ public final class BundleLoader {
                 management,
                 ranges.ranges(),
                 rules.rules(),
-                replay);
+                replay,
+                model);
     }
 
     private static LoadedBundle.ManagementProjection managementProjection(
