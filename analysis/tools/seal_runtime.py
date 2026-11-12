@@ -28,23 +28,28 @@ import zipfile
 _SOURCE_HEADER = b"sfep-source-lines/v1\n"
 _SOURCE_DATE_EPOCH = "1735689600"
 _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
-_PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+_PRODUCER_FILENAME = "sfep_equipment_quality-1.2.0-py3-none-any.whl"
 _PRODUCER_DISTRIBUTION = "sfep-equipment-quality"
-_PRODUCER_VERSION = "1.1.0"
-_PRODUCER_SHA256 = "abdfb2738c4eea6dd9e8c832951deef5faff4795ffbae39c6a9617cac293d514"
+_PRODUCER_VERSION = "1.2.0"
+_PRODUCER_SHA256 = "673f46cf5a7bb194405da84bc507b641a8766308a171ab11d042dee3154f0eda"
 _PIP_VERSION = "25.1.1"
-_PACKAGE_NAMES = (
-    "attrs", "jsonschema", "jsonschema-specifications", "numpy", "pandas",
-    "python-dateutil", "pytz", "referencing", "rpds-py", "six",
-    "typing-extensions", "tzdata",
+_DIRECT_REQUIREMENTS = (
+    "numpy==2.2.6", "pandas==2.3.0", "jsonschema==4.24.0", "scikit-learn==1.9.1",
+    "onnx==1.23.2", "skl2onnx==1.20.0", "onnxruntime==1.31.1", "threadpoolctl==3.8.0",
 )
-_DIRECT_PACKAGES = frozenset({"jsonschema", "numpy", "pandas"})
+_DIRECT_PACKAGES = frozenset(requirement.split("==")[0] for requirement in _DIRECT_REQUIREMENTS)
 _GENERATED_SCRIPTS = {
     "jsonschema": {"jsonschema": "jsonschema.cli:main"},
     "numpy": {
         "f2py": "numpy.f2py.f2py2e:main",
         "numpy-config": "numpy._configtool:main",
     },
+    "onnx": {
+        "backend-test-tools": "onnx.backend.test.cmd_tools:main",
+        "check-model": "onnx.bin.checker:check_model",
+        "check-node": "onnx.bin.checker:check_node",
+    },
+    "onnxruntime": {"onnxruntime_test": "onnxruntime.tools.onnxruntime_test:main"},
     "pip": {
         "pip": "pip._internal.cli.main:main",
         "pip3": "pip._internal.cli.main:main",
@@ -54,27 +59,40 @@ _GENERATED_SCRIPTS = {
         "sfep-equipment-quality": "equipment_quality.cli:main"
     },
 }
-_EXPECTED_DISTRIBUTIONS = frozenset((*_PACKAGE_NAMES, "pip", _PRODUCER_DISTRIBUTION))
 _THIRD_PARTY = (
     ("attrs", "26.1.0", "attrs-26.1.0-py3-none-any.whl", "py3-none-any", "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309", "runtime"),
     ("build", "1.2.2.post1", "build-1.2.2.post1-py3-none-any.whl", "py3-none-any", "1d61c0887fa860c01971625baae8bdd338e517b836a2f70dd1f7aa3a6b2fc5b5", "build"),
+    ("cloudpickle", "3.1.2", "cloudpickle-3.1.2-py3-none-any.whl", "py3-none-any", "9acb47f6afd73f60dc1df93bb801b472f05ff42fa6c84167d25cb206be1fbf4a", "runtime"),
+    ("flatbuffers", "25.12.19", "flatbuffers-25.12.19-py2.py3-none-any.whl", "py2.py3-none-any", "7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4", "runtime"),
+    ("joblib", "1.6.0", "joblib-1.6.0-py3-none-any.whl", "py3-none-any", "3dbbf9f6e4b592a2357b854608e980fe6390d131d7a82f011a377ef2ebef7aba", "runtime"),
     ("jsonschema", "4.24.0", "jsonschema-4.24.0-py3-none-any.whl", "py3-none-any", "a462455f19f5faf404a7902952b6f0e3ce868f3ee09a359b05eca6673bd8412d", "runtime"),
     ("jsonschema-specifications", "2025.9.1", "jsonschema_specifications-2025.9.1-py3-none-any.whl", "py3-none-any", "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", "runtime"),
+    ("ml-dtypes", "0.6.0", "ml_dtypes-0.6.0-cp312-cp312-macosx_10_13_universal2.whl", "cp312-cp312-macosx_10_13_universal2", "5359c588cc62de6f78d7430f06b65853d884955494d86d6ad90b6dd64a3f3a08", "runtime"),
+    ("narwhals", "2.28.0", "narwhals-2.28.0-py3-none-any.whl", "py3-none-any", "1f69d6385ec30e2fa6e1fdeb37c562ecabd0f713f6f3e3b58a668c5c9df9567f", "runtime"),
     ("numpy", "2.2.6", "numpy-2.2.6-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "894b3a42502226a1cac872f840030665f33326fc3dac8e57c607905773cdcde3", "runtime"),
-    ("packaging", "26.3", "packaging-26.3-py3-none-any.whl", "py3-none-any", "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", "build"),
+    ("onnx", "1.23.2", "onnx-1.23.2-cp312-abi3-macosx_13_0_universal2.whl", "cp312-abi3-macosx_13_0_universal2", "1b8680ce1e6a9a4736374a9dce4de14ea8ee05e0dccf0784a78a6e5646bdc1f6", "runtime"),
+    ("onnxruntime", "1.31.1", "onnxruntime-1.31.1-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "96dd2564b10ea7153ad9c207e7cd8e5917cb3ba521e0e0a62ac03486fdc8d56c", "runtime"),
+    ("packaging", "26.3", "packaging-26.3-py3-none-any.whl", "py3-none-any", "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", "build+runtime"),
     ("pandas", "2.3.0", "pandas-2.3.0-cp312-cp312-macosx_11_0_arm64.whl", "cp312-cp312-macosx_11_0_arm64", "b9d8c3187be7479ea5c3d30c32a5d73d62a621166675063b2edd21bc47614027", "runtime"),
     ("pip", "25.1.1", "pip-25.1.1-py3-none-any.whl", "py3-none-any", "2913a38a2abf4ea6b64ab507bd9e967f3b53dc1ede74b01b0931e1ce548751af", "bootstrap"),
+    ("protobuf", "7.36.2", "protobuf-7.36.2-cp310-abi3-macosx_10_9_universal2.whl", "cp310-abi3-macosx_10_9_universal2", "cbc70b17ee27e28894c7fee8bb04be1abead49e936bc70eb60052531eee2079e", "runtime"),
     ("pyproject-hooks", "1.2.0", "pyproject_hooks-1.2.0-py3-none-any.whl", "py3-none-any", "9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", "build"),
     ("python-dateutil", "2.9.0.post0", "python_dateutil-2.9.0.post0-py2.py3-none-any.whl", "py2.py3-none-any", "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", "runtime"),
     ("pytz", "2026.3.post1", "pytz-2026.3.post1-py2.py3-none-any.whl", "py2.py3-none-any", "dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815", "runtime"),
     ("referencing", "0.37.0", "referencing-0.37.0-py3-none-any.whl", "py3-none-any", "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231", "runtime"),
     ("rpds-py", "2026.6.3", "rpds_py-2026.6.3-cp312-cp312-macosx_11_0_arm64.whl", "cp312-cp312-macosx_11_0_arm64", "538949e262e46caa31ac01bdb3c1e8f642622922cacbabbae6a8445d9dc33eaf", "runtime"),
+    ("scikit-learn", "1.9.1", "scikit_learn-1.9.1-cp312-cp312-macosx_12_0_arm64.whl", "cp312-cp312-macosx_12_0_arm64", "8c14ce41d561f7749f990b41d6703fe02c4669fbc485e598e069e0a1967b488e", "runtime"),
+    ("scipy", "1.18.1", "scipy-1.18.1-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "7bbf207c4453ce1ad2e00b17313852b33310b83090c2311bdaf97f93c0380d12", "runtime"),
     ("setuptools", "80.9.0", "setuptools-80.9.0-py3-none-any.whl", "py3-none-any", "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922", "build"),
     ("six", "1.17.0", "six-1.17.0-py2.py3-none-any.whl", "py2.py3-none-any", "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", "runtime"),
+    ("skl2onnx", "1.20.0", "skl2onnx-1.20.0-py3-none-any.whl", "py3-none-any", "30cac34803d1776c14b336ae945e48ef28debfc339215acde1cc04b963ed3f7b", "runtime"),
+    ("threadpoolctl", "3.8.0", "threadpoolctl-3.8.0-py3-none-any.whl", "py3-none-any", "f1b49c82704d50f13ffae019c727b0fa4f6791a58f48f06a09c45face1be66da", "runtime"),
     ("typing-extensions", "4.16.0", "typing_extensions-4.16.0-py3-none-any.whl", "py3-none-any", "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8", "runtime"),
     ("tzdata", "2026.3", "tzdata-2026.3-py2.py3-none-any.whl", "py2.py3-none-any", "dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931", "runtime"),
     ("wheel", "0.45.1", "wheel-0.45.1-py3-none-any.whl", "py3-none-any", "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248", "build"),
 )
+_PACKAGE_NAMES = tuple(item[0] for item in _THIRD_PARTY if "runtime" in item[5].split("+"))
+_EXPECTED_DISTRIBUTIONS = frozenset((*_PACKAGE_NAMES, "pip", _PRODUCER_DISTRIBUTION))
 _SPEC_BY_NAME = {item[0]: item for item in _THIRD_PARTY}
 _RECORD_HASH = re.compile(r"^sha256=([A-Za-z0-9_-]{43})$")
 _RECORD_SIZE = re.compile(r"^(?:0|[1-9][0-9]*)$")
@@ -300,12 +318,12 @@ def _validate_pyproject(payload: bytes) -> None:
         raise RuntimeSealError("pyproject.toml is malformed") from error
     project = value.get("project")
     build = value.get("build-system")
-    if not isinstance(project, dict) or not isinstance(build, dict) or project.get("name") != _PRODUCER_DISTRIBUTION or project.get("version") != _PRODUCER_VERSION or project.get("requires-python") != "==3.12.*" or project.get("dependencies") != ["numpy==2.2.6", "pandas==2.3.0", "jsonschema==4.24.0"] or build.get("requires") != ["setuptools==80.9.0", "wheel==0.45.1"] or build.get("build-backend") != "setuptools.build_meta":
+    if not isinstance(project, dict) or not isinstance(build, dict) or project.get("name") != _PRODUCER_DISTRIBUTION or project.get("version") != _PRODUCER_VERSION or project.get("requires-python") != "==3.12.*" or project.get("dependencies") != list(_DIRECT_REQUIREMENTS) or build.get("requires") != ["setuptools==80.9.0", "wheel==0.45.1"] or build.get("build-backend") != "setuptools.build_meta":
         raise RuntimeSealError("pyproject.toml does not match the producer contract")
 
 
 def _expected_requirement_lock(group: str) -> bytes:
-    selected = [item for item in _THIRD_PARTY if item[5] == group]
+    selected = [item for item in _THIRD_PARTY if group in item[5].split("+")]
     return "".join(f"{name}=={version} --hash=sha256:{digest}\n" for name, version, _filename, _tag, digest, _group in sorted(selected, key=lambda item: item[0].encode("utf-8"))).encode("ascii")
 
 

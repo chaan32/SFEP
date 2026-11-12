@@ -45,7 +45,10 @@ _PACKAGE_NAMES = (
     "tzdata",
 )
 _DIRECT_PACKAGE_NAMES = frozenset({"jsonschema", "numpy", "pandas"})
-_EXPECTED_DISTRIBUTIONS = frozenset((*_PACKAGE_NAMES, "pip", _PRODUCER_DISTRIBUTION))
+_MODEL_PRODUCER_VERSION = "1.2.0"
+_MODEL_DIRECT_PACKAGE_NAMES = frozenset({
+    "onnx", "onnxruntime", "scikit-learn", "skl2onnx", "threadpoolctl",
+})
 _PROVENANCE_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -88,6 +91,25 @@ _IMPORT_ROOT_DISTRIBUTIONS = MappingProxyType({
     for distribution, roots in _DISTRIBUTION_IMPORT_ROOTS.items()
     for root in roots
 })
+_MODEL_IMPORT_ROOT_DISTRIBUTIONS = MappingProxyType({
+    **_IMPORT_ROOT_DISTRIBUTIONS,
+    "cloudpickle": "cloudpickle",
+    "flatbuffers": "flatbuffers",
+    "google": "protobuf",
+    "joblib": "joblib",
+    "ml_dtypes": "ml-dtypes",
+    "narwhals": "narwhals",
+    "onnx": "onnx",
+    "onnxruntime": "onnxruntime",
+    "packaging": "packaging",
+    "scipy": "scipy",
+    "skl2onnx": "skl2onnx",
+    "sklearn": "scikit-learn",
+    "threadpoolctl": "threadpoolctl",
+})
+_MODEL_PACKAGE_NAMES = tuple(sorted(
+    set(_MODEL_IMPORT_ROOT_DISTRIBUTIONS.values()) - {_PRODUCER_DISTRIBUTION}
+))
 
 
 class RuntimeIdentityError(RuntimeError):
@@ -741,9 +763,10 @@ def _import_sort_key(item: RuntimeImportOrigin) -> bytes:
 
 
 def _capture_import_state(
+    import_roots: Mapping[str, str] = _IMPORT_ROOT_DISTRIBUTIONS,
 ) -> tuple[tuple[RuntimeImportOrigin, ...], tuple[RuntimeImportOrigin, ...]]:
     resolved: list[RuntimeImportOrigin] = []
-    for root in sorted(_IMPORT_ROOT_DISTRIBUTIONS, key=lambda value: value.encode("utf-8")):
+    for root in sorted(import_roots, key=lambda value: value.encode("utf-8")):
         try:
             spec = importlib.util.find_spec(root)
         except (ImportError, AttributeError, ValueError) as error:
@@ -757,7 +780,7 @@ def _capture_import_state(
         if type(name) is not str or module is None:
             continue
         root = name.partition(".")[0]
-        if root not in _IMPORT_ROOT_DISTRIBUTIONS:
+        if root not in import_roots:
             continue
         spec = getattr(module, "__spec__", None)
         if spec is None:
@@ -768,13 +791,15 @@ def _capture_import_state(
     )
 
 
-def _capture_environment() -> RuntimeEnvironment:
+def _capture_environment(
+    import_roots: Mapping[str, str] = _IMPORT_ROOT_DISTRIBUTIONS,
+) -> RuntimeEnvironment:
     build_number, build_date = platform.python_build()
     cache_tag = sys.implementation.cache_tag
     soabi = sysconfig.get_config_var("SOABI")
     if type(cache_tag) is not str or type(soabi) is not str:
         raise _identity_error("CPython runtime metadata is unavailable")
-    resolved_imports, loaded_imports = _capture_import_state()
+    resolved_imports, loaded_imports = _capture_import_state(import_roots)
     return RuntimeEnvironment(
         executable=Path(sys.executable),
         platform_system=platform.system(),
@@ -809,6 +834,7 @@ def _require_manifest_object(value: object, label: str) -> Mapping[str, object]:
 
 def _installed_distributions(
     environment: RuntimeEnvironment,
+    package_names: tuple[str, ...],
 ) -> dict[str, Distribution]:
     if type(environment.distributions) is not tuple:
         raise _identity_error("runtime distribution inventory is not frozen")
@@ -825,7 +851,7 @@ def _installed_distributions(
         if normalised in observed:
             raise _identity_error("installed distribution names are not unique")
         observed[normalised] = distribution
-    if frozenset(observed) != _EXPECTED_DISTRIBUTIONS:
+    if observed.keys() != {*package_names, "pip", _PRODUCER_DISTRIBUTION}:
         raise _identity_error("installed distribution inventory is not exact")
     return observed
 
@@ -1144,16 +1170,30 @@ def _verify_record_backed_import(
         raise _identity_error("runtime module has unexpected package locations")
 
 
+def _verify_protobuf_namespace(
+    item: RuntimeImportOrigin, tree: _VerifiedTree, *, loaded: bool
+) -> None:
+    if item.module_file is not None or len(item.package_locations) != 1:
+        raise _identity_error("protobuf namespace is not an installed package")
+    location, = item.package_locations
+    expected = (item.name.replace(".", "/"), _physical_path_key(location))
+    if tree.record_directories.get(_lexical_path_key(location)) != expected:
+        raise _identity_error("protobuf namespace is outside its distribution RECORD tree")
+    if item.module_package_locations != (item.package_locations if loaded else ()):
+        raise _identity_error("protobuf namespace path disagrees with its import spec")
+
+
 def _verify_import_bindings(
     environment: RuntimeEnvironment,
     distribution_trees: Mapping[str, _VerifiedTree],
+    import_roots: Mapping[str, str],
 ) -> None:
     resolved = _verify_import_snapshot_shape(
         environment.resolved_imports, "resolved"
     )
     loaded = _verify_import_snapshot_shape(environment.loaded_imports, "loaded")
     expected_resolved = tuple(
-        sorted(_IMPORT_ROOT_DISTRIBUTIONS, key=lambda name: name.encode("utf-8"))
+        sorted(import_roots, key=lambda name: name.encode("utf-8"))
     )
     if tuple(item.name for item in resolved) != expected_resolved:
         raise _identity_error("runtime resolved import root map is not exact")
@@ -1165,13 +1205,16 @@ def _verify_import_bindings(
         *((item, True) for item in loaded),
     ):
         root = item.name.partition(".")[0]
-        distribution_name = _IMPORT_ROOT_DISTRIBUTIONS.get(root)
+        distribution_name = import_roots.get(root)
         if distribution_name is None:
             raise _identity_error("runtime import root is not approved")
         tree = distribution_trees.get(distribution_name)
         if tree is None:
             raise _identity_error("runtime import distribution tree is unavailable")
         if item.origin is None:
+            if item.name in {"google", "google._upb"} and distribution_name == "protobuf":
+                _verify_protobuf_namespace(item, tree, loaded=is_loaded)
+                continue
             if (
                 not is_loaded
                 or item.name == root
@@ -1207,7 +1250,11 @@ def _verify_import_bindings(
             raise _identity_error("synthetic runtime import loader is not RECORD-backed")
 
 
-def _verify_manifest_inventory(manifest: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+def _verify_manifest_inventory(
+    manifest: Mapping[str, object],
+    package_names: tuple[str, ...],
+    direct_names: frozenset[str],
+) -> tuple[Mapping[str, object], ...]:
     raw_packages = manifest["packages"]
     if type(raw_packages) is not list:
         raise _identity_error("manifest package inventory must be an array")
@@ -1226,11 +1273,11 @@ def _verify_manifest_inventory(manifest: Mapping[str, object]) -> tuple[Mapping[
             raise _identity_error("manifest package name must be a string")
         names.append(name)
         packages.append(item)
-    if tuple(names) != _PACKAGE_NAMES:
+    if tuple(names) != package_names:
         raise _identity_error("manifest package inventory or order is not exact")
     for package in packages:
         name = package["name"]
-        expected_direct = name in _DIRECT_PACKAGE_NAMES
+        expected_direct = name in direct_names
         if package["direct"] is not expected_direct:
             raise _identity_error("manifest direct dependency flags are not exact")
     return tuple(packages)
@@ -1332,12 +1379,20 @@ def _verify_runtime(
         validate_normative_instance("producer_runtime.schema.json", parsed)
     except Exception as error:
         raise _identity_error("runtime manifest does not satisfy its schema", error)
-    packages = _verify_manifest_inventory(parsed)
-    snapshot = _capture_environment() if environment is None else environment
+    producer_manifest = _require_manifest_object(parsed["producer"], "producer")
+    model_runtime = producer_manifest["version"] == _MODEL_PRODUCER_VERSION
+    package_names = _MODEL_PACKAGE_NAMES if model_runtime else _PACKAGE_NAMES
+    direct_names = _DIRECT_PACKAGE_NAMES
+    import_roots = _IMPORT_ROOT_DISTRIBUTIONS
+    if model_runtime:
+        direct_names |= _MODEL_DIRECT_PACKAGE_NAMES
+        import_roots = _MODEL_IMPORT_ROOT_DISTRIBUTIONS
+    packages = _verify_manifest_inventory(parsed, package_names, direct_names)
+    snapshot = _capture_environment(import_roots) if environment is None else environment
     if type(snapshot) is not RuntimeEnvironment:
         raise _identity_error("runtime environment adapter is invalid")
     _verify_process_facts(parsed, snapshot)
-    installed = _installed_distributions(snapshot)
+    installed = _installed_distributions(snapshot, package_names)
     distribution_roots = _reject_distribution_bytecode_caches(installed)
 
     pip_distribution = installed["pip"]
@@ -1359,7 +1414,6 @@ def _verify_runtime(
         verified_trees[name] = tree.digest
         distribution_trees[name] = tree
 
-    producer_manifest = _require_manifest_object(parsed["producer"], "producer")
     if producer_manifest["name"] != "equipment-quality":
         raise _identity_error("logical producer name is not exact")
     producer_distribution = installed[_PRODUCER_DISTRIBUTION]
@@ -1380,7 +1434,7 @@ def _verify_runtime(
     _verify_provenance(producer_tree.captured_file, parsed)
     verified_trees[_PRODUCER_DISTRIBUTION] = producer_tree.digest
     distribution_trees[_PRODUCER_DISTRIBUTION] = producer_tree
-    _verify_import_bindings(snapshot, MappingProxyType(distribution_trees))
+    _verify_import_bindings(snapshot, MappingProxyType(distribution_trees), import_roots)
 
     frozen_manifest = _deep_freeze(parsed)
     if not isinstance(frozen_manifest, Mapping):

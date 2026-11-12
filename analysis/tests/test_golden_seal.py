@@ -42,30 +42,42 @@ from factories.runtime import (
 ANALYSIS_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = ANALYSIS_ROOT / "tools"
 WHEELHOUSE = ANALYSIS_ROOT / ".wheelhouse"
-PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+PRODUCER_FILENAME = "sfep_equipment_quality-1.2.0-py3-none-any.whl"
 EXPECTED_SOURCE_DIGEST = (
-    "sha256:26eefd1d37546b1aeb1a56158bad06765cb40f21f975a1c2efe569410d5d9a05"
+    "sha256:106a414e13520d44aa0bc3944e9e574b5df2ada99ce8fc5abcee6d757b1ad58c"
 )
 EXPECTED_PROVENANCE_DIGEST = (
-    "sha256:93ba035df919f9dfbc2a69b510955e223023bf7ddd81689df6af7e31b393c58f"
+    "sha256:b294333d0dc955f40033184e90513e93e35816a4f573fe8572d49916e880e5c7"
 )
 
 THIRD_PARTY_WHEELS = (
     ("attrs", "26.1.0", "attrs-26.1.0-py3-none-any.whl", "py3-none-any", "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309", "runtime"),
     ("build", "1.2.2.post1", "build-1.2.2.post1-py3-none-any.whl", "py3-none-any", "1d61c0887fa860c01971625baae8bdd338e517b836a2f70dd1f7aa3a6b2fc5b5", "build"),
+    ("cloudpickle", "3.1.2", "cloudpickle-3.1.2-py3-none-any.whl", "py3-none-any", "9acb47f6afd73f60dc1df93bb801b472f05ff42fa6c84167d25cb206be1fbf4a", "runtime"),
+    ("flatbuffers", "25.12.19", "flatbuffers-25.12.19-py2.py3-none-any.whl", "py2.py3-none-any", "7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4", "runtime"),
+    ("joblib", "1.6.0", "joblib-1.6.0-py3-none-any.whl", "py3-none-any", "3dbbf9f6e4b592a2357b854608e980fe6390d131d7a82f011a377ef2ebef7aba", "runtime"),
     ("jsonschema", "4.24.0", "jsonschema-4.24.0-py3-none-any.whl", "py3-none-any", "a462455f19f5faf404a7902952b6f0e3ce868f3ee09a359b05eca6673bd8412d", "runtime"),
     ("jsonschema-specifications", "2025.9.1", "jsonschema_specifications-2025.9.1-py3-none-any.whl", "py3-none-any", "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", "runtime"),
+    ("ml-dtypes", "0.6.0", "ml_dtypes-0.6.0-cp312-cp312-macosx_10_13_universal2.whl", "cp312-cp312-macosx_10_13_universal2", "5359c588cc62de6f78d7430f06b65853d884955494d86d6ad90b6dd64a3f3a08", "runtime"),
+    ("narwhals", "2.28.0", "narwhals-2.28.0-py3-none-any.whl", "py3-none-any", "1f69d6385ec30e2fa6e1fdeb37c562ecabd0f713f6f3e3b58a668c5c9df9567f", "runtime"),
     ("numpy", "2.2.6", "numpy-2.2.6-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "894b3a42502226a1cac872f840030665f33326fc3dac8e57c607905773cdcde3", "runtime"),
-    ("packaging", "26.3", "packaging-26.3-py3-none-any.whl", "py3-none-any", "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", "build"),
+    ("onnx", "1.23.2", "onnx-1.23.2-cp312-abi3-macosx_13_0_universal2.whl", "cp312-abi3-macosx_13_0_universal2", "1b8680ce1e6a9a4736374a9dce4de14ea8ee05e0dccf0784a78a6e5646bdc1f6", "runtime"),
+    ("onnxruntime", "1.31.1", "onnxruntime-1.31.1-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "96dd2564b10ea7153ad9c207e7cd8e5917cb3ba521e0e0a62ac03486fdc8d56c", "runtime"),
+    ("packaging", "26.3", "packaging-26.3-py3-none-any.whl", "py3-none-any", "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", "build+runtime"),
     ("pandas", "2.3.0", "pandas-2.3.0-cp312-cp312-macosx_11_0_arm64.whl", "cp312-cp312-macosx_11_0_arm64", "b9d8c3187be7479ea5c3d30c32a5d73d62a621166675063b2edd21bc47614027", "runtime"),
     ("pip", "25.1.1", "pip-25.1.1-py3-none-any.whl", "py3-none-any", "2913a38a2abf4ea6b64ab507bd9e967f3b53dc1ede74b01b0931e1ce548751af", "bootstrap"),
+    ("protobuf", "7.36.2", "protobuf-7.36.2-cp310-abi3-macosx_10_9_universal2.whl", "cp310-abi3-macosx_10_9_universal2", "cbc70b17ee27e28894c7fee8bb04be1abead49e936bc70eb60052531eee2079e", "runtime"),
     ("pyproject-hooks", "1.2.0", "pyproject_hooks-1.2.0-py3-none-any.whl", "py3-none-any", "9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", "build"),
     ("python-dateutil", "2.9.0.post0", "python_dateutil-2.9.0.post0-py2.py3-none-any.whl", "py2.py3-none-any", "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", "runtime"),
     ("pytz", "2026.3.post1", "pytz-2026.3.post1-py2.py3-none-any.whl", "py2.py3-none-any", "dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815", "runtime"),
     ("referencing", "0.37.0", "referencing-0.37.0-py3-none-any.whl", "py3-none-any", "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231", "runtime"),
     ("rpds-py", "2026.6.3", "rpds_py-2026.6.3-cp312-cp312-macosx_11_0_arm64.whl", "cp312-cp312-macosx_11_0_arm64", "538949e262e46caa31ac01bdb3c1e8f642622922cacbabbae6a8445d9dc33eaf", "runtime"),
+    ("scikit-learn", "1.9.1", "scikit_learn-1.9.1-cp312-cp312-macosx_12_0_arm64.whl", "cp312-cp312-macosx_12_0_arm64", "8c14ce41d561f7749f990b41d6703fe02c4669fbc485e598e069e0a1967b488e", "runtime"),
+    ("scipy", "1.18.1", "scipy-1.18.1-cp312-cp312-macosx_14_0_arm64.whl", "cp312-cp312-macosx_14_0_arm64", "7bbf207c4453ce1ad2e00b17313852b33310b83090c2311bdaf97f93c0380d12", "runtime"),
     ("setuptools", "80.9.0", "setuptools-80.9.0-py3-none-any.whl", "py3-none-any", "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922", "build"),
     ("six", "1.17.0", "six-1.17.0-py2.py3-none-any.whl", "py2.py3-none-any", "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", "runtime"),
+    ("skl2onnx", "1.20.0", "skl2onnx-1.20.0-py3-none-any.whl", "py3-none-any", "30cac34803d1776c14b336ae945e48ef28debfc339215acde1cc04b963ed3f7b", "runtime"),
+    ("threadpoolctl", "3.8.0", "threadpoolctl-3.8.0-py3-none-any.whl", "py3-none-any", "f1b49c82704d50f13ffae019c727b0fa4f6791a58f48f06a09c45face1be66da", "runtime"),
     ("typing-extensions", "4.16.0", "typing_extensions-4.16.0-py3-none-any.whl", "py3-none-any", "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8", "runtime"),
     ("tzdata", "2026.3", "tzdata-2026.3-py2.py3-none-any.whl", "py2.py3-none-any", "dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931", "runtime"),
     ("wheel", "0.45.1", "wheel-0.45.1-py3-none-any.whl", "py3-none-any", "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248", "build"),
@@ -74,8 +86,8 @@ THIRD_PARTY_WHEELS = (
 LOCK_DIGESTS = {
     "bootstrap.lock": "9994816214185cd82bde3c2428852b6a8c77b156c54d01ec139f7f08e10832b8",
     "build-requirements.lock": "097e72ac9f7ba259d530f3a09fd10f840c58ff094761a4c17fb0c9ca8c72c4cb",
-    "requirements.lock": "1fa66c13e8e7bcd8df20ead99b1adfafb227a08691fb67d8bd80861c7d8549ec",
-    "wheelhouse.lock.json": "6e8ed7650891c4651586b05a561b00a85be81fd8a9ce9a264b5b710ee7b4af43",
+    "requirements.lock": "2f3a6c77dbd54f24fb13a7f3b71940cf462ae98513de399021aaef232b7f5e17",
+    "wheelhouse.lock.json": "3ce82fe88cc0e9911c80cef37cf58e524045cf95b3f0799be6955a72273ce797",
 }
 
 
@@ -87,7 +99,7 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 
 def _expected_lock_bytes(group: str) -> bytes:
-    selected = [item for item in THIRD_PARTY_WHEELS if item[5] == group]
+    selected = [item for item in THIRD_PARTY_WHEELS if group in item[5].split("+")]
     return "".join(
         f"{name}=={version} --hash=sha256:{digest}\n"
         for name, version, _filename, _tag, digest, _group in sorted(
@@ -247,9 +259,9 @@ def _rewrite_wheel(
 def _mutated_wheel(wheel: Path, case: str) -> bytes:
     if case.startswith(("local-", "eocd-", "central-")) or case == "unclaimed-gap":
         return _mutated_raw_zip(wheel, case)
-    metadata_path = "sfep_equipment_quality-1.1.0.dist-info/METADATA"
-    wheel_path = "sfep_equipment_quality-1.1.0.dist-info/WHEEL"
-    record_path = "sfep_equipment_quality-1.1.0.dist-info/RECORD"
+    metadata_path = "sfep_equipment_quality-1.2.0.dist-info/METADATA"
+    wheel_path = "sfep_equipment_quality-1.2.0.dist-info/WHEEL"
+    record_path = "sfep_equipment_quality-1.2.0.dist-info/RECORD"
     additions: tuple[tuple[zipfile.ZipInfo, bytes], ...] = ()
     archive_comment = b""
     mutate_info: Callable[[zipfile.ZipInfo], None] | None = None
@@ -263,7 +275,7 @@ def _mutated_wheel(wheel: Path, case: str) -> bytes:
                 b"Name: sfep-equipment-quality", b"Name: other-producer"
             )
         if case == "metadata-version" and name == metadata_path:
-            return name, payload.replace(b"Version: 1.1.0", b"Version: 9.0.0")
+            return name, payload.replace(b"Version: 1.2.0", b"Version: 9.0.0")
         if case == "wheel-tag" and name == wheel_path:
             return name, payload.replace(b"Tag: py3-none-any", b"Tag: cp312-none-any")
         if case.startswith("provenance-") and name == PROVENANCE_PATH:
@@ -518,7 +530,7 @@ def test_frozen_third_party_locks_match_independent_literal_oracle() -> None:
         "requirements.lock": _expected_lock_bytes("runtime"),
         "wheelhouse.lock.json": _expected_wheelhouse_lock_bytes(),
     }
-    assert len(THIRD_PARTY_WHEELS) == 18
+    assert len(THIRD_PARTY_WHEELS) == 30
     inventory = {path.name for path in WHEELHOUSE.iterdir()}
     expected_third_party = {item[2] for item in THIRD_PARTY_WHEELS}
     assert inventory - {PRODUCER_FILENAME} == expected_third_party
@@ -533,7 +545,7 @@ def test_frozen_third_party_locks_match_independent_literal_oracle() -> None:
             (WHEELHOUSE / PRODUCER_FILENAME).read_bytes()
         ).hexdigest()
         assert (ANALYSIS_ROOT / "producer.lock").read_bytes() == (
-            "sfep-equipment-quality==1.1.0 "
+            "sfep-equipment-quality==1.2.0 "
             f"--hash=sha256:{producer_digest}\n"
         ).encode("ascii")
 
@@ -542,7 +554,7 @@ def test_source_preimage_and_provenance_match_independent_literals() -> None:
     preimage = independent_source_preimage(ANALYSIS_ROOT)
     provenance = independently_expected_provenance(ANALYSIS_ROOT)
 
-    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 29
+    assert len(source_tree_bytes(ANALYSIS_ROOT)) == 35
     assert preimage.startswith(b"sfep-source-lines/v1\n")
     assert independent_source_digest(ANALYSIS_ROOT) == EXPECTED_SOURCE_DIGEST
     assert _sha256_uri(provenance) == EXPECTED_PROVENANCE_DIGEST
@@ -2579,7 +2591,7 @@ def producer_wheel_pair(
 
 def _expected_producer_lock(wheel: Path) -> bytes:
     return (
-        "sfep-equipment-quality==1.1.0 "
+        "sfep-equipment-quality==1.2.0 "
         f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
     ).encode("ascii")
 
@@ -3495,19 +3507,35 @@ def test_build_seal_bad_lock_parent_leaves_no_temp_or_output_residue(
 
 RUNTIME_PACKAGE_NAMES = (
     "attrs",
+    "cloudpickle",
+    "flatbuffers",
+    "joblib",
     "jsonschema",
     "jsonschema-specifications",
+    "ml-dtypes",
+    "narwhals",
     "numpy",
+    "onnx",
+    "onnxruntime",
+    "packaging",
     "pandas",
+    "protobuf",
     "python-dateutil",
     "pytz",
     "referencing",
     "rpds-py",
+    "scikit-learn",
+    "scipy",
     "six",
+    "skl2onnx",
+    "threadpoolctl",
     "typing-extensions",
     "tzdata",
 )
-RUNTIME_DIRECT_NAMES = frozenset({"jsonschema", "numpy", "pandas"})
+RUNTIME_DIRECT_NAMES = frozenset({
+    "jsonschema", "numpy", "onnx", "onnxruntime", "pandas", "scikit-learn",
+    "skl2onnx", "threadpoolctl",
+})
 RUNTIME_HASH_PROBES = (-4218979432691865272, 1379760580859628941)
 RUNTIME_GENERATED_SCRIPTS = {
     "jsonschema": {"jsonschema": "jsonschema.cli:main"},
@@ -3515,6 +3543,12 @@ RUNTIME_GENERATED_SCRIPTS = {
         "f2py": "numpy.f2py.f2py2e:main",
         "numpy-config": "numpy._configtool:main",
     },
+    "onnx": {
+        "backend-test-tools": "onnx.backend.test.cmd_tools:main",
+        "check-model": "onnx.bin.checker:check_model",
+        "check-node": "onnx.bin.checker:check_node",
+    },
+    "onnxruntime": {"onnxruntime_test": "onnxruntime.tools.onnxruntime_test:main"},
     "pip": {
         "pip": "pip._internal.cli.main:main",
         "pip3": "pip._internal.cli.main:main",
@@ -3804,7 +3838,7 @@ def test_runtime_seal_is_canonical_path_independent_and_schema_valid(
     ]
     assert manifest["pipVersion"] == "25.1.1"
     assert manifest["producer"]["name"] == "equipment-quality"
-    assert manifest["producer"]["version"] == "1.1.0"
+    assert manifest["producer"]["version"] == "1.2.0"
     forbidden = {
         str(ANALYSIS_ROOT).encode(),
         str(WHEELHOUSE).encode(),
@@ -7513,26 +7547,22 @@ def test_golden_oracles_ignore_valid_but_different_current_runtime_manifest(
     current_bytes = current.read_bytes()
     v1_runtime = _GOLDEN_CONTRACT_ROOT / "golden-bundle/producer_runtime.json"
     v2_runtime = _GOLDEN_V2_BUNDLE / "producer_runtime.json"
-    assert current_bytes == v2_runtime.read_bytes()
+    assert current_bytes != v2_runtime.read_bytes()
     assert current_bytes != v1_runtime.read_bytes()
-    try:
-        current.write_bytes(v1_runtime.read_bytes())
-        v1_output = tmp_path / "v1"
-        v1_result = _run_golden_seal(
-            _GOLDEN_CONTRACT_ROOT,
-            ANALYSIS_ROOT / "analysis_config.json",
-            v1_runtime,
-            v1_output,
-        )
-        v2_output = tmp_path / "v2"
-        v2_result = _run_golden_v2_seal(
-            _GOLDEN_CONTRACT_ROOT,
-            _GOLDEN_V2_CONFIG,
-            v2_runtime,
-            v2_output,
-        )
-    finally:
-        current.write_bytes(current_bytes)
+    v1_output = tmp_path / "v1"
+    v1_result = _run_golden_seal(
+        _GOLDEN_CONTRACT_ROOT,
+        ANALYSIS_ROOT / "analysis_config.json",
+        v1_runtime,
+        v1_output,
+    )
+    v2_output = tmp_path / "v2"
+    v2_result = _run_golden_v2_seal(
+        _GOLDEN_CONTRACT_ROOT,
+        _GOLDEN_V2_CONFIG,
+        v2_runtime,
+        v2_output,
+    )
 
     assert v1_result.returncode == 0, v1_result.stderr
     assert v2_result.returncode == 0, v2_result.stderr

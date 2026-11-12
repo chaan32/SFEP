@@ -22,18 +22,31 @@ import tomllib
 _SOURCE_DATE_EPOCH = 1735689600
 _SOURCE_HEADER = b"sfep-source-lines/v1\n"
 _PROVENANCE_PATH = "equipment_quality/sfep_producer_provenance.json"
-_PRODUCER_FILENAME = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+_PRODUCER_FILENAME = "sfep_equipment_quality-1.2.0-py3-none-any.whl"
 _RUNTIME_VERSIONS = {
     "attrs": "26.1.0",
+    "cloudpickle": "3.1.2",
+    "flatbuffers": "25.12.19",
+    "joblib": "1.6.0",
     "jsonschema": "4.24.0",
     "jsonschema-specifications": "2025.9.1",
+    "ml-dtypes": "0.6.0",
+    "narwhals": "2.28.0",
     "numpy": "2.2.6",
+    "onnx": "1.23.2",
+    "onnxruntime": "1.31.1",
+    "packaging": "26.3",
     "pandas": "2.3.0",
+    "protobuf": "7.36.2",
     "python-dateutil": "2.9.0.post0",
     "pytz": "2026.3.post1",
     "referencing": "0.37.0",
     "rpds-py": "2026.6.3",
+    "scikit-learn": "1.9.1",
+    "scipy": "1.18.1",
     "six": "1.17.0",
+    "skl2onnx": "1.20.0",
+    "threadpoolctl": "3.8.0",
     "typing-extensions": "4.16.0",
     "tzdata": "2026.3",
 }
@@ -698,7 +711,7 @@ def _validate_pyproject(payload: bytes) -> None:
         package_data = setuptools["package-data"]["equipment_quality"]
     except (UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
         raise ProducerBuildError("pyproject.toml does not define the producer") from error
-    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.1.0":
+    if project.get("name") != "sfep-equipment-quality" or project.get("version") != "1.2.0":
         raise ProducerBuildError("pyproject.toml producer name/version is invalid")
     if "sfep_producer_provenance.json" not in package_data:
         raise ProducerBuildError("pyproject.toml does not package provenance")
@@ -723,7 +736,7 @@ def _provenance(snapshot: dict[str, bytes], requirements: bytes) -> bytes:
         "schemaVersion": "sfep-producer-provenance/v1",
         "producerName": "equipment-quality",
         "distributionName": "sfep-equipment-quality",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "sourceSha256": _source_digest(snapshot),
         "sourceDateEpoch": str(_SOURCE_DATE_EPOCH),
         "requirementsLockSha256": _sha256_uri(requirements),

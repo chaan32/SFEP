@@ -1473,6 +1473,15 @@ def test_all_verification_failures_use_the_single_public_exception(
     assert type(error.value) is RuntimeIdentityError
 
 
+def test_current_producer_requires_the_model_inventory(runtime_fixture: RuntimeFixture) -> None:
+    manifest = json.loads(runtime_fixture.manifest_path.read_bytes())
+    manifest["producer"]["version"] = "1.2.0"
+    runtime_fixture.set_manifest_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(RuntimeIdentityError, match="manifest package inventory"):
+        _verify(runtime_fixture)
+
+
 def _current_runtime_paths() -> tuple[Path, Path, Path]:
     repository = Path(__file__).resolve().parents[2]
     return (
@@ -1489,25 +1498,27 @@ def _assert_current_runtime_provenance(manifest_path: Path) -> None:
     producer = manifest["producer"]
     runtime_path, producer_lock, _v1_runtime = _current_runtime_paths()
     match = __import__("re").fullmatch(
-        rb"sfep-equipment-quality==1\.1\.0 --hash=sha256:([0-9a-f]{64})\n",
+        rb"sfep-equipment-quality==1\.2\.0 --hash=sha256:([0-9a-f]{64})\n",
         producer_lock.read_bytes(),
     )
     assert match is not None
     assert producer == {
         **producer,
         "name": "equipment-quality",
-        "version": "1.1.0",
-        "wheelFilename": "sfep_equipment_quality-1.1.0-py3-none-any.whl",
+        "version": "1.2.0",
+        "wheelFilename": "sfep_equipment_quality-1.2.0-py3-none-any.whl",
         "wheelSha256": "sha256:" + match.group(1).decode("ascii"),
         "sourceSha256": independent_source_digest(runtime_path.parent),
     }
 
 
-def test_checked_in_current_runtime_is_honest_1_1_and_not_the_v1_golden_copy() -> None:
+def test_checked_in_current_runtime_is_honest_1_2_and_distinct_from_golden() -> None:
     runtime, _producer_lock, v1_runtime = _current_runtime_paths()
+    v2_runtime = v1_runtime.parents[2] / "v2/golden-bundle/producer_runtime.json"
 
     _assert_current_runtime_provenance(runtime)
     assert runtime.read_bytes() != v1_runtime.read_bytes()
+    assert runtime.read_bytes() != v2_runtime.read_bytes()
 
 
 @pytest.mark.parametrize("field", ("sourceSha256", "wheelSha256"))
@@ -1525,21 +1536,21 @@ def test_current_runtime_provenance_check_rejects_source_and_wheel_digest_tamper
         _assert_current_runtime_provenance(tampered)
 
 
-def test_compatibility_runtime_authenticates_current_manifest_and_rejects_v1_copy(
+def test_sealed_runtime_authenticates_current_manifest_and_rejects_v1_copy(
     tmp_path: Path,
 ) -> None:
-    runtime_root = os.environ.get("SFEP_COMPAT_RUNTIME")
+    runtime_root = os.environ.get("SFEP_SEALED_RUNTIME")
     if runtime_root is None:
-        pytest.skip("SFEP_COMPAT_RUNTIME is required for installed-runtime acceptance")
+        pytest.skip("SFEP_SEALED_RUNTIME is required for installed-runtime acceptance")
     python = Path(runtime_root) / "bin/python"
     if not python.is_file():
-        pytest.skip("compatibility runtime Python is unavailable")
+        pytest.skip("sealed runtime Python is unavailable")
     runtime, _producer_lock, v1_runtime = _current_runtime_paths()
     script = (
         "from pathlib import Path; import sys; "
         "from equipment_quality.runtime_verify import verify_runtime; "
         "identity=verify_runtime(Path(sys.argv[1])); "
-        "assert identity.manifest['producer']['version']=='1.1.0'"
+        "assert identity.manifest['producer']['version']=='1.2.0'"
     )
     environment = {
         **os.environ,
@@ -1547,6 +1558,7 @@ def test_compatibility_runtime_authenticates_current_manifest_and_rejects_v1_cop
         "PYTHONDONTWRITEBYTECODE": "1",
         "TZ": "Asia/Seoul",
     }
+    environment.pop("PYTHONPATH", None)
 
     accepted = subprocess.run(
         [str(python), "-P", "-s", "-B", "-c", script, str(runtime)],
@@ -1577,3 +1589,14 @@ def test_compatibility_runtime_authenticates_current_manifest_and_rejects_v1_cop
     assert accepted.returncode == 0, accepted.stderr
     assert copied.returncode != 0
     assert rejected_tree.returncode != 0
+
+    (tmp_path / "google").mkdir()
+    rejected_namespace = subprocess.run(
+        [str(python), "-P", "-s", "-B", "-c", script, str(runtime)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**environment, "PYTHONPATH": str(tmp_path)},
+    )
+    assert rejected_namespace.returncode != 0
+    assert "protobuf namespace" in rejected_namespace.stderr

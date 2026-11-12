@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import textwrap
 import time
+import tomllib
 
 import pytest
 
@@ -228,6 +230,55 @@ def _remove_fake_recoveries(targets: list[Path]) -> None:
 def test_checked_in_lock_is_the_exact_pinned_archive_set() -> None:
     assert LOCK.is_file(), "pinned lock file is missing"
     assert LOCK.read_text(encoding="ascii") == EXPECTED_LOCK
+
+
+def test_producer_release_is_1_2_0() -> None:
+    analysis = LOCK.parent
+    project = tomllib.loads((analysis / "pyproject.toml").read_text())["project"]
+    runtime = json.loads((analysis / "producer_runtime.json").read_bytes())
+    assert project["version"] == runtime["producer"]["version"] == "1.2.0"
+
+
+def test_training_dependency_closure_is_hash_locked_and_sealed() -> None:
+    direct = {
+        "onnx": "1.23.2",
+        "onnxruntime": "1.31.1",
+        "scikit-learn": "1.9.1",
+        "skl2onnx": "1.20.0",
+        "threadpoolctl": "3.8.0",
+    }
+    transitive = {
+        "cloudpickle": "3.1.2",
+        "flatbuffers": "25.12.19",
+        "joblib": "1.6.0",
+        "ml-dtypes": "0.6.0",
+        "narwhals": "2.28.0",
+        "packaging": "26.3",
+        "protobuf": "7.36.2",
+        "scipy": "1.18.1",
+    }
+    analysis = LOCK.parent
+    project = tomllib.loads((analysis / "pyproject.toml").read_text())["project"]
+    requirements = (analysis / "requirements.lock").read_text()
+    wheels = {
+        wheel["filename"]: wheel
+        for wheel in json.loads((analysis / "wheelhouse.lock.json").read_bytes())["wheels"]
+    }
+    packages = {
+        package["name"]: package
+        for package in json.loads((analysis / "producer_runtime.json").read_bytes())["packages"]
+    }
+    assert set(direct) | set(transitive) <= packages.keys()
+    for name, version in (direct | transitive).items():
+        package = packages[name]
+        requirement = f"{name}=={version}"
+        assert (requirement in project["dependencies"]) == (name in direct)
+        assert package["version"] == version
+        assert package["direct"] == (name in direct)
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", package["wheelSha256"])
+        assert f"{requirement} --hash={package['wheelSha256']}" in requirements.splitlines()
+        assert wheels[package["wheelFilename"]]["sha256"] == package["wheelSha256"]
+        assert wheels[package["wheelFilename"]]["tag"] == package["wheelTag"]
 
 
 @pytest.mark.parametrize(

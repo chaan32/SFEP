@@ -568,7 +568,7 @@ def independently_expected_provenance(source_root: Path) -> bytes:
         "schemaVersion": "sfep-producer-provenance/v1",
         "producerName": "equipment-quality",
         "distributionName": PRODUCER_NAME,
-        "version": PRODUCER_VERSION,
+        "version": "1.2.0",
         "sourceSha256": independent_source_digest(source_root),
         "sourceDateEpoch": SOURCE_DATE_EPOCH,
         "requirementsLockSha256": sha256_uri(
@@ -662,7 +662,7 @@ def two_wheels(
     first_payload: bytes,
     second_payload: bytes | None = None,
 ) -> tuple[Path, Path]:
-    filename = "sfep_equipment_quality-1.1.0-py3-none-any.whl"
+    filename = "sfep_equipment_quality-1.2.0-py3-none-any.whl"
     wheel_a = root / "wheel-a" / filename
     wheel_b = root / "wheel-b" / filename
     wheel_a.parent.mkdir(parents=True)

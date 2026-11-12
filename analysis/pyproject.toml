@@ -4,12 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sfep-equipment-quality"
-version = "1.1.0"
+version = "1.2.0"
 requires-python = "==3.12.*"
 dependencies = [
   "numpy==2.2.6",
   "pandas==2.3.0",
   "jsonschema==4.24.0",
+  "scikit-learn==1.9.1",
+  "onnx==1.23.2",
+  "skl2onnx==1.20.0",
+  "onnxruntime==1.31.1",
+  "threadpoolctl==3.8.0",
 ]
 
 [project.scripts]
