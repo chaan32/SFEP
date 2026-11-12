@@ -776,7 +776,14 @@ def _artifact_lineage_paths(
         "bundleId": request.bundle_identity.value,
         "criteriaId": request.criteria_identity.value,
         "criteriaIdentity": request.criteria_identity.fields,
-        "identity": request.bundle_identity.fields,
+        # The v2 summary schema describes statistical lineage; the v3 manifest binds the model.
+        "identity": {
+            key: value for key, value in request.bundle_identity.fields.items()
+            if key not in {
+                "model_id", "quality_model_sha256", "quality_model_metadata_sha256",
+                "schema.quality_model_metadata.sha256",
+            }
+        },
         "labelMaturityDays": request.analysis_config.label_maturity_days,
         "schemaVersion": request.contract.manifest_version,
         "timezone": request.analysis_config.timezone,

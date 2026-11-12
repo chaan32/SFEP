@@ -213,12 +213,20 @@ def run_analysis(
         bootstrap_seed,
         material_catalog=material_catalog,
     )
+    model_artifacts = {}
+    if "quality_model" in contract.artifact_versions:
+        # Native model modules load only after the sealed runtime is verified.
+        from equipment_quality.model_cli import bundle_model_artifacts
+
+        model, metadata = bundle_model_artifacts(split, int(bootstrap_seed.material[-8:], 16))
+        model_artifacts = {"quality_model": model, "quality_model_metadata": metadata}
     bundle_identity = compute_bundle_identity(
         criteria_identity.value,
         analysis_config_bytes,
         producer_runtime_bytes,
         inputs.sources,
         schema_digests=schema_digests,
+        **model_artifacts,
     )
     events = tuple(
         build_replay_events(
@@ -276,6 +284,7 @@ def run_analysis(
         timezone=analysis_config.timezone,
         label_maturity_days=analysis_config.label_maturity_days,
         manifest_version=contract.manifest_version,
+        **model_artifacts,
     )
     return write_bundle(bundle_request)
 
