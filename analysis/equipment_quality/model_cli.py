@@ -52,6 +52,29 @@ def _test_vectors(rows, matrix, probabilities, feature_names):
     return {"raw": raw, "matrix": matrix[:10], "probabilities": probabilities[:10]}
 
 
+def select_exportable(ranked, reference_x):
+    failures = []
+    for candidate in ranked:
+        try:
+            blob = export_onnx(candidate.estimator, reference_x.shape[1])
+            with single_threaded():
+                native = candidate.estimator.predict_proba(reference_x)[:, 1]
+            parity = verify_probability_parity(native, onnx_probabilities(blob, reference_x)[:, 1])
+            return candidate, blob, parity, failures
+        except (ValueError, RuntimeError, NotImplementedError) as error:
+            failures.append({"model": candidate.name, "reason": str(error)})
+    raise ValueError(f"NO_EXPORTABLE_CANDIDATE: {failures}")
+
+
+def score_holdout(estimator, matrix, labels, probabilities, threshold, reference_prevalence, contract, seed):
+    metrics = classification_metrics(labels, probabilities, threshold, reference_prevalence)
+    prevalence = float(np.mean(labels))
+    qualified = metrics.average_precision > prevalence and metrics.brier_skill > 0 and metrics.tp + metrics.fp > 0 and metrics.tp + metrics.fn > 0
+    qualification = "QUALIFIED" if qualified else "RESEARCH_ONLY"
+    importance = grouped_holdout_importance(estimator, matrix, labels, None, contract, seed)
+    return metrics, qualification, importance
+
+
 def run_model(config_path: Path, data_dir: Path, output_dir: Path) -> dict:
     config_bytes = config_path.read_bytes()
     config = load_analysis_config(config_path)
@@ -67,26 +90,12 @@ def run_model(config_path: Path, data_dir: Path, output_dir: Path) -> dict:
     holdout_y = np.asarray(holdout.labels, dtype=object)[holdout.evaluable].astype(np.int8)
     if set(holdout_y) != {0, 1}:
         raise ValueError("INSUFFICIENT_LABELS")
-    failures = []
-    for candidate in candidates.ranked:
-        try:
-            blob = export_onnx(candidate.estimator, reference_x.shape[1])
-            with single_threaded():
-                native = candidate.estimator.predict_proba(reference_x)[:, 1]
-            parity = verify_probability_parity(native, onnx_probabilities(blob, reference_x)[:, 1])
-            chosen = candidate
-            break
-        except (ValueError, RuntimeError, NotImplementedError) as error:
-            failures.append({"model": candidate.name, "reason": str(error)})
-    else:
-        raise ValueError(f"NO_EXPORTABLE_CANDIDATE: {failures}")
+    chosen, blob, parity, failures = select_exportable(candidates.ranked, reference_x)
     probability = onnx_probabilities(blob, holdout_x)[:, 1]
-    metrics = classification_metrics(holdout_y, probability, chosen.threshold, candidates.reference_prevalence)
+    metrics, qualification, importance = score_holdout(chosen.estimator, holdout_x, holdout_y, probability, chosen.threshold, candidates.reference_prevalence, candidates.feature_contract, seed)
     prevalence = float(holdout_y.mean())
-    qualified = metrics.average_precision > prevalence and metrics.brier_skill > 0 and metrics.tp + metrics.fp > 0 and metrics.tp + metrics.fn > 0
-    importance = grouped_holdout_importance(chosen.estimator, holdout_x, holdout_y, holdout.evaluable, candidates.feature_contract, seed)
     feature_wire = candidates.feature_contract.to_wire()
-    metadata = {"schemaVersion": "sfep-quality-model-dev/v1", "model": chosen.name, "features": feature_wire, "featureSha256": _digest(canonical_json_bytes(feature_wire)), "threshold": chosen.threshold, "qualification": "QUALIFIED" if qualified else "RESEARCH_ONLY", "onnxSha256": _digest(blob)}
+    metadata = {"schemaVersion": "sfep-quality-model-dev/v1", "model": chosen.name, "features": feature_wire, "featureSha256": _digest(canonical_json_bytes(feature_wire)), "threshold": chosen.threshold, "qualification": qualification, "onnxSha256": _digest(blob)}
     report = {"holdoutTotal": len(split.holdout_rows), "holdoutEvaluable": len(holdout_y), "holdoutDefects": int(holdout_y.sum()), "oofRanking": [{"model": c.name, "averagePrecision": c.metrics.average_precision, "threshold": c.threshold} for c in candidates.ranked], "selectedModel": chosen.name, "exportFailures": failures, "threshold": chosen.threshold, "holdoutRecall": metrics.recall, "holdoutPrecision": metrics.precision, "holdoutAveragePrecision": metrics.average_precision, "holdoutBrierSkill": metrics.brier_skill, "holdoutPrevalence": prevalence, "confusion": {"tp": metrics.tp, "fp": metrics.fp, "tn": metrics.tn, "fn": metrics.fn}, "qualification": metadata["qualification"], "pythonOnnxMaxDifference": parity, "importance": list(importance)}
     eligible_rows = split.holdout_rows.iloc[np.flatnonzero(holdout.evaluable)]
     vectors = _test_vectors(eligible_rows, holdout_x.tolist(), probability.tolist(), [f["name"] for f in metadata["features"]["features"]])
