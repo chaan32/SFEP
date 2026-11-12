@@ -2,6 +2,7 @@ package com.sfep.equipmentmonitor.ui;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.sfep.equipmentmonitor.bundle.LoadedBundle;
+import com.sfep.equipmentmonitor.prediction.QualityModelMetadata;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -20,7 +21,8 @@ public record MonitorDashboardMetadata(
         int rangeDefinitionCount,
         int qualityRuleDefinitionCount,
         List<ManagementFact> managementFacts,
-        List<DefinitionView> definitions) {
+        List<DefinitionView> definitions,
+        QualityModelView qualityModel) {
     public MonitorDashboardMetadata {
         Objects.requireNonNull(bundleId, "bundleId");
         Objects.requireNonNull(criteriaId, "criteriaId");
@@ -49,10 +51,14 @@ public record MonitorDashboardMetadata(
             int qualityRuleDefinitionCount) {
         this(bundleId, criteriaId, asOf, evaluationMode, dateFrom, dateTo,
                 holdoutTotal, replayRows, rangeDefinitionCount, qualityRuleDefinitionCount,
-                List.of(), List.of());
+                List.of(), List.of(), null);
     }
 
     public static MonitorDashboardMetadata from(LoadedBundle bundle) {
+        return from(bundle, null);
+    }
+
+    public static MonitorDashboardMetadata from(LoadedBundle bundle, QualityModelMetadata model) {
         Objects.requireNonNull(bundle, "bundle");
         return new MonitorDashboardMetadata(
                 bundle.bundleId(),
@@ -66,8 +72,11 @@ public record MonitorDashboardMetadata(
                 bundle.ranges().size(),
                 bundle.rules().size(),
                 managementFacts(bundle.management()),
-                definitions(bundle));
+                definitions(bundle),
+                model == null ? null : new QualityModelView(model.modelId(), model.qualification(), model.threshold()));
     }
+
+    public record QualityModelView(String modelId, String qualification, double threshold) { }
 
     private static List<ManagementFact> managementFacts(LoadedBundle.ManagementProjection management) {
         List<ManagementFact> facts = new ArrayList<>();

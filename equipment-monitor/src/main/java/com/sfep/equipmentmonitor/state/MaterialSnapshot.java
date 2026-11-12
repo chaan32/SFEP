@@ -1,5 +1,7 @@
 package com.sfep.equipmentmonitor.state;
 
+import com.sfep.equipmentmonitor.prediction.QualityPrediction;
+import com.sfep.equipmentmonitor.risk.ProcessStage;
 import com.sfep.equipmentmonitor.risk.RangeEvaluation;
 import com.sfep.equipmentmonitor.risk.RiskGrade;
 import com.sfep.equipmentmonitor.risk.RiskScalar;
@@ -27,7 +29,8 @@ public record MaterialSnapshot(
         List<StageAssessment> assessments,
         RiskGrade qualityRisk,
         RiskGrade historicalEvidenceRisk,
-        long matchedRuleCount) {
+        long matchedRuleCount,
+        QualityPrediction qualityPrediction) {
     public MaterialSnapshot {
         Objects.requireNonNull(materialKey, "materialKey");
         Objects.requireNonNull(chargeId, "chargeId");
@@ -46,5 +49,9 @@ public record MaterialSnapshot(
         if (matchedRuleCount < 0) {
             throw new IllegalArgumentException("matchedRuleCount must be non-negative");
         }
+    }
+
+    public String predictedAtStage() {
+        return qualityPrediction == null ? null : ProcessStage.FURNACE_EXTRACTED.name();
     }
 }

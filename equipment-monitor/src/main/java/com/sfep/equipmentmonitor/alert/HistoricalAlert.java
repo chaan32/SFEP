@@ -30,14 +30,18 @@ public record HistoricalAlert(
         Objects.requireNonNull(replayDate, "replayDate");
         Objects.requireNonNull(equipmentType, "equipmentType");
         Objects.requireNonNull(equipmentId, "equipmentId");
-        Objects.requireNonNull(grade, "grade");
         if (kind == AlertKind.OPERATING_RANGE && rangeStatus == null) {
             throw new IllegalArgumentException("operating-range alert requires rangeStatus");
         }
         if (kind == AlertKind.QUALITY_RISK && (discovery == null || confirmation == null)) {
             throw new IllegalArgumentException("quality-risk alert requires statistical evidence");
         }
-        if (grade != RiskGrade.CAUTION && grade != RiskGrade.DANGER) {
+        if (kind == AlertKind.MODEL_QUALITY_RISK) {
+            if (grade != null || observedValue == null || !observedValue.isNumber()
+                    || observedValue.doubleValue() < 0 || observedValue.doubleValue() > 1) {
+                throw new IllegalArgumentException("model-quality alert requires a probability and no statistical grade");
+            }
+        } else if (grade != RiskGrade.CAUTION && grade != RiskGrade.DANGER) {
             throw new IllegalArgumentException("alert grade must be CAUTION or DANGER");
         }
     }

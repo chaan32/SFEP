@@ -1,6 +1,7 @@
 package com.sfep.equipmentmonitor.ui;
 
 import com.sfep.equipmentmonitor.bundle.LoadedBundle;
+import com.sfep.equipmentmonitor.prediction.OnnxQualityPredictor;
 import com.sfep.equipmentmonitor.replay.ReplayController;
 import com.sfep.equipmentmonitor.replay.ReplayControllerState;
 import com.sfep.equipmentmonitor.replay.ReplayCursor;
@@ -19,17 +20,25 @@ public final class DesktopMonitorSession implements ReplayControl, AutoCloseable
     private final MonitorDashboardMetadata metadata;
     private final HistoricalMonitor historicalMonitor;
     private final ReplayController replayController;
+    private final OnnxQualityPredictor qualityPredictor;
 
     public DesktopMonitorSession(LoadedBundle bundle) {
+        this(bundle, null);
+    }
+
+    public DesktopMonitorSession(LoadedBundle bundle, OnnxQualityPredictor qualityPredictor) {
         Objects.requireNonNull(bundle, "bundle");
+        this.qualityPredictor = qualityPredictor;
         RiskDefinitionCompiler compiler = new RiskDefinitionCompiler();
         this.historicalMonitor = new HistoricalMonitor(
                 bundle.bundleId(),
                 compiler.compileRanges(bundle.ranges()),
-                compiler.compileRules(bundle.rules()));
+                compiler.compileRules(bundle.rules()),
+                qualityPredictor);
+        this.metadata = MonitorDashboardMetadata.from(bundle,
+                qualityPredictor == null ? null : qualityPredictor.metadata());
         this.replayController = new ReplayController(
                 ReplayCursor.open(bundle.replay()), historicalMonitor::accept);
-        this.metadata = MonitorDashboardMetadata.from(bundle);
     }
 
     public MonitorDashboardMetadata metadata() {
@@ -91,6 +100,8 @@ public final class DesktopMonitorSession implements ReplayControl, AutoCloseable
 
     @Override
     public void close() {
-        replayController.close();
+        try (qualityPredictor) {
+            replayController.close();
+        }
     }
 }

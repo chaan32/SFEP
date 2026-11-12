@@ -1,7 +1,8 @@
 package com.sfep.equipmentmonitor.alert;
 
-/** The two evidence axes are intentionally never combined into one score. */
+/** Independent alert evidence sources. */
 public enum AlertKind {
     OPERATING_RANGE,
-    QUALITY_RISK
+    QUALITY_RISK,
+    MODEL_QUALITY_RISK
 }

@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sfep.equipmentmonitor.alert.AlertKey;
 import com.sfep.equipmentmonitor.alert.AlertKind;
 import com.sfep.equipmentmonitor.alert.HistoricalAlert;
+import com.sfep.equipmentmonitor.prediction.PredictionStatus;
+import com.sfep.equipmentmonitor.prediction.QualityPrediction;
 import com.sfep.equipmentmonitor.replay.ReplayControllerState;
 import com.sfep.equipmentmonitor.replay.ReplayEvent;
 import com.sfep.equipmentmonitor.replay.ReplayFailureContext;
@@ -25,6 +27,7 @@ import com.sfep.equipmentmonitor.risk.RuleEvaluation;
 import com.sfep.equipmentmonitor.risk.RuleMatchStatus;
 import com.sfep.equipmentmonitor.state.EquipmentKey;
 import com.sfep.equipmentmonitor.state.EquipmentSnapshot;
+import com.sfep.equipmentmonitor.state.HistoricalMonitor;
 import com.sfep.equipmentmonitor.state.MaterialSnapshot;
 import com.sfep.equipmentmonitor.state.MonitorUpdate;
 import org.junit.jupiter.api.Test;
@@ -78,7 +81,7 @@ class MonitorDashboardPanelTest {
     }
 
     @Test
-    void putsTheMostUrgentMaterialAtTheTopWithoutChangingOverviewColumns() throws Exception {
+    void putsTheMostUrgentMaterialAtTheTopAndPreservesTheStatisticalColumns() throws Exception {
         Fixture fixture = panel();
         fixture.panel.acceptUpdate(overviewRiskUpdate());
         onEdt(() -> { });
@@ -87,8 +90,45 @@ class MonitorDashboardPanelTest {
         assertThat(onEdt(() -> overview.getValueAt(0, columnOf(overview, "소재"))))
                 .isEqualTo("mat-danger");
         assertThat(columnNames(overview)).containsExactly(
-                "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
+                "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인", "예상 불량확률",
                 "소재", "공정 단계", "설비", "재생 시각");
+        assertThat(overview.getValueAt(0, columnOf(overview, "예상 불량확률"))).isEqualTo("ONNX 모델 없음");
+    }
+
+    @Test
+    void showsPredictionAndPublishedApResultTogetherInAnAccessibleMaterialDetail() throws Exception {
+        var model = new MonitorDashboardMetadata.QualityModelView("model-a", "RESEARCH_ONLY", 0.70);
+        Fixture fixture = panel(SwingUtilities::invokeLater, 189_043, model);
+        var monitor = new HistoricalMonitor(BUNDLE, List.of(), List.of(), (values, seen) ->
+                new QualityPrediction(PredictionStatus.AVAILABLE, 0.8125, "model-a", "RESEARCH_ONLY", 0.70));
+        JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
+        JLabel detail = onEdt(() -> component(fixture.panel, "overview-selection-detail", JLabel.class));
+
+        try (var ignored = monitor.addListener(fixture.panel::acceptUpdate)) {
+            monitor.accept(predictionUnit("FURNACE_CHARGED", "FURNACE", JsonNodeFactory.instance.objectNode()));
+            onEdt(() -> overview.setRowSelectionInterval(0, 0));
+            assertThat(onEdt(detail::getText)).contains("예측 대기 · 가열로 출측 후 계산", "AP 실제 결과", "대기");
+
+            monitor.accept(predictionUnit("FURNACE_EXTRACTED", "FURNACE", JsonNodeFactory.instance.objectNode()));
+            assertThat(onEdt(() -> overview.getValueAt(0, columnOf(overview, "예상 불량확률"))))
+                    .isEqualTo("81.25% · 연구용");
+
+            monitor.accept(predictionUnit("AP_RECORDED_WITH_RESULT", "AP",
+                    JsonNodeFactory.instance.objectNode().put("judge", "불량")));
+            assertThat(onEdt(detail::getText)).contains("81.25%", "독립 평가 기준 미달 · 경보 미발행",
+                    "가열로 출측 완료", "model-a", "AP 실제 결과", "불량");
+            assertThat(onEdt(() -> detail.getAccessibleContext().getAccessibleName()))
+                    .contains("81.25%", "AP 실제 결과", "불량");
+        }
+    }
+
+    private static ReplayUnit predictionUnit(String stage, String equipmentType, ObjectNode values) {
+        ReplayEvent event = new ReplayEvent(
+                "1.0", BUNDLE, CRITERIA, "event-" + stage, "2025-02-03", 14,
+                "HOUR", "batch-" + stage, "equipment-" + stage, stage, "HOUR",
+                "mat-prediction", equipmentType, equipmentType + "_1", "charge-1", "slab-1", null, null, values);
+        return new ReplayUnit(event.batchId(), stage, event.replayDate(), event.replayHour(),
+                event.batchKind(), event.timePrecision(), List.of(event), false);
     }
 
     @Test
@@ -349,7 +389,7 @@ class MonitorDashboardPanelTest {
         JTable overview = onEdt(() -> component(fixture.panel, "overview-table", JTable.class));
 
         assertThat(columnNames(overview)).containsExactly(
-                "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
+                "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인", "예상 불량확률",
                 "소재", "공정 단계", "설비", "재생 시각");
         assertOverview(overview, "mat-normal", "● 전형 범위", "● 정상", "? 근거 부족");
         assertOverview(overview, "mat-missing", "? 근거 부족", "? 근거 부족", "? 근거 부족");
@@ -683,6 +723,13 @@ class MonitorDashboardPanelTest {
     private static Fixture panel(
             MonitorDashboardPanel.UpdateScheduler scheduler,
             long replayRows) throws Exception {
+        return panel(scheduler, replayRows, null);
+    }
+
+    private static Fixture panel(
+            MonitorDashboardPanel.UpdateScheduler scheduler,
+            long replayRows,
+            MonitorDashboardMetadata.QualityModelView qualityModel) throws Exception {
         MonitorDashboardMetadata metadata = new MonitorDashboardMetadata(
                 BUNDLE,
                 CRITERIA,
@@ -709,7 +756,7 @@ class MonitorDashboardPanelTest {
                         new MonitorDashboardMetadata.DefinitionView(
                                 "품질 위험구간", "quality-rule", "HEAT_COMPLETE",
                                 "FURNACE / FURNACE_1", "[f_temp]", "HEATING / DANGER",
-                                "{\"allOf\":[]}")));
+                                "{\"allOf\":[]}")), qualityModel);
         RecordingReplayControl control = new RecordingReplayControl();
         return new Fixture(onEdt(() -> new MonitorDashboardPanel(metadata, control, scheduler)), control);
     }
@@ -888,7 +935,7 @@ class MonitorDashboardPanelTest {
                 "mat-rm4", "charge-1", "slab-1", null, null,
                 "RM4_RECORDED", "RM4", "RM4", "2025-02-03", 15, "HOUR",
                 Map.of("rm4_temp", RiskScalar.of(1050)), List.of(range(RangeStatus.TYPICAL)),
-                List.of(), List.of(), RiskGrade.NORMAL, RiskGrade.INSUFFICIENT_EVIDENCE, 0);
+                List.of(), List.of(), RiskGrade.NORMAL, RiskGrade.INSUFFICIENT_EVIDENCE, 0, null);
         EquipmentKey key = new EquipmentKey("RM4", "RM4");
         EquipmentSnapshot equipment = new EquipmentSnapshot(
                 key, "RM4_RECORDED", "2025-02-03", 15, "HOUR",
@@ -919,7 +966,7 @@ class MonitorDashboardPanelTest {
                 material, "charge-1", "slab-1", null, null,
                 "FURNACE_CHARGED", "FURNACE", "FURNACE_1", "2025-02-03", 14, "HOUR",
                 Map.of("f_temp", RiskScalar.of(1250)), ranges, rules, List.of(),
-                qualityRisk, historicalRisk, rules.stream().filter(RuleEvaluation::matched).count());
+                qualityRisk, historicalRisk, rules.stream().filter(RuleEvaluation::matched).count(), null);
     }
 
     private static RangeEvaluation range(RangeStatus status) {

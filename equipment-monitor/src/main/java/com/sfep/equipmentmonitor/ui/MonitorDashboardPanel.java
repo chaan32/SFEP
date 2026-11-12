@@ -2,6 +2,7 @@ package com.sfep.equipmentmonitor.ui;
 
 import com.sfep.equipmentmonitor.alert.AlertKind;
 import com.sfep.equipmentmonitor.alert.HistoricalAlert;
+import com.sfep.equipmentmonitor.prediction.QualityPrediction;
 import com.sfep.equipmentmonitor.replay.ReplayControllerState;
 import com.sfep.equipmentmonitor.replay.ReplaySpeed;
 import com.sfep.equipmentmonitor.replay.ReplayStatus;
@@ -15,6 +16,7 @@ import com.sfep.equipmentmonitor.risk.ReasonCode;
 import com.sfep.equipmentmonitor.risk.RiskGrade;
 import com.sfep.equipmentmonitor.risk.RuleEvaluation;
 import com.sfep.equipmentmonitor.risk.RuleMatchStatus;
+import com.sfep.equipmentmonitor.risk.RiskScalar;
 import com.sfep.equipmentmonitor.state.EquipmentSnapshot;
 import com.sfep.equipmentmonitor.state.EquipmentKey;
 import com.sfep.equipmentmonitor.state.MaterialSnapshot;
@@ -70,6 +72,8 @@ public final class MonitorDashboardPanel extends JPanel {
             "과거 품질 결과와 통계적으로 연결된 위험 근거이며, 직접 원인으로 단정하지 않음";
     private static final String MISSING_QUALITY_NOTICE =
             "입력 데이터가 없어 현재 소재의 품질 위험 연결 여부를 판정하지 않음";
+    private static final String RESEARCH_NOTICE = "독립 평가 기준 미달 · 경보 미발행";
+    private static final String MODEL_ALERT_EXPLANATION = "가열로 출측 시 모델의 불량확률이 기준 이상";
 
     private final ReplayControl replayControl;
     private final UpdateScheduler updateScheduler;
@@ -82,9 +86,10 @@ public final class MonitorDashboardPanel extends JPanel {
     private final JProgressBar replayProgress = new JProgressBar(0, 100);
     private final JLabel unitNotice = new JLabel("시간대 데이터를 재생하면 처리 묶음이 표시됩니다.");
     private final long totalReplayEvents;
+    private final MonitorDashboardMetadata.QualityModelView qualityModel;
     private final ReadOnlyTableModel overviewModel = model(
             "설비 운전범위", "조기 품질 위험", "AP 후행 품질 확인",
-            "소재", "공정 단계", "설비", "재생 시각", "우선순위");
+            "소재", "공정 단계", "설비", "재생 시각", "우선순위", "예상 불량확률");
     private final ReadOnlyTableModel equipmentModel = model(
             "설비 유형", "설비 ID", "공정 단계", "재생 시각", "시간대 소재 수", "소재별 대표 관측값");
     private final ReadOnlyTableModel equipmentMaterialModel = model(
@@ -138,6 +143,7 @@ public final class MonitorDashboardPanel extends JPanel {
         this.updateScheduler = Objects.requireNonNull(updateScheduler, "updateScheduler");
         Objects.requireNonNull(metadata, "metadata");
         totalReplayEvents = metadata.replayRows();
+        qualityModel = metadata.qualityModel();
         updateReplayProgress(0, 0);
         setBorder(BorderFactory.createEmptyBorder(18, 20, 16, 20));
         setBackground(MonitorUiTheme.PAGE);
@@ -467,6 +473,7 @@ public final class MonitorDashboardPanel extends JPanel {
         panel.add(label, BorderLayout.NORTH);
         JTable table = new JTable(model);
         table.setName(name);
+        table.getAccessibleContext().setAccessibleName(description);
         table.setAutoCreateRowSorter(!"overview-table".equals(name));
         table.setFillsViewportHeight(true);
         table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
@@ -538,6 +545,8 @@ public final class MonitorDashboardPanel extends JPanel {
         sorter.setSortsOnUpdates(true);
         table.setRowSorter(sorter);
         table.removeColumn(table.getColumn("우선순위"));
+        table.moveColumn(table.getColumnModel().getColumnIndex("예상 불량확률"), 3);
+        table.getAccessibleContext().setAccessibleName("소재별 설비 운전범위, 품질 위험 및 예상 불량확률");
         table.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
         table.getSelectionModel().addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting()) renderSelectedMaterial(table);
@@ -553,6 +562,7 @@ public final class MonitorDashboardPanel extends JPanel {
                 case "소재", "규칙 ID", "필드", "항목/규칙", "대상" -> 170;
                 case "설비", "설비 유형", "설비 ID", "공정 단계", "최초 공개 단계" -> 175;
                 case "재생 시각", "기준 수준", "시간대 내부 순서" -> 160;
+                case "예상 불량확률" -> 215;
                 case "공개 대표값", "소재별 대표 관측값", "정의/위험구간" -> 280;
                 case "발견구간 통계", "확인구간 통계", "해석", "설명", "봉인된 값" -> 360;
                 default -> 130;
@@ -664,7 +674,8 @@ public final class MonitorDashboardPanel extends JPanel {
                     stageLabel(material.eventStage()),
                     equipmentLabel(material.equipmentType(), material.equipmentId()),
                     replayTime(material.replayDate(), material.replayHour()),
-                    actionPriority(material)
+                    actionPriority(material),
+                    predictionText(material.qualityPrediction())
             };
             Integer modelRow = overviewRows.get(material.materialKey());
             if (modelRow == null) {
@@ -677,6 +688,7 @@ public final class MonitorDashboardPanel extends JPanel {
         }
         overviewModel.applyRows(replacements, additions);
         restoreOverviewSelection(selectedMaterial);
+        if (selectedMaterial != null) renderSelectedMaterial(overviewTable);
         if (replayedMaterialCountRow >= 0) {
             managementModel.setValueAt(
                     number(overviewRows.size()), replayedMaterialCountRow, 2);
@@ -728,7 +740,8 @@ public final class MonitorDashboardPanel extends JPanel {
         String range = String.valueOf(overviewModel.getValueAt(modelRow, 0));
         String quality = String.valueOf(overviewModel.getValueAt(modelRow, 1));
         String ap = String.valueOf(overviewModel.getValueAt(modelRow, 2));
-        String material = String.valueOf(overviewModel.getValueAt(modelRow, 3));
+        String materialKey = String.valueOf(overviewModel.getValueAt(modelRow, 3));
+        MaterialSnapshot material = latestMaterials.get(materialKey);
         int priority = ((Number) overviewModel.getValueAt(modelRow, 7)).intValue();
         String action = switch (priority) {
             case 0 -> "즉시 확인 필요";
@@ -736,10 +749,42 @@ public final class MonitorDashboardPanel extends JPanel {
             case 2 -> "판정 근거 확인 필요";
             default -> "현재 우선 확인 대상 아님";
         };
-        overviewSelectionDetail.setText("<html><b>" + html(material) + " · " + action + "</b>"
+        String modelDetail = "<br>예상 불량확률: " + html(predictionText(material.qualityPrediction()))
+                + " &nbsp; AP 실제 결과: " + html(apResult(material));
+        if (qualityModel != null) {
+            if (material.predictedAtStage() != null) modelDetail += " &nbsp; 가열로 출측 완료";
+            modelDetail += "<br>모델 " + html(qualityModel.modelId())
+                    + " &nbsp; 임계값 " + percentage(qualityModel.threshold())
+                    + ("RESEARCH_ONLY".equals(qualityModel.qualification())
+                            ? " &nbsp; " + RESEARCH_NOTICE : " &nbsp; 독립 평가 기준 충족");
+        }
+        overviewSelectionDetail.setText("<html><b>" + html(materialKey) + " · " + action + "</b>"
                 + " &nbsp; 설비 운전범위: " + html(plainStatus(range))
                 + " &nbsp; 조기 품질 위험: " + html(plainStatus(quality))
-                + " &nbsp; AP 후행 품질: " + html(plainStatus(ap)) + "</html>");
+                + " &nbsp; AP 후행 품질: " + html(plainStatus(ap)) + modelDetail + "</html>");
+    }
+
+    private String predictionText(QualityPrediction prediction) {
+        if (prediction == null) {
+            return qualityModel == null ? "ONNX 모델 없음" : "예측 대기 · 가열로 출측 후 계산";
+        }
+        return switch (prediction.status()) {
+            case AVAILABLE -> percentage(prediction.probability()) + " · "
+                    + ("RESEARCH_ONLY".equals(prediction.qualification()) ? "연구용"
+                    : prediction.shouldAlert() ? "기준 이상" : "기준 미만");
+            case INPUT_INCOMPLETE -> "입력 부족";
+            case INFERENCE_FAILED -> "추론 실패";
+            case NOT_AVAILABLE -> "ONNX 모델 없음";
+        };
+    }
+
+    private static String apResult(MaterialSnapshot material) {
+        RiskScalar judge = material.values().get("judge");
+        return judge == null ? "대기" : value(judge);
+    }
+
+    private static String percentage(double probability) {
+        return String.format(Locale.ROOT, "%.2f%%", probability * 100);
     }
 
     private void replaceCurrentEquipmentDetails(
@@ -828,26 +873,40 @@ public final class MonitorDashboardPanel extends JPanel {
                 replayTime(alert.replayDate(), alert.replayHour()),
                 alert.materialKey(),
                 equipmentLabel(alert.equipmentType(), alert.equipmentId()),
-                alert.kind() == AlertKind.QUALITY_RISK ? "품질 위험 연결" : "설비 운전범위",
+                switch (alert.kind()) {
+                    case OPERATING_RANGE -> "설비 운전범위";
+                    case QUALITY_RISK -> "품질 위험 연결";
+                    case MODEL_QUALITY_RISK -> "모델 품질 위험";
+                },
                 value(alert.field()),
-                value(alert.observedValue()),
+                alert.kind() == AlertKind.MODEL_QUALITY_RISK
+                        ? percentage(alert.observedValue().doubleValue()) : value(alert.observedValue()),
                 alert.kind() == AlertKind.OPERATING_RANGE
                         ? rangeStatusLabel(alert.rangeStatus()) : "-",
-                alert.repeated() ? "반복 확인 필요" : "반복 아님",
+                alert.kind() == AlertKind.MODEL_QUALITY_RISK ? "-"
+                        : alert.repeated() ? "반복 확인 필요" : "반복 아님",
                 shortId(alert.ruleId()),
                 alert.kind() == AlertKind.QUALITY_RISK
                         ? metricText("발견구간", alert.discovery()) : "-",
                 alert.kind() == AlertKind.QUALITY_RISK
                         ? metricText("확인구간 결과", alert.confirmation()) : "-",
-                alert.kind() == AlertKind.QUALITY_RISK
-                        ? ASSOCIATION_NOTICE
-                        : "과거 설비 관측 분포 범위를 벗어난 이력이며 품질의 직접 원인으로 단정하지 않음"
+                switch (alert.kind()) {
+                    case OPERATING_RANGE -> "과거 설비 관측 분포 범위를 벗어난 이력이며 품질의 직접 원인으로 단정하지 않음";
+                    case QUALITY_RISK -> ASSOCIATION_NOTICE;
+                    case MODEL_QUALITY_RISK -> MODEL_ALERT_EXPLANATION;
+                }
         };
     }
 
     private static EvidenceRow alertEvidenceRow(HistoricalAlert alert) {
         String key = "A|" + alert.kind() + "|" + alert.materialKey() + "|"
                 + alert.eventStage() + "|" + alert.ruleId();
+        if (alert.kind() == AlertKind.MODEL_QUALITY_RISK) {
+            return new EvidenceRow(key, List.of(
+                    alert.materialKey(), stageLabel(alert.eventStage()), "모델 품질 위험 경보",
+                    value(alert.field()), "모델 기준 이상", percentage(alert.observedValue().doubleValue()),
+                    "모델 " + shortId(alert.ruleId()), "-", "-", MODEL_ALERT_EXPLANATION));
+        }
         if (alert.kind() == AlertKind.OPERATING_RANGE) {
             return new EvidenceRow(key, List.of(
                     alert.materialKey(),
@@ -1175,6 +1234,7 @@ public final class MonitorDashboardPanel extends JPanel {
     }
 
     private static String alertStatus(HistoricalAlert alert) {
+        if (alert.kind() == AlertKind.MODEL_QUALITY_RISK) return "모델 기준 이상";
         if (alert.kind() == AlertKind.OPERATING_RANGE) {
             return switch (alert.rangeStatus()) {
                 case TYPICAL -> "● 전형 범위";
@@ -1188,6 +1248,7 @@ public final class MonitorDashboardPanel extends JPanel {
     }
 
     private static String alertGradeFilterLabel(HistoricalAlert alert) {
+        if (alert.kind() == AlertKind.MODEL_QUALITY_RISK) return "모델 기준 이상";
         if (alert.kind() == AlertKind.OPERATING_RANGE) {
             return switch (alert.rangeStatus()) {
                 case CAUTION -> "주의 편차";

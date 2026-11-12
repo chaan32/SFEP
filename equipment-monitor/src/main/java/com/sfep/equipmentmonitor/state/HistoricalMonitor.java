@@ -6,6 +6,8 @@ import com.sfep.equipmentmonitor.alert.AlertKey;
 import com.sfep.equipmentmonitor.alert.AlertKind;
 import com.sfep.equipmentmonitor.alert.HistoricalAlert;
 import com.sfep.equipmentmonitor.alert.RepetitionTracker;
+import com.sfep.equipmentmonitor.prediction.QualityPrediction;
+import com.sfep.equipmentmonitor.prediction.QualityPredictor;
 import com.sfep.equipmentmonitor.replay.ReplayEvent;
 import com.sfep.equipmentmonitor.replay.ReplayUnit;
 import com.sfep.equipmentmonitor.risk.EquipmentType;
@@ -25,10 +27,12 @@ import com.sfep.equipmentmonitor.risk.RuleEvaluationSummary;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
@@ -39,6 +43,7 @@ public final class HistoricalMonitor {
     private final List<OperatingRange> ranges;
     private final List<QualityRule> rules;
     private final Map<String, QualityRule> rulesById;
+    private final QualityPredictor qualityPredictor;
     private final OperatingRangeEvaluator rangeEvaluator = new OperatingRangeEvaluator();
     private final QualityRuleEvaluator ruleEvaluator = new QualityRuleEvaluator();
     private final AlertHistory alertHistory = new AlertHistory();
@@ -51,12 +56,18 @@ public final class HistoricalMonitor {
     private long eventsProcessed;
 
     public HistoricalMonitor(String bundleId, List<OperatingRange> ranges, List<QualityRule> rules) {
+        this(bundleId, ranges, rules, null);
+    }
+
+    public HistoricalMonitor(
+            String bundleId, List<OperatingRange> ranges, List<QualityRule> rules, QualityPredictor qualityPredictor) {
         if (bundleId == null || bundleId.isBlank()) {
             throw new IllegalArgumentException("bundleId must not be blank");
         }
         this.bundleId = bundleId;
         this.ranges = List.copyOf(Objects.requireNonNull(ranges, "ranges"));
         this.rules = List.copyOf(Objects.requireNonNull(rules, "rules"));
+        this.qualityPredictor = qualityPredictor;
         LinkedHashMap<String, QualityRule> index = new LinkedHashMap<>();
         for (QualityRule rule : this.rules) {
             if (index.putIfAbsent(rule.ruleId(), rule) != null) {
@@ -73,10 +84,12 @@ public final class HistoricalMonitor {
             LinkedHashMap<String, MaterialSnapshot> changedMaterials = new LinkedHashMap<>();
             LinkedHashMap<EquipmentKey, EquipmentSnapshot> changedEquipment = new LinkedHashMap<>();
             List<PendingAlert> pendingAlerts = new ArrayList<>();
+            List<HistoricalAlert> pendingModelAlerts = new ArrayList<>();
             List<RepetitionTracker.Observation> repetitionObservations = new ArrayList<>();
             List<HistoricalAlert> newAlerts = new ArrayList<>();
             for (ReplayEvent event : unit.events()) {
-                process(event, changedMaterials, changedEquipment, pendingAlerts, repetitionObservations);
+                process(event, changedMaterials, changedEquipment, pendingAlerts, repetitionObservations,
+                        pendingModelAlerts);
             }
             Map<RepetitionTracker.ObservationKey, Boolean> repeated =
                     repetitionTracker.observeUnit(repetitionObservations);
@@ -86,6 +99,11 @@ public final class HistoricalMonitor {
                 HistoricalAlert alert = pending.range() == null
                         ? qualityAlert(pending.event(), pending.rule(), badge)
                         : rangeAlert(pending.event(), pending.range(), badge);
+                if (alertHistory.add(alert)) {
+                    newAlerts.add(alert);
+                }
+            }
+            for (HistoricalAlert alert : pendingModelAlerts) {
                 if (alertHistory.add(alert)) {
                     newAlerts.add(alert);
                 }
@@ -132,7 +150,8 @@ public final class HistoricalMonitor {
             Map<String, MaterialSnapshot> changedMaterials,
             Map<EquipmentKey, EquipmentSnapshot> changedEquipment,
             List<PendingAlert> pendingAlerts,
-            List<RepetitionTracker.Observation> repetitionObservations) {
+            List<RepetitionTracker.Observation> repetitionObservations,
+            List<HistoricalAlert> pendingModelAlerts) {
         if (!bundleId.equals(event.bundleId())) {
             throw new IllegalArgumentException("replay event bundle does not match monitor bundle");
         }
@@ -140,7 +159,8 @@ public final class HistoricalMonitor {
         EquipmentType equipmentType = parse(EquipmentType.class, event.equipmentType(), "equipmentType");
         MaterialAccumulator material = materials.computeIfAbsent(
                 event.materialKey(), ignored -> new MaterialAccumulator(event));
-        material.merge(event, scalarValues(event.values()));
+        Map<String, RiskScalar> published = scalarValues(event.values());
+        material.merge(event, published);
 
         RiskEvent riskEvent = RiskEvent.of(stage, equipmentType, event.equipmentId(), material.values);
         List<RangeEvaluation> rangeEvaluations = rangeEvaluator.evaluate(riskEvent, ranges);
@@ -170,10 +190,21 @@ public final class HistoricalMonitor {
             }
         }
 
+        if (qualityPredictor != null && material.qualityPrediction == null) {
+            if (material.seenFields == null) material.seenFields = new HashSet<>();
+            event.values().properties().forEach(property -> material.seenFields.add(property.getKey()));
+            if (stage == ProcessStage.FURNACE_EXTRACTED) {
+                material.qualityPrediction = qualityPredictor.predict(Map.copyOf(material.values), Set.copyOf(material.seenFields));
+                if (material.qualityPrediction.shouldAlert()) {
+                    pendingModelAlerts.add(modelAlert(event, material.qualityPrediction));
+                }
+                material.seenFields = null;
+            }
+        }
+
         MaterialSnapshot materialSnapshot = material.snapshot();
         changedMaterials.put(event.materialKey(), materialSnapshot);
         EquipmentKey equipmentKey = new EquipmentKey(event.equipmentType(), event.equipmentId());
-        Map<String, RiskScalar> published = scalarValues(event.values());
         EquipmentSnapshot inUnit = changedEquipment.get(equipmentKey);
         LinkedHashMap<String, Map<String, RiskScalar>> valuesByMaterial = new LinkedHashMap<>();
         List<String> materialKeys = new ArrayList<>();
@@ -213,6 +244,13 @@ public final class HistoricalMonitor {
                 evaluation.discovery(), evaluation.confirmation());
     }
 
+    private HistoricalAlert modelAlert(ReplayEvent event, QualityPrediction prediction) {
+        return new HistoricalAlert(
+                key(event, prediction.modelId()), AlertKind.MODEL_QUALITY_RISK, event.eventId(),
+                event.replayDate(), event.replayHour(), event.equipmentType(), event.equipmentId(),
+                "예상 불량확률", RiskScalar.of(prediction.probability()), null, null, false, null, null);
+    }
+
     private AlertKey key(ReplayEvent event, String ruleId) {
         return new AlertKey(bundleId, event.materialKey(), event.batchStep(), ruleId);
     }
@@ -222,7 +260,7 @@ public final class HistoricalMonitor {
             throw new IllegalArgumentException("replay values must be an object");
         }
         LinkedHashMap<String, RiskScalar> result = new LinkedHashMap<>();
-        values.fields().forEachRemaining(entry -> {
+        values.properties().forEach(entry -> {
             JsonNode value = entry.getValue();
             if (value.isNull()) {
                 return;
@@ -267,6 +305,8 @@ public final class HistoricalMonitor {
         private String hrCoilId;
         private String apProdId;
         private final LinkedHashMap<String, RiskScalar> values = new LinkedHashMap<>();
+        private Set<String> seenFields;
+        private QualityPrediction qualityPrediction;
         private ReplayEvent latest;
         private List<RangeEvaluation> rangeEvaluations = List.of();
         private List<RuleEvaluation> ruleEvaluations = List.of();
@@ -330,7 +370,7 @@ public final class HistoricalMonitor {
                     materialKey, chargeId, slabNo, hrCoilId, apProdId, latest.batchStep(),
                     latest.equipmentType(), latest.equipmentId(), latest.replayDate(), latest.replayHour(),
                     latest.timePrecision(), values, rangeEvaluations, ruleEvaluations,
-                    assessments, qualityRisk, historicalEvidenceRisk, matchedRuleCount);
+                    assessments, qualityRisk, historicalEvidenceRisk, matchedRuleCount, qualityPrediction);
         }
     }
 }

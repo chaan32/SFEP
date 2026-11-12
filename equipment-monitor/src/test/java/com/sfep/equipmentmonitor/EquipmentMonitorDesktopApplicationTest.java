@@ -11,6 +11,7 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.test.util.ReflectionTestUtils;
+import com.sfep.equipmentmonitor.bundle.BundleLoadException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +19,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class EquipmentMonitorDesktopApplicationTest {
     private static final String OPTION = "--sfep.equipment-monitor.bundle-dir=";
@@ -86,6 +88,34 @@ class EquipmentMonitorDesktopApplicationTest {
                     assertThat(context.getBean(DesktopMonitorSession.class).metadata().replayRows())
                             .isEqualTo(95);
                 });
+    }
+
+    @Test
+    void rejectsEitherLocalModelPathOnItsOwn() throws Exception {
+        var runner = new ApplicationContextRunner()
+                .withUserConfiguration(EquipmentMonitorDesktopApplication.class)
+                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + runtimeGoldenBundle());
+
+        for (String option : List.of("sfep.quality-model", "sfep.quality-model-metadata")) {
+            runner.withPropertyValues(option + "=/private/tmp/model-file")
+                    .run(context -> assertThat(context).getFailure().hasStackTraceContaining("QUALITY_MODEL_PATHS_REQUIRED"));
+        }
+    }
+
+    @Test
+    void rejectsLocalModelDigestMismatchDuringSpringStartup() throws Exception {
+        String modelDirectory = System.getProperty("sfep.model-dev-dir");
+        assumeTrue(modelDirectory != null, "local-only model not configured");
+        Path tampered = Files.writeString(temporary.resolve("tampered.onnx"), "tampered model");
+
+        new ApplicationContextRunner()
+                .withUserConfiguration(EquipmentMonitorDesktopApplication.class)
+                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + runtimeGoldenBundle(),
+                        "sfep.quality-model=" + tampered,
+                        "sfep.quality-model-metadata=" + Path.of(modelDirectory).resolve("quality_model.json"))
+                .run(context -> assertThat(context).getFailure()
+                        .hasRootCauseInstanceOf(BundleLoadException.class)
+                        .hasStackTraceContaining("ONNX_DIGEST_MISMATCH"));
     }
 
     private Path runtimeGoldenBundle() throws Exception {

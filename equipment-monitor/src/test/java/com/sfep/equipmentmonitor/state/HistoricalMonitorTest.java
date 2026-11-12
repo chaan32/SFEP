@@ -3,6 +3,9 @@ package com.sfep.equipmentmonitor.state;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sfep.equipmentmonitor.alert.AlertKind;
+import com.sfep.equipmentmonitor.alert.AlertKey;
+import com.sfep.equipmentmonitor.prediction.PredictionStatus;
+import com.sfep.equipmentmonitor.prediction.QualityPrediction;
 import com.sfep.equipmentmonitor.replay.ReplayEvent;
 import com.sfep.equipmentmonitor.replay.ReplayUnit;
 import com.sfep.equipmentmonitor.risk.OperatingRange;
@@ -17,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -26,6 +30,66 @@ class HistoricalMonitorTest {
     private static final String BUNDLE = "bundle-a";
     private static final String MATERIAL = "material-a";
     private final RiskDefinitionCompiler compiler = new RiskDefinitionCompiler();
+
+    @Test
+    void predictsOnceAtExtractionAndKeepsThePredictionThroughAp() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        QualityPrediction prediction = new QualityPrediction(
+                PredictionStatus.AVAILABLE, 0.75, "model-a", "QUALIFIED", 0.75);
+        HistoricalMonitor monitor = new HistoricalMonitor(BUNDLE, List.of(), List.of(), (values, seen) -> {
+            calls.incrementAndGet();
+            assertThat(seen).containsExactlyInAnyOrder("steel_grade", "f_cog", "f_bfg");
+            assertThat(values).containsOnlyKeys("steel_grade", "f_bfg");
+            return prediction;
+        });
+        monitor.accept(unit(event(MATERIAL, "CAST_RECORDED", "SM_CC", "SM1", "{\"steel_grade\":\"C13\"}")));
+        assertThat(monitor.snapshot().materials().get(MATERIAL).qualityPrediction()).isNull();
+        ReplayUnit extraction = unit(event(MATERIAL, "FURNACE_EXTRACTED", "FURNACE", "1호기",
+                "{\"f_cog\":null,\"f_bfg\":10}"));
+        monitor.accept(extraction);
+        monitor.accept(extraction);
+        monitor.accept(unit(event(MATERIAL, "AP_RECORDED_WITH_RESULT", "AP", "AP1", "{\"judge\":\"불량\"}")));
+
+        assertThat(calls.get()).isEqualTo(1);
+        MaterialSnapshot material = monitor.snapshot().materials().get(MATERIAL);
+        assertThat(material.qualityPrediction()).isEqualTo(prediction);
+        assertThat(material.predictedAtStage()).isEqualTo("FURNACE_EXTRACTED");
+        assertThat(material.values().get("judge").value()).isEqualTo("불량");
+        assertThat(monitor.snapshot().alerts()).singleElement().satisfies(alert -> {
+            assertThat(alert.kind()).isEqualTo(AlertKind.MODEL_QUALITY_RISK);
+            assertThat(alert.key()).isEqualTo(new AlertKey(BUNDLE, MATERIAL, "FURNACE_EXTRACTED", "model-a"));
+            assertThat(alert.observedValue().doubleValue()).isEqualTo(0.75);
+            assertThat(alert.grade()).isNull();
+        });
+    }
+
+    @Test
+    void nonAlertingPredictionsPreserveStatisticalAlertsAndReplayState() throws Exception {
+        OperatingRange range = compiler.compileRanges(List.of(definition(rangeJson(), false))).getFirst();
+        QualityRule rule = compiler.compileRules(List.of(definition(
+                ruleJson("a", "f_jangip_gubun", "CCR", "CAUTION", true), true))).getFirst();
+        var baseline = new HistoricalMonitor(BUNDLE, List.of(range), List.of(rule));
+        ReplayUnit charge = unit(event(MATERIAL, "FURNACE_CHARGED", "FURNACE", "1호기",
+                "{\"furnace_no\":\"1호기\",\"f_jangip_gubun\":\"CCR\",\"f_jangip_temp\":145}"));
+        ReplayUnit extraction = unit(event(MATERIAL, "FURNACE_EXTRACTED", "FURNACE", "1호기", "{}"));
+        ReplayUnit ap = unit(event(MATERIAL, "AP_RECORDED_WITH_RESULT", "AP", "AP1", "{\"judge\":\"양품\"}"));
+        List.of(charge, extraction, ap).forEach(baseline::accept);
+        MonitorSnapshot expected = baseline.snapshot();
+        assertThat(expected.alerts()).hasSize(2);
+
+        for (QualityPrediction prediction : List.of(
+                new QualityPrediction(PredictionStatus.AVAILABLE, 0.9, "model-a", "RESEARCH_ONLY", 0.75),
+                new QualityPrediction(PredictionStatus.AVAILABLE, 0.5, "model-a", "QUALIFIED", 0.75),
+                new QualityPrediction(PredictionStatus.INPUT_INCOMPLETE, null, "model-a", "QUALIFIED", 0.75),
+                new QualityPrediction(PredictionStatus.INFERENCE_FAILED, null, "model-a", "QUALIFIED", 0.75))) {
+            var monitor = new HistoricalMonitor(BUNDLE, List.of(range), List.of(rule), (values, seen) -> prediction);
+            List.of(charge, extraction, ap).forEach(monitor::accept);
+            MonitorSnapshot actual = monitor.snapshot();
+            assertThat(actual).usingRecursiveComparison().ignoringFieldsMatchingRegexes(".*qualityPrediction")
+                    .isEqualTo(expected);
+            assertThat(actual.materials().get(MATERIAL).qualityPrediction()).isEqualTo(prediction);
+        }
+    }
 
     @Test
     void accumulatesOnlyValuesPublishedByTheCurrentStageAndReturnsImmutableSnapshots() throws Exception {
