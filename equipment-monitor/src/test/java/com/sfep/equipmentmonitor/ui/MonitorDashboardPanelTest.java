@@ -440,7 +440,7 @@ class MonitorDashboardPanelTest {
     }
 
     @Test
-    void filtersAllStoredHistoryByDateEquipmentMaterialAndGrade() throws Exception {
+    void sortsHistoryNewestFirstAndFiltersByDateEquipmentMaterialAndGrade() throws Exception {
         Fixture fixture = panel();
         HistoricalAlert furnaceDanger = alert(
                 "2025-02-03", "mat-2", "FURNACE", "FURNACE_1", RiskGrade.DANGER, "d");
@@ -458,6 +458,8 @@ class MonitorDashboardPanelTest {
         JComboBox<?> grade = onEdt(() -> component(fixture.panel, "history-grade-filter", JComboBox.class));
 
         assertThat(onEdt(history::getRowCount)).isEqualTo(2);
+        assertThat(onEdt(() -> history.getValueAt(0, columnOf(history, "소재")))).isEqualTo("mat-1");
+        assertThat(onEdt(() -> history.getValueAt(1, columnOf(history, "소재")))).isEqualTo("mat-2");
         assertThat(comboItems(date)).containsExactly("전체", "2025-02-03", "2025-02-04");
         assertThat(comboItems(equipment)).containsExactly("전체", "가열로 / FURNACE_1", "조압연 RM4 / RM4");
         assertThat(comboItems(material)).containsExactly("전체", "mat-1", "mat-2");
@@ -467,8 +469,10 @@ class MonitorDashboardPanelTest {
         assertThat(onEdt(history::getRowCount)).isEqualTo(1);
         assertThat(tableRowText(history, 0)).contains("mat-1", "▲ 주의", "조압연 RM4 / RM4");
 
+        onEdt(() -> date.setSelectedItem("전체"));
+        assertThat(onEdt(() -> history.getValueAt(0, columnOf(history, "소재")))).isEqualTo("mat-1");
+
         onEdt(() -> {
-            date.setSelectedItem("전체");
             equipment.setSelectedItem("가열로 / FURNACE_1");
             material.setSelectedItem("mat-2");
             grade.setSelectedItem("위험");

@@ -480,7 +480,12 @@ public final class MonitorDashboardPanel extends JPanel {
         table.getTableHeader().setReorderingAllowed(false);
         MonitorUiTheme.table(table);
         configureColumnWidths(table);
-        if ("overview-table".equals(name)) configureOverviewTable(table);
+        if ("overview-table".equals(name)) {
+            configureOverviewTable(table);
+        } else if ("history-table".equals(name)) {
+            table.getRowSorter().setSortKeys(List.of(
+                    new RowSorter.SortKey(model.findColumn("재생 시각"), SortOrder.DESCENDING)));
+        }
         JScrollPane scroll = new JScrollPane(table);
         MonitorUiTheme.scrollPane(scroll);
         scroll.setPreferredSize(new Dimension(1100, 500));
