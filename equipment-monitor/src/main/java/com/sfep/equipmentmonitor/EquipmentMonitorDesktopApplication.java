@@ -3,7 +3,6 @@ package com.sfep.equipmentmonitor;
 import com.sfep.equipmentmonitor.bootstrap.MonitorLaunchPreflight;
 import com.sfep.equipmentmonitor.bundle.BundleLoader;
 import com.sfep.equipmentmonitor.bundle.LoadedBundle;
-import com.sfep.equipmentmonitor.prediction.OnnxQualityPredictor;
 import com.sfep.equipmentmonitor.ui.DesktopMonitorSession;
 import com.sfep.equipmentmonitor.ui.DesktopMonitorWindow;
 import org.springframework.boot.ApplicationRunner;
@@ -48,29 +47,8 @@ public class EquipmentMonitorDesktopApplication {
     }
 
     @Bean(destroyMethod = "close")
-    DesktopMonitorSession desktopMonitorSession(
-            LoadedBundle bundle,
-            @Value("${sfep.quality-model:#{null}}") String modelPath,
-            @Value("${sfep.quality-model-metadata:#{null}}") String metadataPath) {
-        // shortcut: development-only until Bundle v3; remove in Task 10
-        if (modelPath == null && metadataPath == null) {
-            return new DesktopMonitorSession(bundle);
-        }
-        if (modelPath == null || modelPath.isBlank() || metadataPath == null || metadataPath.isBlank()) {
-            throw new IllegalArgumentException(
-                    "QUALITY_MODEL_PATHS_REQUIRED: configure both sfep.quality-model and sfep.quality-model-metadata");
-        }
-        OnnxQualityPredictor predictor = OnnxQualityPredictor.open(Path.of(modelPath), Path.of(metadataPath));
-        try {
-            return new DesktopMonitorSession(bundle, predictor);
-        } catch (RuntimeException | Error failure) {
-            try {
-                predictor.close();
-            } catch (RuntimeException closeFailure) {
-                failure.addSuppressed(closeFailure);
-            }
-            throw failure;
-        }
+    DesktopMonitorSession desktopMonitorSession(LoadedBundle bundle) {
+        return new DesktopMonitorSession(bundle);
     }
 
     @Bean(destroyMethod = "close")

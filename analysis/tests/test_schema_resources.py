@@ -31,6 +31,7 @@ CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v1"
 PACKAGED_CONTRACT_ROOT = ANALYSIS_ROOT / "equipment_quality/contracts/v1"
 V2_CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v2"
 V2_PACKAGED_CONTRACT_ROOT = ANALYSIS_ROOT / "equipment_quality/contracts/v2"
+V3_CONTRACT_ROOT = REPOSITORY_ROOT / "contracts/equipment-monitor/v3"
 SCHEMA_NAMES = (
     "bundle_manifest.schema.json",
     "analysis_config.schema.json",
@@ -55,6 +56,11 @@ V2_SCHEMA_NAMES = (
     "bundle_manifest.schema.json",
     "analysis_config.schema.json",
     "analysis_summary.schema.json",
+)
+V3_SCHEMA_NAMES = (
+    "bundle_manifest.schema.json",
+    "analysis_config.schema.json",
+    "quality_model.schema.json",
 )
 
 
@@ -1394,6 +1400,10 @@ def test_wheel_contains_exactly_one_nested_copy_of_each_schema_and_no_legacy_cop
         **{
             f"equipment_quality/contracts/v2/{name}": V2_CONTRACT_ROOT / name
             for name in V2_SCHEMA_NAMES
+        },
+        **{
+            f"equipment_quality/contracts/v3/{name}": V3_CONTRACT_ROOT / name
+            for name in V3_SCHEMA_NAMES
         },
     }
     with zipfile.ZipFile(built_wheel) as archive:

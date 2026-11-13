@@ -151,7 +151,7 @@ def configureActualBundleEnvironment = { Test task, List<String> variables ->
 customTestTasks << tasks.register('fastTest', Test) {
     configureCustomTestTask(delegate)
     useJUnitPlatform {
-        excludeTags 'actual-bundle-v1', 'actual-bundle-v2-parity'
+        excludeTags 'actual-bundle-v1', 'actual-bundle-v2-parity', 'actual-bundle-v3'
     }
 }
 
@@ -168,6 +168,7 @@ customTestTasks << tasks.register('actualBundleTest', Test) {
 }
 
 customTestTasks << tasks.register('actualBundleV2Test', Test) {
+    maxHeapSize = '2g'
     testClassesDirs = sourceSets.test.output.classesDirs
     classpath = sourceSets.test.runtimeClasspath
     dependsOn verifyNormativeSchemas, verifyRuntimeShape
@@ -180,6 +181,20 @@ customTestTasks << tasks.register('actualBundleV2Test', Test) {
         }
         systemProperty 'sfep.actual-bundle', System.getenv('SFEP_ACTUAL_BUNDLE')
         systemProperty 'sfep.actual-bundle-v2', System.getenv('SFEP_ACTUAL_BUNDLE_V2')
+    }
+}
+
+customTestTasks << tasks.register('actualBundleV3Test', Test) {
+    configureCustomTestTask(delegate)
+    maxHeapSize = '2g'
+    configureActualBundleEnvironment(delegate, ['SFEP_ACTUAL_BUNDLE_V2', 'SFEP_ACTUAL_BUNDLE_V3'])
+    useJUnitPlatform { includeTags 'actual-bundle-v3' }
+    doFirst {
+        ['SFEP_ACTUAL_BUNDLE_V2', 'SFEP_ACTUAL_BUNDLE_V3'].each { name ->
+            if (!System.getenv(name)) throw new GradleException("Missing ${name}")
+        }
+        systemProperty 'sfep.actual-bundle-v2', System.getenv('SFEP_ACTUAL_BUNDLE_V2')
+        systemProperty 'sfep.actual-bundle-v3', System.getenv('SFEP_ACTUAL_BUNDLE_V3')
     }
 }
 
@@ -204,7 +219,8 @@ def customTestConfiguration = tasks.register('verifyCustomTestTaskConfiguration'
             }
             def environmentVariables = [
                     actualBundleTest: ['SFEP_ACTUAL_BUNDLE'],
-                    actualBundleV2Test: ['SFEP_ACTUAL_BUNDLE', 'SFEP_ACTUAL_BUNDLE_V2']
+                    actualBundleV2Test: ['SFEP_ACTUAL_BUNDLE', 'SFEP_ACTUAL_BUNDLE_V2'],
+                    actualBundleV3Test: ['SFEP_ACTUAL_BUNDLE_V2', 'SFEP_ACTUAL_BUNDLE_V3']
             ][task.name]
             if (environmentVariables != null) {
                 environmentVariables.each { name ->

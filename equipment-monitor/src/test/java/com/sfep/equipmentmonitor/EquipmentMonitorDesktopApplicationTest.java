@@ -3,23 +3,23 @@ package com.sfep.equipmentmonitor;
 import com.sfep.equipmentmonitor.bootstrap.MonitorLaunchException;
 import com.sfep.equipmentmonitor.bootstrap.MonitorLaunchPreflight;
 import com.sfep.equipmentmonitor.bootstrap.RuntimeProbe;
+import com.sfep.equipmentmonitor.bundle.BundleLoadException;
 import com.sfep.equipmentmonitor.ui.DesktopMonitorSession;
 import com.sfep.equipmentmonitor.ui.DesktopMonitorWindow;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.test.util.ReflectionTestUtils;
-import com.sfep.equipmentmonitor.bundle.BundleLoadException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class EquipmentMonitorDesktopApplicationTest {
     private static final String OPTION = "--sfep.equipment-monitor.bundle-dir=";
@@ -73,9 +73,11 @@ class EquipmentMonitorDesktopApplicationTest {
                 MonitorLaunchPreflight.validate(args, new RuntimeProbe(21, true, true)));
     }
 
-    @Test
-    void managesOneReplaySessionAndWindowWhileDeferringDisplayToApplicationRunner() throws Exception {
-        Path bundle = runtimeGoldenBundle();
+    @ParameterizedTest
+    @ValueSource(strings = {"v1", "v2"})
+    void managesOneLegacyReplaySessionAndWindowWhileDeferringDisplayToApplicationRunner(String version)
+            throws Exception {
+        Path bundle = runtimeGoldenBundle(version);
 
         new ApplicationContextRunner()
                 .withUserConfiguration(EquipmentMonitorDesktopApplication.class)
@@ -87,50 +89,49 @@ class EquipmentMonitorDesktopApplicationTest {
                     assertThat(context).hasSingleBean(ApplicationRunner.class);
                     assertThat(context.getBean(DesktopMonitorSession.class).metadata().replayRows())
                             .isEqualTo(95);
+                    assertThat(context.getBean(DesktopMonitorSession.class).metadata().qualityModel()).isNull();
                 });
     }
 
     @Test
-    void rejectsEitherLocalModelPathOnItsOwn() throws Exception {
-        var runner = new ApplicationContextRunner()
+    void opensTheVerifiedV3ModelDuringSpringStartup() throws Exception {
+        Path bundle = runtimeGoldenBundle("v3");
+        new ApplicationContextRunner()
                 .withUserConfiguration(EquipmentMonitorDesktopApplication.class)
-                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + runtimeGoldenBundle());
-
-        for (String option : List.of("sfep.quality-model", "sfep.quality-model-metadata")) {
-            runner.withPropertyValues(option + "=/private/tmp/model-file")
-                    .run(context -> assertThat(context).getFailure().hasStackTraceContaining("QUALITY_MODEL_PATHS_REQUIRED"));
-        }
+                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + bundle)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    var model = context.getBean(DesktopMonitorSession.class).metadata().qualityModel();
+                    assertThat(model).isNotNull();
+                    assertThat(model.qualification()).isEqualTo("QUALIFIED");
+                });
     }
 
     @Test
-    void rejectsLocalModelDigestMismatchDuringSpringStartup() throws Exception {
-        String modelDirectory = System.getProperty("sfep.model-dev-dir");
-        assumeTrue(modelDirectory != null, "local-only model not configured");
-        Path tampered = Files.writeString(temporary.resolve("tampered.onnx"), "tampered model");
+    void rejectsV3ModelDigestMismatchDuringSpringStartup() throws Exception {
+        Path bundle = runtimeGoldenBundle("v3");
+        Path model = bundle.resolve("quality_model.onnx");
+        byte[] bytes = Files.readAllBytes(model);
+        bytes[bytes.length / 2] ^= 1;
+        Files.write(model, bytes);
 
         new ApplicationContextRunner()
                 .withUserConfiguration(EquipmentMonitorDesktopApplication.class)
-                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + runtimeGoldenBundle(),
-                        "sfep.quality-model=" + tampered,
-                        "sfep.quality-model-metadata=" + Path.of(modelDirectory).resolve("quality_model.json"))
+                .withPropertyValues("sfep.equipment-monitor.bundle-dir=" + bundle)
                 .run(context -> assertThat(context).getFailure()
                         .hasRootCauseInstanceOf(BundleLoadException.class)
-                        .hasStackTraceContaining("ONNX_DIGEST_MISMATCH"));
+                        .hasStackTraceContaining("ARTIFACT_HASH_MISMATCH"));
     }
 
-    private Path runtimeGoldenBundle() throws Exception {
+    private Path runtimeGoldenBundle(String version) throws Exception {
         Path source = Path.of(System.getProperty("sfep.repo-root"))
-                .resolve("contracts/equipment-monitor/v1/golden-bundle");
+                .resolve("contracts/equipment-monitor").resolve(version).resolve("golden-bundle");
         Path destination = Files.createDirectory(temporary.toRealPath().resolve("runtime-bundle"));
-        for (String name : List.of(
-                "bundle_manifest.json",
-                "analysis_config.json",
-                "producer_runtime.json",
-                "equipment_operating_ranges.json",
-                "quality_risk_intervals.json",
-                "replay_events.csv",
-                "analysis_summary.json")) {
-            Files.copy(source.resolve(name), destination.resolve(name));
+        try (var files = Files.list(source)) {
+            for (Path file : files.toList()) {
+                if (file.getFileName().toString().equals("expected_alerts.json")) continue;
+                Files.copy(file, destination.resolve(file.getFileName()));
+            }
         }
         return destination;
     }

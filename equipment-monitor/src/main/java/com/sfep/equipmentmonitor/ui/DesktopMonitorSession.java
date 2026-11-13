@@ -1,6 +1,7 @@
 package com.sfep.equipmentmonitor.ui;
 
 import com.sfep.equipmentmonitor.bundle.LoadedBundle;
+import com.sfep.equipmentmonitor.bundle.QualityModelArtifact;
 import com.sfep.equipmentmonitor.prediction.OnnxQualityPredictor;
 import com.sfep.equipmentmonitor.replay.ReplayController;
 import com.sfep.equipmentmonitor.replay.ReplayControllerState;
@@ -23,22 +24,29 @@ public final class DesktopMonitorSession implements ReplayControl, AutoCloseable
     private final OnnxQualityPredictor qualityPredictor;
 
     public DesktopMonitorSession(LoadedBundle bundle) {
-        this(bundle, null);
-    }
-
-    public DesktopMonitorSession(LoadedBundle bundle, OnnxQualityPredictor qualityPredictor) {
         Objects.requireNonNull(bundle, "bundle");
-        this.qualityPredictor = qualityPredictor;
-        RiskDefinitionCompiler compiler = new RiskDefinitionCompiler();
-        this.historicalMonitor = new HistoricalMonitor(
-                bundle.bundleId(),
-                compiler.compileRanges(bundle.ranges()),
-                compiler.compileRules(bundle.rules()),
-                qualityPredictor);
-        this.metadata = MonitorDashboardMetadata.from(bundle,
-                qualityPredictor == null ? null : qualityPredictor.metadata());
-        this.replayController = new ReplayController(
-                ReplayCursor.open(bundle.replay()), historicalMonitor::accept);
+        this.qualityPredictor = bundle.qualityModel().map(QualityModelArtifact::openPredictor).orElse(null);
+        try {
+            RiskDefinitionCompiler compiler = new RiskDefinitionCompiler();
+            this.historicalMonitor = new HistoricalMonitor(
+                    bundle.bundleId(),
+                    compiler.compileRanges(bundle.ranges()),
+                    compiler.compileRules(bundle.rules()),
+                    qualityPredictor);
+            this.metadata = MonitorDashboardMetadata.from(bundle,
+                    qualityPredictor == null ? null : qualityPredictor.metadata());
+            this.replayController = new ReplayController(
+                    ReplayCursor.open(bundle.replay()), historicalMonitor::accept);
+        } catch (RuntimeException | Error failure) {
+            if (qualityPredictor != null) {
+                try {
+                    qualityPredictor.close();
+                } catch (RuntimeException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+            throw failure;
+        }
     }
 
     public MonitorDashboardMetadata metadata() {
