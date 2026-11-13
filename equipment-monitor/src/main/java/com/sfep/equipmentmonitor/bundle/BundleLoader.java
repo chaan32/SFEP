@@ -12,6 +12,8 @@ import java.util.Map;
 import java.util.Optional;
 
 public final class BundleLoader {
+    private static final long MAX_ONNX_BYTES = 16L * 1024 * 1024;
+
     public BundleLoader() {
     }
 
@@ -27,6 +29,10 @@ public final class BundleLoader {
         UntrustedManifestClaims claims = UntrustedManifestClaims.extract(manifestNode, contract);
         verifySchemaDigests(contract, claims);
         EnumMap<ArtifactRole, ArtifactDescriptor> descriptors = descriptors(contract, claims.artifacts());
+        ArtifactDescriptor modelDescriptor = descriptors.get(ArtifactRole.QUALITY_MODEL);
+        if (modelDescriptor != null && modelDescriptor.sizeBytes() > MAX_ONNX_BYTES) {
+            throw new BundleLoadException("ONNX_TOO_LARGE", ArtifactRole.QUALITY_MODEL.fileName());
+        }
         verifyIds(contract, claims);
         verifyIdentityBindings(claims, descriptors);
         verifyArtifactAttestations(layout, descriptors);

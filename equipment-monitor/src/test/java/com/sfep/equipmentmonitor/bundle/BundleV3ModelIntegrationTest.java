@@ -70,6 +70,20 @@ class BundleV3ModelIntegrationTest {
     }
 
     @Test
+    void rejectsOversizedModelBeforeReadingIt(@TempDir Path temp) throws Exception {
+        Path bundle = copyBundle(temp);
+        Path manifestPath = bundle.resolve("bundle_manifest.json");
+        ObjectNode manifest = readObject(manifestPath);
+        for (JsonNode descriptor : manifest.path("artifacts")) {
+            if ("quality_model".equals(descriptor.path("role").textValue())) {
+                ((ObjectNode) descriptor).put("sizeBytes", 16L * 1024 * 1024 + 1);
+            }
+        }
+        Files.write(manifestPath, DigestIds.canonicalJsonBytes(manifest));
+        assertRejected("ONNX_TOO_LARGE", bundle);
+    }
+
+    @Test
     void rejectsModelPathThatEscapesBundle(@TempDir Path temp) throws Exception {
         Path bundle = copyBundle(Files.createDirectory(temp.resolve("bundle")));
         Path model = bundle.resolve("quality_model.onnx");
